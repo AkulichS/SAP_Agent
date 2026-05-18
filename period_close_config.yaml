@@ -9,150 +9,155 @@
 #   {{fiscal_year}}       e.g. "2024"
 
 company_config:
-  company_code:      "1000"
-  controlling_area:  "1000"
-  fiscal_year:       "2024"
-  period:            "12"
-  currency:          "EUR"
+  company_code:      "RU06"
+  controlling_area:  "X500"
+  fiscal_year:       "2025"
+  period:            "11"
+  currency:          "RUB"
 
 steps:
 
   # ─────────────────────────────────────────────────────────────
-  # STEP 1: KO8G — CO Actual Assessment
-  # Underlying program: RKABL000
-  # Runs assessment cycles — distributes overhead costs
-  # across cost centers/orders according to cycle rules.
+  # STEP 1: KO8G — CO Actual Settlement: Orders
   # ─────────────────────────────────────────────────────────────
-  - step_id:      "ko8g_actual_assessment"
-    description:  "Run CO actual assessment cycles (KO8G)"
+  - step_id:      "ko8g_actual_settlement"
+    description:  "Run CO actual settlement (KO8G)"
     tcode:        "KO8G"
     action_type:  "SUBMIT"
-    object_name:  "RKABL000"
+    object_name:  "RKO7KO8G"
     async:        true        # Long-running — always use async
-    test_run:     false
+    test_run:     true
 
     params:
-      # Controlling area
-      - selname: "KOKRS"
+      # Controlling area         
+      - selname: "KOKRS" 
         kind:    "P"
         low:     "{{controlling_area}}"
 
-      # Period from (same as period to for single period close)
-      - selname: "ABPER"
+      # Selection Variant         
+      - selname: "VARIANT" 
+        kind:    "P"
+        low:     ""
+
+      # Settlement Period   
+      - selname: "PERIO"
         kind:    "P"
         low:     "{{period}}"
 
-      # Period to
-      - selname: "ABPIS"
-        kind:    "P"
-        low:     "{{period}}"
-
-      # Fiscal year
-      - selname: "ABGJAHR"
+      # Settlement Year
+      - selname: "GJAHR"
         kind:    "P"
         low:     "{{fiscal_year}}"
 
-      # Cycle name filter — leave empty to run all cycles
-      # Uncomment and set to restrict to specific cycles:
-      # - selname: "ZCYKL"
-      #   kind:    "S"
-      #   sign:    "I"
-      #   option:  "EQ"
-      #   low:     "CYCLE_01"
-
-    # After async submit, poll this table/field to confirm completion
-    validation:
-      # RFC will call JOB_STATUS until state = FINISHED or ABORTED
-      poll_interval_seconds: 30
-      max_poll_attempts:     20
-      success_condition:     "job_state == 'FINISHED'"
-      error_condition:       "job_state == 'ABORTED'"
-
-      # Additionally verify actual postings exist after cycle run
-      post_check:
-        action_type:  "STATUS_CHECK"
-        object_name:  "COSP"
-        params:
-          where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}'"
-          fields:   "KOKRS,GJAHR,PERAB"
-          max_rows: 1
-        success_condition: "count > 0"
-        error_message:     "No CO postings found in COSP after assessment run"
-
-  # ─────────────────────────────────────────────────────────────
-  # STEP 2: S_ALR_87013127 — Cost Centers: Actual/Plan/Variance
-  # This is a REPORT VIEWER transaction.
-  # For AI agent: we don't "run" it — we read the underlying
-  # data directly from CO tables and validate key figures.
-  # ─────────────────────────────────────────────────────────────
-  - step_id:      "s_alr_87013127_verify"
-    description:  "Verify CO cost center actuals (S_ALR_87013127 data check)"
-    tcode:        "S_ALR_87013127"
-    action_type:  "STATUS_CHECK"
-    object_name:  "COSP"           # CO primary cost: actual/plan totals
-
-    params:
-      where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}' AND VERSN EQ '0'"
-      fields:   "KOKRS,GJAHR,PERAB,KSTAR,BEKNZ,WKG001"
-      max_rows: 200
-
-    validation:
-      success_condition: "count >= 0"   # Table read succeeded (even 0 rows = valid)
-      # LLM will analyse the data and flag anomalies:
-      llm_analysis_prompt: |
-        The following data is from CO primary cost table COSP for period {{period}}/{{fiscal_year}}.
-        Check for:
-        1. Are there any cost elements with unexpectedly large variances vs prior period?
-        2. Are there zero-balance rows where postings are expected?
-        3. Flag any BEKNZ (debit/credit indicator) anomalies.
-        Return: OK | WARNING | ERROR with brief explanation.
-
-  # ─────────────────────────────────────────────────────────────
-  # STEP 3: KSW5 — Indirect Activity Allocation
-  # Underlying program: RKAIB000
-  # Allocates activity quantities/costs from sender cost centers
-  # to receiver cost centers/orders based on allocation cycles.
-  # ─────────────────────────────────────────────────────────────
-  - step_id:      "ksw5_indirect_allocation"
-    description:  "Run CO indirect activity allocation cycles (KSW5)"
-    tcode:        "KSW5"
-    action_type:  "SUBMIT"
-    object_name:  "RKAIB000"
-    async:        true
-    test_run:     false
-
-    params:
-      - selname: "KOKRS"
+      # Processing Type  
+      - selname: "VAART"
         kind:    "P"
-        low:     "{{controlling_area}}"
+        low:     "1"  # Automatic
 
-      - selname: "ABPER"
+      # Test Run  
+      - selname: "TESTLAUF"
         kind:    "P"
-        low:     "{{period}}"
+        low:     "X"
+        
 
-      - selname: "ABPIS"
-        kind:    "P"
-        low:     "{{period}}"
+  #   # After async submit, poll this table/field to confirm completion
+  #   validation:
+  #     # RFC will call JOB_STATUS until state = FINISHED or ABORTED
+  #     poll_interval_seconds: 30
+  #     max_poll_attempts:     20
+  #     success_condition:     "job_state == 'FINISHED'"
+  #     error_condition:       "job_state == 'ABORTED'"
 
-      - selname: "ABGJAHR"
-        kind:    "P"
-        low:     "{{fiscal_year}}"
+  #     # Additionally verify actual postings exist after cycle run
+  #     post_check:
+  #       action_type:  "STATUS_CHECK"
+  #       object_name:  "COSP"
+  #       params:
+  #         where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}'"
+  #         fields:   "KOKRS,GJAHR,PERAB"
+  #         max_rows: 1
+  #       success_condition: "count > 0"
+  #       error_message:     "No CO postings found in COSP after assessment run"
 
-    validation:
-      poll_interval_seconds: 30
-      max_poll_attempts:     20
-      success_condition:     "job_state == 'FINISHED'"
-      error_condition:       "job_state == 'ABORTED'"
+  # # ─────────────────────────────────────────────────────────────
+  # # STEP 2: S_ALR_87013127 — Cost Centers: Actual/Plan/Variance
+  # # This is a REPORT VIEWER transaction.
+  # # For AI agent: we don't "run" it — we read the underlying
+  # # data directly from CO tables and validate key figures.
+  # # ─────────────────────────────────────────────────────────────
+  # - step_id:      "s_alr_87013127_verify"
+  #   description:  "Verify CO cost center actuals (S_ALR_87013127 data check)"
+  #   tcode:        "S_ALR_87013127"
+  #   action_type:  "STATUS_CHECK"
+  #   object_name:  "COSP"           # CO primary cost: actual/plan totals
 
-      post_check:
-        action_type:  "STATUS_CHECK"
-        object_name:  "COSS"          # CO secondary cost totals (activity alloc posts here)
-        params:
-          where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}'"
-          fields:   "KOKRS,GJAHR,PERAB,KSTAR,WKG001"
-          max_rows: 1
-        success_condition: "count > 0"
-        error_message:     "No secondary cost postings found in COSS after activity allocation"
+  #   params:
+  #     where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}' AND VERSN EQ '0'"
+  #     fields:   "KOKRS,GJAHR,PERAB,KSTAR,BEKNZ,WKG001"
+  #     max_rows: 200
+
+  #   validation:
+  #     success_condition: "count >= 0"   # Table read succeeded (even 0 rows = valid)
+  #     # LLM will analyse the data and flag anomalies:
+  #     llm_analysis_prompt: |
+  #       The following data is from CO primary cost table COSP for period {{period}}/{{fiscal_year}}.
+  #       Check for:
+  #       1. Are there any cost elements with unexpectedly large variances vs prior period?
+  #       2. Are there zero-balance rows where postings are expected?
+  #       3. Flag any BEKNZ (debit/credit indicator) anomalies.
+  #       Return: OK | WARNING | ERROR with brief explanation.
+
+  # # ─────────────────────────────────────────────────────────────
+  # # STEP 3: KSW5 — Indirect Activity Allocation
+  # # Underlying program: RKAIB000
+  # # Allocates activity quantities/costs from sender cost centers
+  # # to receiver cost centers/orders based on allocation cycles.
+  # # ─────────────────────────────────────────────────────────────
+  # - step_id:      "ksw5_indirect_allocation"
+  #   description:  "Run CO indirect activity allocation cycles (KSW5)"
+  #   tcode:        "KSW5"
+  #   action_type:  "SUBMIT"
+  #   object_name:  "RKAIB000"
+  #   async:        true
+  #   test_run:     false
+
+  #   params:
+  #     - selname: "KOKRS"
+  #       kind:    "P"
+  #       low:     "{{controlling_area}}"
+
+  #     - selname: "ABPER"
+  #       kind:    "P"
+  #       low:     "{{period}}"
+
+  #     - selname: "ABPIS"
+  #       kind:    "P"
+  #       low:     "{{period}}"
+
+  #     # - selname: "ABGJAHR"
+  #     #   kind:    "P"
+  #       low:     "{{fiscal_year}}"
+
+  #   validation:
+  #     poll_interval_seconds: 30
+  #     max_poll_attempts:     20
+  #     success_condition:     "job_state == 'FINISHED'"
+  #     error_condition:       "job_state == 'ABORTED'"
+
+  #     post_check:
+  #       action_type:  "STATUS_CHECK"
+  #       object_name:  "COSS"          # CO secondary cost totals (activity alloc posts here)
+  #       params:
+  #         where:    "KOKRS EQ '{{controlling_area}}' AND GJAHR EQ '{{fiscal_year}}' AND PERAB EQ '{{period}}'"
+  #         fields:   "KOKRS,GJAHR,PERAB,KSTAR,WKG001"
+  #         max_rows: 1
+  #       success_condition: "count > 0"
+  #       error_message:     "No secondary cost postings found in COSS after activity allocation"
+
+
+
+
+
 
 # ─────────────────────────────────────────────────────────────
 # RFC CALL REFERENCE (for LangGraph Python code)
