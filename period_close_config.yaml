@@ -9,20 +9,18 @@
 #   {{fiscal_year}}       e.g. "2024"
 
 company_config:
-  company_code:      "RU06"
   controlling_area:  "X500"
+  company_code:      "RU06"
   fiscal_year:       "2025"
   period:            "11"
   currency:          "RUB"
 
 steps:
-
   # ─────────────────────────────────────────────────────────────
   # STEP 1: KO8G — CO Actual Settlement: Orders
   # ─────────────────────────────────────────────────────────────
-  - step_id:      "ko8g_actual_settlement"
+  - step_id:      "KO8G"  # step_id = tcode
     description:  "Run CO actual settlement (KO8G)"
-    tcode:        "KO8G"
     action_type:  "SUBMIT"
     object_name:  "RKO7KO8G"
     async:        true        # Long-running — always use async
@@ -37,7 +35,7 @@ steps:
       # Selection Variant         
       - selname: "VARIANT" 
         kind:    "P"
-        low:     ""
+        low:     "TEST"
 
       # Settlement Period   
       - selname: "PERIO"
