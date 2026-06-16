@@ -1,0 +1,38 @@
+company_config:
+  company_code:     "RU06"
+  controlling_area: "X500"
+  currency:         "RUB"
+
+# steps: omitted — all steps from base.yaml run in base order.
+# Add a steps: list here to control which steps run, their order,
+# and any per-step overrides (async, poll_timeout_sec, params, etc.).
+#
+# Example — run all base steps but override KO8G for a small-orders company:
+# steps:
+#   - step_id: "Z_FI_COMPARISON"
+#   - step_id: "KO8G"
+#     async:            false
+#     poll_timeout_sec: 1000
+#     params:
+#       - {selname: "VARIANT", kind: "P", low: "RU06_SMALL"}
+#   - step_id: "S_ALR_87013127"
+#   ... (continue listing all desired steps)
+
+steps:
+  - step_id: "Z_FI_COMPARISON"
+  - step_id:     "KO8G"
+    test_run:    false
+    params:
+      - {selname: "VARIANT", kind: "P", low: "TEST"}
+  - step_id:     "S_ALR_87013127"
+  - step_id:     "KP46"
+  - step_id:     "KSW5"
+  - step_id:     "KSC5"
+  - step_id:     "S_ALR_87013611"
+  - step_id:     "KSII"
+  - step_id:     "CO88"
+  - step_id:     "CKMLCP"
+  - step_id:     "CKMLCPAVR"
+  - step_id:     "ZFKTAXREP"
+  - step_id:     "Z_FI_TRNSFR"
+  - step_id:     "ZFI_SLD_CLOSING"

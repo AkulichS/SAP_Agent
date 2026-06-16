@@ -1,0 +1,1837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SAP Period Close Agent</title>
+  <style>
+    /* ── Base ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #1e1e1e;
+      --sidebar-bg:   #252526;
+      --sidebar-sel:  #37373d;
+      --sidebar-hov:  #2a2d2e;
+      --panel-bg:     #1e1e1e;
+      --border:       #3c3c3c;
+      --text:         #cccccc;
+      --text-dim:     #858585;
+      --text-bright:  #d4d4d4;
+      --accent:       #0078d4;
+      --ok:           #4ec9b0;
+      --failed:       #f44747;
+      --warn:         #cca700;
+      --running:      #4fc1ff;
+      --skipped:      #858585;
+      --pending:      #5a5a5a;
+      --header-bg:    #323233;
+      --scrollbar:    #424242;
+      --font:         'Segoe UI', Consolas, 'DejaVu Sans', sans-serif;
+      --mono:         Consolas, 'Courier New', monospace;
+    }
+
+    html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; }
+
+    /* ── Layout ── */
+    #app { display: flex; flex-direction: column; height: 100%; }
+
+    /* Title bar */
+    #titlebar {
+      height: 35px; min-height: 35px;
+      background: var(--header-bg);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 12px;
+      padding: 0 16px;
+      user-select: none;
+    }
+    #titlebar .logo { font-size: 15px; font-weight: 600; color: var(--text-bright); letter-spacing: .5px; }
+    #titlebar .context { color: var(--text-dim); font-size: 12px; flex: 1; }
+    #titlebar .ws-status { font-size: 11px; padding: 2px 8px; border-radius: 3px; font-weight: 500; }
+    .ws-status.connecting { color: var(--warn); }
+    .ws-status.open       { color: var(--ok); }
+    .ws-status.closed     { color: var(--failed); }
+    /* ── Tab bar ── */
+    #tab-bar {
+      display: flex; align-items: stretch; flex: 1;
+      overflow: hidden; margin-left: 4px;
+    }
+    .tab-item {
+      display: flex; align-items: center; gap: 5px;
+      padding: 0 14px; height: 100%;
+      font-size: 12px; color: var(--text-dim);
+      cursor: pointer; border-right: 1px solid var(--border);
+      transition: background .1s, color .1s;
+      white-space: nowrap; user-select: none; flex-shrink: 0;
+    }
+    .tab-item:hover { background: rgba(255,255,255,.05); color: var(--text); }
+    .tab-item.active { background: var(--bg); color: var(--text-bright); box-shadow: inset 0 -2px 0 var(--accent); }
+    .tab-dot { font-size: 8px; line-height: 1; }
+    .tab-close {
+      font-size: 10px; margin-left: 3px; width: 16px; height: 16px;
+      border-radius: 3px; display: inline-flex; align-items: center; justify-content: center;
+      color: var(--text-dim); flex-shrink: 0;
+    }
+    .tab-close:hover { background: rgba(255,255,255,.12); color: var(--text); }
+
+    /* Main row */
+    #main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── Sidebar ── */
+    #sidebar {
+      width: 280px; min-width: 220px; max-width: 380px;
+      background: var(--sidebar-bg);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+
+    #sidebar-header {
+      height: 35px; min-height: 35px;
+      display: flex; align-items: center;
+      padding: 0 16px;
+      text-transform: uppercase; font-size: 11px; letter-spacing: .7px;
+      color: var(--text-dim); font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+
+    #step-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+    #step-list::-webkit-scrollbar { width: 6px; }
+    #step-list::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+
+    .step-item {
+      display: flex; align-items: flex-start; gap: 8px;
+      padding: 6px 12px;
+      cursor: pointer; border-radius: 4px; margin: 1px 4px;
+      transition: background .1s;
+    }
+    .step-item:hover { background: var(--sidebar-hov); }
+    .step-item.active { background: var(--sidebar-sel); }
+
+    .step-item.current,
+    .step-item.current.active {
+      background: #1a3a5c !important;
+      border-left: 3px solid var(--running) !important;
+      padding-left: 9px;
+    }
+    .step-item.current:hover { background: #1e4575 !important; }
+
+    /* locked steps: no hover, muted icon */
+    .step-item.locked { cursor: default; }
+    .step-item.locked:hover { background: transparent; }
+    .step-item.locked .step-id,
+    .step-item.locked .step-desc { opacity: .4; }
+    .step-item.locked .step-icon { opacity: .25; }
+
+    .step-icon {
+      flex-shrink: 0; width: 16px; height: 16px; margin-top: 1px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-family: var(--mono);
+    }
+
+    .step-meta { flex: 1; min-width: 0; }
+    .step-id   { font-size: 12px; font-weight: 600; color: var(--text-bright); }
+    .step-desc { font-size: 11px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* run-from-here button — shown only on the eligible step */
+
+    /* status colours */
+    .step-item[data-status="ok"]       .step-icon { color: var(--ok); }
+    .step-item[data-status="failed"]   .step-icon { color: var(--failed); }
+    .step-item[data-status="skipped"]  .step-icon { color: var(--skipped); }
+    .step-item[data-status="running"]  .step-icon { color: var(--running); }
+    .step-item[data-status="pending"]  .step-icon { color: var(--pending); }
+
+    /* sidebar footer */
+    #sidebar-footer { padding: 12px; border-top: 1px solid var(--border); }
+    #btn-start {
+      width: 100%; padding: 7px;
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500;
+      transition: opacity .15s;
+    }
+    #btn-start:hover { opacity: .85; }
+    #btn-start:disabled { opacity: .4; cursor: default; }
+
+    /* ── Main content area ── */
+    #content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    #content-header {
+      height: 35px; min-height: 35px;
+      display: flex; align-items: center; gap: 8px;
+      padding: 0 16px;
+      background: var(--header-bg);
+      border-bottom: 1px solid var(--border);
+      font-size: 12px; color: var(--text-dim);
+    }
+    #content-header .step-path { color: var(--text-bright); font-weight: 500; }
+
+    #action-log { flex: 1; overflow-y: auto; padding: 12px 16px; }
+    #action-log::-webkit-scrollbar { width: 8px; }
+    #action-log::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
+
+    /* ── Action entry ── */
+    .action-entry {
+      display: flex; gap: 10px; align-items: flex-start;
+      padding: 6px 0;
+      border-left: 3px solid transparent; padding-left: 10px;
+      margin-bottom: 2px; border-radius: 0 3px 3px 0;
+    }
+    .action-entry[data-status="ok"]      { border-left-color: var(--ok); }
+    .action-entry[data-status="failed"]  { border-left-color: var(--failed); }
+    .action-entry[data-status="skipped"] { border-left-color: var(--skipped); }
+    .action-entry[data-status="running"] { border-left-color: var(--running); }
+    .action-entry[data-status="pending"] { border-left-color: var(--border); }
+
+    .action-icon  { width: 18px; flex-shrink: 0; margin-top: 1px; font-size: 13px; text-align: center; }
+    .action-body  { flex: 1; min-width: 0; }
+    .action-title { font-size: 12px; font-weight: 600; color: var(--text-bright); }
+    .action-msg   { font-size: 12px; color: var(--text-dim); word-break: break-word; margin-top: 2px; }
+
+    .action-entry[data-status="ok"]      .action-title { color: var(--ok); }
+    .action-entry[data-status="failed"]  .action-title { color: var(--failed); }
+    .action-entry[data-status="running"] .action-title { color: var(--running); }
+    .action-entry[data-status="skipped"] .action-title { color: var(--skipped); }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      display: inline-block; width: 12px; height: 12px;
+      border: 2px solid var(--running); border-top-color: transparent;
+      border-radius: 50%; animation: spin .7s linear infinite; vertical-align: middle;
+    }
+
+    /* ── Detail panel ── */
+    .action-detail {
+      margin-top: 6px; padding: 6px 8px;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border); border-radius: 3px; font-size: 11px;
+    }
+    .det-row  { margin-bottom: 3px; line-height: 1.5; }
+    .det-lbl  { color: var(--text-dim); margin-right: 4px; }
+    .det-pass { color: var(--ok); font-weight: 600; }
+    .det-fail { color: var(--failed); font-weight: 600; }
+    .det-warn { color: var(--warn); font-weight: 600; }
+    .det-check { margin: 4px 0; line-height: 1.6; }
+    .det-table { border-collapse: collapse; margin: 4px 0; font-family: var(--mono); }
+    .det-table th, .det-table td { padding: 2px 8px; border: 1px solid var(--border); font-size: 11px; }
+    .det-table th { background: var(--header-bg); color: var(--text-dim); }
+    .det-table td { color: var(--text); }
+    .det-msgs { margin-top: 4px; }
+    .det-msg  { color: var(--text-dim); padding: 1px 0; font-family: var(--mono); font-size: 11px; }
+    .det-spool summary { cursor: pointer; color: var(--text-dim); font-size: 11px; user-select: none; }
+    .det-spool summary:hover { color: var(--text); }
+    .det-pre {
+      font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+      white-space: pre-wrap; word-break: break-all;
+      margin-top: 4px; max-height: 160px; overflow-y: auto;
+      background: var(--bg); padding: 4px; border-radius: 2px; border: 1px solid var(--border);
+    }
+
+    /* ── Empty state ── */
+    #empty-state {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      flex-direction: column; gap: 12px; color: var(--text-dim);
+    }
+
+    /* ── Status bar ── */
+    #statusbar {
+      height: 22px; min-height: 22px;
+      background: var(--accent); display: flex; align-items: center;
+      padding: 0 12px; gap: 14px; font-size: 11px; color: #fff;
+    }
+    #statusbar .sb-item { opacity: .85; }
+    #status-text { font-weight: 500; }
+
+    /* ── Interrupt modal ── */
+    #modal-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.65); z-index: 100;
+      align-items: center; justify-content: center;
+    }
+    #modal-overlay.visible { display: flex; }
+    #modal {
+      background: #252526; border: 1px solid #555; border-radius: 6px;
+      width: 560px; max-width: calc(100vw - 40px); max-height: 90vh;
+      overflow-y: auto; padding: 20px 24px;
+    }
+    #modal h2 { font-size: 14px; font-weight: 600; color: var(--failed); margin-bottom: 14px; }
+    .modal-section { margin-bottom: 14px; }
+    .modal-section label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-dim); margin-bottom: 5px; }
+    .modal-section .value { font-size: 12px; color: var(--text-bright); background: #1e1e1e; border-radius: 4px; padding: 8px 10px; white-space: pre-wrap; }
+    #modal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+    .modal-btn { padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; font-weight: 500; transition: opacity .15s; }
+    .modal-btn:hover { opacity: .8; }
+    .btn-retry   { background: var(--accent); color: #fff; }
+    .btn-execute { background: #3d5a80; color: #fff; }
+    .btn-skip    { background: #4a4a4a; color: var(--text); }
+    .btn-abort   { background: #6b2121; color: #fff; }
+    #param-override-wrap { margin-top: 10px; display: none; }
+    #param-override-wrap.visible { display: block; }
+    #param-override-wrap label { font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 5px; }
+    #param-override {
+      width: 100%; height: 80px; background: #1e1e1e; color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 6px; font-family: var(--mono); font-size: 12px; resize: vertical;
+    }
+    #param-override:focus { outline: 1px solid var(--accent); }
+
+    /* rollback button — shown on hover over done (ok/skipped) steps */
+    .step-rollback-btn {
+      flex-shrink: 0; font-size: 10px;
+      padding: 1px 5px; border-radius: 3px; border: none;
+      background: #6b3a00; color: #ffb347; cursor: pointer;
+      transition: opacity .1s; display: none;
+      white-space: nowrap;
+    }
+    .step-item.done:hover .step-rollback-btn { display: inline-block; }
+
+    /* rollback confirmation modal */
+    #rollback-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.65); z-index: 110;
+      align-items: center; justify-content: center;
+    }
+    #rollback-overlay.visible { display: flex; }
+    #rollback-modal {
+      background: #252526; border: 1px solid #6b3a00; border-radius: 6px;
+      width: 500px; max-width: calc(100vw - 40px);
+      padding: 20px 24px;
+    }
+    #rollback-modal h2 { font-size: 14px; font-weight: 600; color: #ffb347; margin-bottom: 14px; }
+    .rb-section { margin-bottom: 12px; font-size: 12px; }
+    .rb-section label { display: block; font-size: 11px; text-transform: uppercase;
+                        letter-spacing: .5px; color: var(--text-dim); margin-bottom: 4px; }
+    .rb-section .rb-value { background: #1e1e1e; border-radius: 4px; padding: 7px 10px;
+                             color: var(--text-bright); }
+    .rb-steps-list { font-family: var(--mono); font-size: 11px;
+                     background: #1e1e1e; border-radius: 4px; padding: 7px 10px;
+                     color: #ffb347; }
+    .rb-steps-list .rb-step-item { padding: 1px 0; }
+    #rollback-actions { display: flex; gap: 8px; margin-top: 16px; }
+    .btn-rb-confirm { background: #6b3a00; color: #ffb347; padding: 6px 16px;
+                      border-radius: 4px; border: none; cursor: pointer;
+                      font-size: 12px; font-weight: 500; }
+    .btn-rb-confirm:hover { opacity: .8; }
+    .btn-rb-cancel  { background: #4a4a4a; color: var(--text); padding: 6px 14px;
+                      border-radius: 4px; border: none; cursor: pointer; font-size: 12px; }
+    .btn-rb-cancel:hover { opacity: .8; }
+
+    /* rollback progress bar in action log */
+    .rollback-banner {
+      background: #2a1a00; border: 1px solid #6b3a00; border-radius: 4px;
+      padding: 8px 12px; margin-bottom: 8px; font-size: 12px; color: #ffb347;
+    }
+    .rollback-banner .rb-title { font-weight: 600; margin-bottom: 4px; }
+    .rollback-step-entry {
+      display: flex; gap: 8px; align-items: center;
+      padding: 3px 8px; font-size: 11px; font-family: var(--mono);
+    }
+    .rb-entry-icon { width: 14px; text-align: center; flex-shrink: 0; }
+    .rb-entry-ok      { color: var(--ok); }
+    .rb-entry-error   { color: var(--failed); }
+    .rb-entry-skipped { color: var(--skipped); }
+    .rb-entry-running { color: #ffb347; }
+
+    /* ══════════════════════════════════════════════════════
+       PERIOD PICKER MODAL
+    ══════════════════════════════════════════════════════ */
+    #period-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.65); z-index: 120;
+      align-items: center; justify-content: center;
+    }
+    #period-overlay.visible { display: flex; }
+    #period-modal {
+      background: #252526; border: 1px solid var(--border); border-radius: 6px;
+      width: 360px; max-width: calc(100vw - 40px);
+      padding: 20px 24px;
+    }
+    #period-modal h2 {
+      font-size: 14px; font-weight: 600; color: var(--text-bright);
+      margin-bottom: 4px;
+    }
+    #period-modal .pm-company {
+      font-size: 12px; color: var(--text-dim); margin-bottom: 18px;
+    }
+    .pm-row {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 14px;
+    }
+    .pm-row label {
+      font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+      color: var(--text-dim); flex-shrink: 0; margin-right: 12px;
+    }
+    .pm-row select, .pm-row input {
+      flex: 1; background: #3c3c3c; border: 1px solid var(--border);
+      color: var(--text); border-radius: 4px; padding: 6px 8px;
+      font-size: 13px; font-family: var(--font);
+    }
+    .pm-row select:focus, .pm-row input:focus { outline: 1px solid var(--accent); }
+    #period-actions { display: flex; gap: 8px; margin-top: 18px; }
+    #pm-btn-start {
+      flex: 1; padding: 8px; background: var(--accent); color: #fff;
+      border: none; border-radius: 4px; cursor: pointer;
+      font-size: 13px; font-weight: 500; transition: opacity .15s;
+    }
+    #pm-btn-start:hover { opacity: .85; }
+    #pm-btn-cancel {
+      padding: 8px 16px; background: #3c3c3c; color: var(--text);
+      border: none; border-radius: 4px; cursor: pointer; font-size: 13px;
+    }
+    #pm-btn-cancel:hover { opacity: .8; }
+
+    /* Period edit button on company card */
+    .period-edit-btn {
+      background: none; border: none; color: #ffb347;
+      cursor: pointer; padding: 0 4px; font-size: 13px;
+      vertical-align: middle; transition: color .1s;
+      line-height: 1; display: inline-block; transform: scaleX(-1);
+    }
+    .period-edit-btn:hover { color: var(--text-bright); }
+
+    /* Toast notification */
+    #toast {
+      position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%);
+      background: #3a2a00; color: var(--warn);
+      padding: 8px 18px; border-radius: 4px; font-size: 12px;
+      border: 1px solid var(--warn);
+      opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 300;
+      white-space: nowrap;
+    }
+    #toast.visible { opacity: 1; }
+
+    /* Locked-but-executed steps remain hoverable so users can click to view */
+    .step-item.locked[data-status="ok"]:hover,
+    .step-item.locked[data-status="failed"]:hover,
+    .step-item.locked[data-status="skipped"]:hover {
+      background: var(--sidebar-hov); cursor: pointer;
+    }
+
+    /* ══════════════════════════════════════════════════════
+       LOGIN OVERLAY
+    ══════════════════════════════════════════════════════ */
+    #login-overlay {
+      display: flex; position: fixed; inset: 0;
+      background: #1e1e1e; z-index: 200;
+      align-items: center; justify-content: center;
+    }
+    #login-overlay.hidden { display: none; }
+    #login-box {
+      background: #252526; border: 1px solid var(--border); border-radius: 8px;
+      padding: 32px 36px; width: 340px;
+    }
+    #login-box h1 { font-size: 16px; font-weight: 600; color: var(--text-bright); margin-bottom: 6px; }
+    #login-box .subtitle { font-size: 12px; color: var(--text-dim); margin-bottom: 24px; }
+    .field { margin-bottom: 16px; }
+    .field label { display: block; font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .4px; margin-bottom: 5px; }
+    .field input {
+      width: 100%; background: #3c3c3c; border: 1px solid var(--border);
+      color: var(--text); border-radius: 4px; padding: 7px 10px; font-size: 13px;
+    }
+    .field input:focus { outline: 1px solid var(--accent); }
+    #login-btn {
+      width: 100%; padding: 9px; background: var(--accent); color: #fff;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500;
+      margin-top: 4px; transition: opacity .15s;
+    }
+    #login-btn:hover { opacity: .85; }
+    #login-btn:disabled { opacity: .4; cursor: default; }
+    #login-error {
+      color: var(--failed); font-size: 12px; margin-top: 10px; text-align: center;
+      min-height: 18px;
+    }
+
+    /* ══════════════════════════════════════════════════════
+       DASHBOARD PAGE
+    ══════════════════════════════════════════════════════ */
+    #dashboard-page {
+      display: none; flex: 1; flex-direction: column; overflow: hidden;
+    }
+    #dashboard-page.visible { display: flex; }
+
+    #dashboard-header {
+      padding: 20px 24px 12px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+    #dashboard-header h2 { font-size: 15px; font-weight: 600; color: var(--text-bright); }
+    #dashboard-header .user-info { font-size: 12px; color: var(--text-dim); }
+    #logout-btn {
+      margin-left: 12px; font-size: 11px; padding: 3px 10px;
+      border: 1px solid var(--border); border-radius: 3px;
+      background: transparent; color: var(--text-dim); cursor: pointer;
+    }
+    #logout-btn:hover { color: var(--text); }
+
+    #company-grid {
+      flex: 1; overflow-y: auto;
+      padding: 20px 24px;
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px;
+      align-content: start;
+    }
+
+    .company-card {
+      background: #252526; border: 1px solid var(--border); border-radius: 6px;
+      padding: 18px 20px;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .company-card-header { display: flex; align-items: flex-start; gap: 10px; }
+    .company-code { font-size: 18px; font-weight: 700; color: var(--text-bright); }
+    .company-name { font-size: 12px; color: var(--text-dim); margin-top: 2px; }
+    .company-meta { font-size: 11px; color: var(--text-dim); }
+
+    .company-status {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px;
+    }
+    .cs-idle        { background: #3c3c3c; color: var(--text-dim); }
+    .cs-running     { background: #1a3a5c; color: var(--running); }
+    .cs-interrupted { background: #3c2a00; color: var(--warn); }
+    .cs-completed   { background: #1e3a2a; color: var(--ok); }
+    .cs-failed      { background: #3a1e1e; color: var(--failed); }
+
+    .company-progress { font-size: 11px; color: var(--text-dim); min-height: 16px; }
+
+    .company-card-actions { display: flex; gap: 8px; }
+    .card-btn {
+      flex: 1; padding: 7px; border-radius: 4px; border: none;
+      cursor: pointer; font-size: 12px; font-weight: 500;
+      transition: opacity .15s;
+    }
+    .card-btn:hover { opacity: .8; }
+    .card-btn:disabled { opacity: .35; cursor: default; }
+    .btn-card-start { background: var(--accent); color: #fff; }
+    .btn-card-view  { background: #3c3c3c; color: var(--text); }
+
+    /* ══════════════════════════════════════════════════════
+       DETAIL VIEW (existing period-close view)
+    ══════════════════════════════════════════════════════ */
+    #detail-page {
+      display: none; flex: 1; overflow: hidden;
+    }
+    #detail-page.visible { display: flex; }
+  </style>
+</head>
+<body>
+
+<div id="app">
+
+  <!-- Title bar -->
+  <div id="titlebar">
+    <span class="logo">⚙ SAP Period Close Agent</span>
+    <div id="tab-bar"><!-- tabs populated by JS --></div>
+    <span id="ws-status" class="ws-status connecting">⬤ connecting</span>
+  </div>
+
+  <!-- Main row -->
+  <div id="main" style="flex:1;overflow:hidden;">
+
+    <!-- ═══ DASHBOARD PAGE ═══ -->
+    <div id="dashboard-page">
+      <div id="dashboard-header">
+        <h2>Period Close — Company Selection</h2>
+        <div style="display:flex;align-items:center;gap:0">
+          <span id="user-display" class="user-info"></span>
+          <button id="logout-btn" onclick="logout()">Logout</button>
+        </div>
+      </div>
+      <div id="company-grid">
+        <!-- cards populated by JS -->
+      </div>
+    </div>
+
+    <!-- ═══ DETAIL PAGE (sidebar + action log) ═══ -->
+    <div id="detail-page">
+
+      <!-- Sidebar -->
+      <div id="sidebar">
+        <div id="sidebar-header">Steps</div>
+        <div id="step-list"></div>
+        <div id="sidebar-footer">
+          <button id="btn-start" disabled>▶ Start Run</button>
+        </div>
+      </div>
+
+      <!-- Right content -->
+      <div id="content">
+        <div id="content-header">
+          <span id="content-breadcrumb">SAP Period Close</span>
+          <span style="flex:1"></span>
+          <span id="step-counter" style="color:var(--text-dim);font-size:11px;"></span>
+        </div>
+        <div id="action-log">
+          <div id="empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--text-dim);">
+            <div style="font-size:48px;opacity:.3;">🗂️</div>
+            <div style="font-size:13px;">Select a step to see its action log — or start the run.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- #main -->
+
+  <!-- Status bar -->
+  <div id="statusbar">
+    <span id="status-text" class="sb-item">Ready</span>
+    <span id="sb-step" class="sb-item" style="margin-left:auto;"></span>
+  </div>
+</div>
+
+<!-- Interrupt modal -->
+<div id="modal-overlay">
+  <div id="modal">
+    <h2>⚠ Operator Intervention Required</h2>
+    <div class="modal-section"><label>Step</label><div id="modal-step" class="value"></div></div>
+    <div class="modal-section"><label>Diagnosis</label><div id="modal-diagnosis" class="value"></div></div>
+    <div class="modal-section"><label>Instructions</label><div id="modal-instructions" class="value"></div></div>
+    <div id="param-override-wrap">
+      <label>Parameter overrides (JSON array, optional)</label>
+      <textarea id="param-override" placeholder='[{"name":"BUKRS","value":"RU06"}]'></textarea>
+    </div>
+    <div id="modal-actions">
+      <button class="modal-btn btn-retry"   onclick="sendDecision('retry_from_precheck')">↺ Retry from Pre-check</button>
+      <button class="modal-btn btn-execute" onclick="sendDecision('retry_from_execute')">▶ Retry Execute</button>
+      <button class="modal-btn btn-skip"    onclick="sendDecision('skip_step')">⏭ Skip Step</button>
+      <button class="modal-btn btn-abort"   onclick="sendDecision('abort')">✕ Abort Run</button>
+      <button class="modal-btn" style="background:#6b3a00;color:#ffb347;" onclick="openRollbackFromModal()">↩ Roll Back…</button>
+    </div>
+  </div>
+</div>
+
+<!-- Rollback confirmation modal -->
+<div id="rollback-overlay">
+  <div id="rollback-modal">
+    <h2>↩ Rollback &amp; Restart</h2>
+    <div class="rb-section">
+      <label>Restart from step</label>
+      <div id="rb-target-step" class="rb-value"></div>
+    </div>
+    <div class="rb-section">
+      <label>Steps to roll back (in reverse order)</label>
+      <div id="rb-steps-list" class="rb-steps-list"></div>
+    </div>
+    <div class="rb-section" style="color:var(--text-dim);font-size:11px;">
+      Completed steps listed above will be reversed in SAP, then the calculation
+      will restart from the selected step. This action cannot be undone automatically.
+    </div>
+    <div id="rollback-actions">
+      <button class="btn-rb-confirm" id="btn-rb-confirm">↩ Confirm Rollback &amp; Restart</button>
+      <button class="btn-rb-cancel"  id="btn-rb-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Period editor modal -->
+<div id="period-overlay">
+  <div id="period-modal">
+    <h2>✎ Change Fiscal Period</h2>
+    <div id="pm-company" class="pm-company"></div>
+    <div class="pm-row">
+      <label>Fiscal Year</label>
+      <input id="pm-year" type="number" min="2020" max="2099" step="1"/>
+    </div>
+    <div class="pm-row">
+      <label>Period</label>
+      <select id="pm-period">
+        <option value="1">1 — January</option>
+        <option value="2">2 — February</option>
+        <option value="3">3 — March</option>
+        <option value="4">4 — April</option>
+        <option value="5">5 — May</option>
+        <option value="6">6 — June</option>
+        <option value="7">7 — July</option>
+        <option value="8">8 — August</option>
+        <option value="9">9 — September</option>
+        <option value="10">10 — October</option>
+        <option value="11">11 — November</option>
+        <option value="12">12 — December</option>
+      </select>
+    </div>
+    <div id="period-actions">
+      <button id="pm-btn-start">✓ Apply</button>
+      <button id="pm-btn-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Login overlay -->
+<div id="login-overlay">
+  <div id="login-box">
+    <h1>⚙ SAP Period Close</h1>
+    <p class="subtitle">Sign in to continue</p>
+    <div class="field">
+      <label>Username</label>
+      <input id="login-user" type="text" autocomplete="username" placeholder="ivanov"/>
+    </div>
+    <div class="field">
+      <label>Password</label>
+      <input id="login-pass" type="password" autocomplete="current-password"/>
+    </div>
+    <button id="login-btn" onclick="doLogin()">Sign In</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  App state
+// ═══════════════════════════════════════════════════════════
+
+const appState = {
+  user: null,                 // {username, display_name, role, companies}
+  currentCompany: null,       // company code currently open in detail view
+
+  // Detail-view state
+  steps: [],
+  stepStatus: {},             // step_id → "pending"|"running"|"ok"|"failed"|"skipped"
+  stepActions: {},            // step_id → [{id, action, status, message, detail}]
+  currentRunStep: null,
+  selectedStep: null,
+  running: false,
+  pollActionId: {},
+  nextEligibleStepIndex: 0,   // sequential locking
+  autoFollow: true,           // right panel tracks the currently running step
+  interrupted: false,         // graph is paused at user_node
+  rollbackTargetStep: null,   // step_id selected for rollback (pending confirmation)
+
+  // Dashboard
+  companies: [],              // [{code, display_name, run_status, ...}]
+  dashboardStatus: {},        // code → run_status dict (live updates from /ws/dashboard)
+  period: null,               // global fiscal period (same for all companies)
+  fiscal_year: null,          // global fiscal year
+
+  // Tabs
+  openTabs: [],               // company codes with open tabs (dashboard is always implicit)
+  activeTab: 'dashboard',     // 'dashboard' | company_code
+};
+
+// ═══════════════════════════════════════════════════════════
+//  Page routing
+// ═══════════════════════════════════════════════════════════
+
+function showLogin()     { document.getElementById('login-overlay').classList.remove('hidden'); }
+function hideLogin()     { document.getElementById('login-overlay').classList.add('hidden'); }
+function showDashboard() {
+  appState.activeTab = 'dashboard';
+  document.getElementById('dashboard-page').classList.add('visible');
+  document.getElementById('detail-page').classList.remove('visible');
+  setStatus('Ready');
+  renderTabs();
+  if (wsDashboard && wsDashboard.readyState !== WebSocket.OPEN) connectDashboardWS();
+}
+function showDetail(company) {
+  appState.currentCompany = company;
+  appState.activeTab = company;
+  if (!appState.openTabs.includes(company)) appState.openTabs.push(company);
+  document.getElementById('dashboard-page').classList.remove('visible');
+  document.getElementById('detail-page').classList.add('visible');
+  renderTabs();
+  connectCompanyWS(company);
+}
+
+// ─── Tab bar ────────────────────────────────────────────────
+function renderTabs() {
+  const bar = document.getElementById('tab-bar');
+  bar.innerHTML = '';
+
+  // Dashboard tab
+  const dt = document.createElement('div');
+  dt.className = 'tab-item' + (appState.activeTab === 'dashboard' ? ' active' : '');
+  dt.innerHTML = '⊞ Dashboard';
+  dt.addEventListener('click', showDashboard);
+  bar.appendChild(dt);
+
+  // Company tabs
+  appState.openTabs.forEach(code => {
+    const rs = appState.dashboardStatus[code] || {status: 'idle'};
+    const color = tabDotColor(rs.status);
+    const tab = document.createElement('div');
+    tab.className = 'tab-item' + (appState.activeTab === code ? ' active' : '');
+    tab.innerHTML =
+      `<span class="tab-dot" style="color:${color}">⬤</span>` +
+      `<span>${esc(code)}</span>` +
+      `<span class="tab-close" title="Close">✕</span>`;
+    tab.addEventListener('click', (e) => {
+      if (e.target.classList.contains('tab-close')) { closeTab(code); }
+      else if (appState.activeTab !== code) { showDetail(code); }
+    });
+    bar.appendChild(tab);
+  });
+}
+
+function tabDotColor(st) {
+  return {idle:'var(--text-dim)', running:'var(--running)',
+          interrupted:'var(--warn)', completed:'var(--ok)', failed:'var(--failed)'}[st]
+    || 'var(--text-dim)';
+}
+
+function closeTab(code) {
+  appState.openTabs = appState.openTabs.filter(c => c !== code);
+  if (appState.activeTab === code) {
+    if (wsCompany) { wsCompany.close(); wsCompany = null; }
+    showDashboard();
+  } else {
+    renderTabs();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Auth
+// ═══════════════════════════════════════════════════════════
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/me');
+    if (r.ok) {
+      const data = await r.json();
+      onLoginSuccess(data);
+    } else {
+      showLogin();
+    }
+  } catch {
+    showLogin();
+  }
+}
+
+async function doLogin() {
+  const btn = document.getElementById('login-btn');
+  const errEl = document.getElementById('login-error');
+  const user = document.getElementById('login-user').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  errEl.textContent = '';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user, password: pass}),
+    });
+    const data = await r.json();
+    if (!r.ok) { errEl.textContent = data.error || 'Login failed'; return; }
+    onLoginSuccess(data);
+  } catch (e) {
+    errEl.textContent = 'Network error';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Compute the previous calendar month as the default closing period
+function defaultPeriod() {
+  const d = new Date();
+  const m = d.getMonth(); // 0 = January
+  if (m === 0) return { period: '12', fiscal_year: String(d.getFullYear() - 1) };
+  return { period: String(m), fiscal_year: String(d.getFullYear()) };
+}
+
+function onLoginSuccess(data) {
+  appState.user = data;
+  const dp = defaultPeriod();
+  appState.period      = dp.period;
+  appState.fiscal_year = dp.fiscal_year;
+  appState.companies   = data.companies || [];
+  appState.openTabs    = [];
+  appState.activeTab   = 'dashboard';
+  hideLogin();
+  renderDashboard();
+  showDashboard();
+  connectDashboardWS();
+}
+
+// ─── Global period editor ────────────────────────────────────────────────────
+
+function openPeriodModal() {
+  document.getElementById('pm-company').textContent = 'Applied to all companies';
+  document.getElementById('pm-year').value   = appState.fiscal_year;
+  document.getElementById('pm-period').value = appState.period;
+  document.getElementById('period-overlay').classList.add('visible');
+  document.getElementById('pm-year').focus();
+}
+
+function confirmPeriodEdit() {
+  const period      = document.getElementById('pm-period').value;
+  const fiscal_year = document.getElementById('pm-year').value.trim();
+  if (!period || !fiscal_year) return;
+  appState.period      = period;
+  appState.fiscal_year = fiscal_year;
+  document.getElementById('period-overlay').classList.remove('visible');
+  // Refresh all cards with updated global period
+  appState.companies.forEach(c => updateCompanyCard(c.code));
+}
+
+// ─── Start company run (uses global period) ──────────────────────────────────
+
+function startCompany(code) {
+  const msg = {type: 'start', company: code,
+               period: appState.period, fiscal_year: appState.fiscal_year};
+  if (!wsDashboard || wsDashboard.readyState !== WebSocket.OPEN) {
+    connectDashboardWS();
+    setTimeout(() => wsDashboard.send(JSON.stringify(msg)), 400);
+  } else {
+    wsDashboard.send(JSON.stringify(msg));
+  }
+  const c = appState.companies.find(x => x.code === code);
+  if (c) {
+    c.run_status = {status: 'running', current_step: null, step_progress: [0,0]};
+    updateCompanyCard(code);
+  }
+}
+
+async function logout() {
+  await fetch('/api/logout', {method: 'POST'});
+  if (wsDashboard) { wsDashboard.close(); wsDashboard = null; }
+  if (wsCompany)   { wsCompany.close();   wsCompany   = null; }
+  showLogin();
+  document.getElementById('dashboard-page').classList.remove('visible');
+  document.getElementById('detail-page').classList.remove('visible');
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Dashboard
+// ═══════════════════════════════════════════════════════════
+
+let wsDashboard = null;
+
+function connectDashboardWS() {
+  if (wsDashboard && wsDashboard.readyState === WebSocket.OPEN) return;
+  wsDashboard = new WebSocket(`ws://${location.host}/ws/dashboard`);
+  wsDashboard.onopen  = () => setWsStatus('open');
+  wsDashboard.onclose = () => setWsStatus('closed');
+  wsDashboard.onerror = (e) => console.error('[dash WS]', e);
+  wsDashboard.onmessage = (evt) => {
+    let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+    handleDashboardEvent(msg);
+  };
+}
+
+function handleDashboardEvent(e) {
+  const company = e.company;
+  if (!company) return;
+  const entry = appState.companies.find(c => c.code === company);
+  if (entry) {
+    if (!entry.run_status) entry.run_status = {};
+    if (e.type === 'run_init' && e.company_config) {
+      // Sync global period/fiscal_year from the actual company config
+      if (e.company_config.period)      appState.period      = e.company_config.period;
+      if (e.company_config.fiscal_year) appState.fiscal_year = e.company_config.fiscal_year;
+    } else if (e.type === 'step_start') {
+      entry.run_status.status        = 'running';
+      entry.run_status.current_step  = e.step_id;
+      entry.run_status.step_progress = [e.step_index, e.total];
+    } else if (e.type === 'interrupt') {
+      entry.run_status.status = 'interrupted';
+    } else if (e.type === 'run_end') {
+      entry.run_status.status       = e.status === 'completed' ? 'completed' : 'failed';
+      entry.run_status.current_step = null;
+    }
+    appState.dashboardStatus[company] = entry.run_status;
+    updateCompanyCard(company);
+    renderTabs();
+  }
+}
+
+function renderDashboard() {
+  const grid = document.getElementById('company-grid');
+  const userDisplay = document.getElementById('user-display');
+  userDisplay.textContent = appState.user.display_name || appState.user.username;
+  grid.innerHTML = '';
+  appState.companies.forEach(c => {
+    appState.dashboardStatus[c.code] = c.run_status || {status: 'idle'};
+    const card = buildCard(c);
+    grid.appendChild(card);
+  });
+}
+
+function buildCard(c) {
+  const div = document.createElement('div');
+  div.className = 'company-card';
+  div.id = `card-${c.code}`;
+  div.innerHTML = cardHTML(c);
+  return div;
+}
+
+function cardHTML(c) {
+  const rs      = (c.run_status || {status: 'idle'});
+  const stBadge = statusBadge(rs.status);
+  const prog    = progressText(rs);
+  const isIdle  = rs.status === 'idle' || rs.status === 'failed';
+  const p = appState.period, fy = appState.fiscal_year;
+  const periodLabel = p && fy
+    ? `Period ${esc(p)} / ${esc(fy)}`
+    : '<span style="color:var(--text-dim);font-style:italic">Period not set</span>';
+  return `
+    <div class="company-card-header">
+      <div>
+        <div class="company-code">${esc(c.code)}</div>
+        <div class="company-name">${esc(c.display_name || '')}</div>
+      </div>
+      <div style="margin-left:auto">${stBadge}</div>
+    </div>
+    <div class="company-meta">
+      ${periodLabel}
+      <button class="period-edit-btn" onclick="openPeriodModal()" title="Change period">✎</button>
+    </div>
+    <div class="company-progress" id="progress-${c.code}">${prog}</div>
+    <div class="company-card-actions">
+      <button class="card-btn btn-card-start" id="start-${c.code}"
+        ${isIdle ? '' : 'disabled'}
+        onclick="startCompany('${esc(c.code)}')">▶ Start</button>
+      <button class="card-btn btn-card-view" onclick="showDetail('${esc(c.code)}')">👁 View</button>
+    </div>`;
+}
+
+function updateCompanyCard(code) {
+  const card = document.getElementById(`card-${code}`);
+  const c = appState.companies.find(x => x.code === code);
+  if (card && c) card.innerHTML = cardHTML(c);
+}
+
+function statusBadge(st) {
+  const map = {
+    idle:        ['cs-idle',        '○ Idle'],
+    running:     ['cs-running',     '⬤ Running'],
+    interrupted: ['cs-interrupted', '⚠ Needs operator'],
+    completed:   ['cs-completed',   '✓ Completed'],
+    failed:      ['cs-failed',      '✗ Failed'],
+  };
+  const [cls, label] = map[st] || map['idle'];
+  return `<span class="company-status ${cls}">${label}</span>`;
+}
+
+function progressText(rs) {
+  if (rs.status === 'running' && rs.current_step) {
+    const [idx, total] = rs.step_progress || [0, 0];
+    return `Step ${idx + 1}/${total}: ${esc(rs.current_step)}`;
+  }
+  return '';
+}
+
+// startCompany is now handled by openStartModal → confirmStartModal
+
+// ═══════════════════════════════════════════════════════════
+//  Detail view — WebSocket per company
+// ═══════════════════════════════════════════════════════════
+
+let wsCompany = null;
+
+function connectCompanyWS(company) {
+  if (wsCompany) { wsCompany.close(); wsCompany = null; }
+  // Reset detail state
+  appState.steps = [];
+  appState.stepStatus = {};
+  appState.stepActions = {};
+  appState.currentRunStep = null;
+  appState.selectedStep = null;
+  appState.running = false;
+  appState.pollActionId = {};
+  appState.nextEligibleStepIndex = 0;
+  appState.autoFollow = true;
+  appState.interrupted = false;
+  appState.rollbackTargetStep = null;
+
+  document.getElementById('step-list').innerHTML = '';
+  document.getElementById('step-counter').textContent = '';
+  document.getElementById('btn-start').disabled = true;
+  document.getElementById('sidebar-header').textContent = esc(company);
+  // Reset the right-panel action log to the empty placeholder
+  document.getElementById('action-log').innerHTML =
+    `<div id="empty-state" style="flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--text-dim);">` +
+    `<div style="font-size:48px;opacity:.3;">🗂️</div>` +
+    `<div style="font-size:13px;">Select a step to see its action log — or start the run.</div>` +
+    `</div>`;
+  _rollbackBanner = null;
+
+  const url = `ws://${location.host}/ws?company=${encodeURIComponent(company)}`;
+  wsCompany = new WebSocket(url);
+  setWsStatus('connecting');
+
+  wsCompany.onopen = () => {
+    setWsStatus('open');
+    console.log('[WS] connected to', company);
+  };
+  wsCompany.onclose = () => {
+    setWsStatus('closed');
+    document.getElementById('btn-start').disabled = true;
+  };
+  wsCompany.onerror = (e) => console.error('[WS]', e);
+  wsCompany.onmessage = (evt) => {
+    let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+    handleDetailEvent(msg);
+  };
+}
+
+function wsSend(obj) {
+  if (wsCompany && wsCompany.readyState === WebSocket.OPEN)
+    wsCompany.send(JSON.stringify(obj));
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Detail event dispatcher
+// ═══════════════════════════════════════════════════════════
+
+function handleDetailEvent(e) {
+  switch (e.type) {
+    case 'company_status':    onCompanyStatus(e);   break;
+    case 'run_init':          onRunInit(e);         break;
+    case 'run_start':         onRunStart(e);        break;
+    case 'step_start':        onStepStart(e);       break;
+    case 'action_start':      onActionStart(e);     break;
+    case 'action_update':     onActionUpdate(e);    break;
+    case 'action_end':        onActionEnd(e);       break;
+    case 'step_end':          onStepEnd(e);         break;
+    case 'interrupt':         onInterrupt(e);       break;
+    case 'run_end':           onRunEnd(e);          break;
+    case 'rollback_start':    onRollbackStart(e);   break;
+    case 'rollback_step_start': onRollbackStepStart(e); break;
+    case 'rollback_step_end':   onRollbackStepEnd(e);   break;
+    case 'rollback_end':      onRollbackEnd(e);     break;
+    default: console.log('[WS event]', e);
+  }
+}
+
+function onCompanyStatus(e) {
+  // Late-join: restore running state badge in titlebar
+  if (e.status === 'running' && e.current_step) {
+    setStatus(`Running ${e.current_step}…`);
+  }
+  // Enable Start button only for companies that have not yet run or have failed
+  if (e.status === 'idle' || e.status === 'failed') {
+    document.getElementById('btn-start').disabled = false;
+  }
+}
+
+function onRunInit(e) {
+  const prevSelected = appState.selectedStep;
+
+  // run_init fires before rollback_start in a rollback+restart flow.
+  // The event carries is_rollback:true so we can reliably detect this even
+  // after appState.running was cleared by onRunEnd when the prior run finished.
+  const isRollback = !!e.is_rollback;
+  const savedStatus  = isRollback ? {...appState.stepStatus}  : {};
+  const savedActions = isRollback ? {...appState.stepActions} : {};
+
+  appState.steps = e.steps || [];
+  appState.stepStatus  = {};
+  appState.stepActions = {};
+  appState.pollActionId    = {};
+  appState.currentRunStep  = null;
+  appState.running         = false;
+  appState.nextEligibleStepIndex = 0;
+  appState.autoFollow = true;
+  _rollbackBanner = null;
+
+  appState.steps.forEach(s => {
+    const saved = savedStatus[s.step_id];
+    if (saved === 'ok' || saved === 'skipped') {
+      appState.stepStatus[s.step_id]  = saved;
+      appState.stepActions[s.step_id] = savedActions[s.step_id] || [];
+    } else {
+      appState.stepStatus[s.step_id]  = 'pending';
+      appState.stepActions[s.step_id] = [];
+    }
+  });
+
+  // Recompute nextEligibleStepIndex from any preserved statuses.
+  // rollback_step_end will push it back down once rolled-back steps arrive.
+  for (let i = 0; i < appState.steps.length; i++) {
+    const st = appState.stepStatus[appState.steps[i].step_id];
+    if (st === 'ok' || st === 'skipped') appState.nextEligibleStepIndex = i + 1;
+    else break;
+  }
+
+  renderSidebar();
+  updateAllStepLockState();
+
+  // renderSidebar() always draws items as pending; repaint any preserved ones.
+  if (isRollback) {
+    appState.steps.forEach(s => {
+      if (appState.stepStatus[s.step_id] === 'ok' ||
+          appState.stepStatus[s.step_id] === 'skipped') {
+        updateSidebarItem(s.step_id);
+      }
+    });
+  }
+
+  if (prevSelected && appState.steps.some(s => s.step_id === prevSelected)) {
+    appState.selectedStep = prevSelected;
+    document.querySelectorAll('.step-item').forEach(el => {
+      el.classList.toggle('active', el.dataset.stepId === prevSelected);
+    });
+  }
+
+  if (e.company_config) {
+    const rc = e.company_config;
+    document.getElementById('sidebar-header').textContent =
+      [rc.company_code, rc.controlling_area, `FY${rc.fiscal_year}`, `P${rc.period}`, rc.currency]
+        .filter(Boolean).join(' · ');
+  }
+
+  appState.interrupted = false;
+  appState.rollbackTargetStep = null;
+  document.getElementById('btn-start').disabled = false;
+  document.getElementById('step-counter').textContent = `0 / ${appState.steps.length} steps`;
+  setStatus('Ready — click ▶ Start Run');
+}
+
+function onRunStart(e) {
+  appState.running = true;
+  document.getElementById('btn-start').disabled = true;
+  setStatus('Running…');
+}
+
+function onStepStart(e) {
+  const sid = e.step_id;
+  appState.stepStatus[sid] = 'running';
+  appState.currentRunStep = sid;
+  // Preserve action history from a previous run; insert a visual divider so
+  // the user can distinguish the old run's log from the new one.
+  const _existing = appState.stepActions[sid] || [];
+  if (_existing.length > 0) {
+    _existing.push({id: newId(), action: '__divider__', status: 'info', message: '', detail: null});
+    appState.stepActions[sid] = _existing;
+  } else {
+    appState.stepActions[sid] = [];
+  }
+  updateSidebarItem(sid);
+
+  if (appState.autoFollow) {
+    selectStep(sid);
+  } else if (appState.selectedStep === sid) {
+    renderActionLog(sid);
+  }
+
+  document.getElementById('step-counter').textContent = `${e.step_index + 1} / ${e.total} steps`;
+  document.getElementById('sb-step').textContent = sid;
+  setStatus(`Running ${sid}…`);
+}
+
+const ACTION_STATUS = {
+  pre_check:  'Checking preconditions',
+  execute:    'Submitting to SAP',
+  poll:       'Waiting for SAP job',
+  validate:   'Validating result',
+  analysis:   'Analysing error',
+  user_input: 'Waiting for decision',
+};
+
+function onActionStart(e) {
+  const entry = {id: newId(), action: e.action, status: 'running', message: e.message || '', detail: null};
+  if (e.action === 'poll') appState.pollActionId[e.step_id] = entry.id;
+  appState.stepActions[e.step_id].push(entry);
+  if (appState.selectedStep === e.step_id) appendActionEntry(e.step_id, entry);
+  setStatus(`${e.step_id}: ${ACTION_STATUS[e.action] || e.action}…`);
+}
+
+function onActionUpdate(e) {
+  const list = appState.stepActions[e.step_id] || [];
+  let entry = null;
+  if (e.action === 'poll') {
+    const pid = appState.pollActionId[e.step_id];
+    entry = pid ? list.find(x => x.id === pid) : null;
+  } else {
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].action === e.action && list[i].status === 'running') { entry = list[i]; break; }
+    }
+  }
+  if (entry) {
+    entry.message = e.message;
+    const el = document.getElementById(`action-${entry.id}`);
+    if (el) el.querySelector('.action-msg').textContent = e.message;
+  }
+  if (e.message) setStatus(`${e.step_id}: ${e.message}`);
+}
+
+function onActionEnd(e) {
+  const list = appState.stepActions[e.step_id] || [];
+  const pid  = appState.pollActionId[e.step_id];
+  let entry = null;
+  if (e.action === 'poll' && pid) {
+    entry = list.find(x => x.id === pid);
+  } else {
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].action === e.action && list[i].status === 'running') { entry = list[i]; break; }
+    }
+  }
+  if (entry) {
+    entry.status  = e.status;
+    entry.message = e.message || entry.message;
+    entry.detail  = e.detail  || null;
+    const el = document.getElementById(`action-${entry.id}`);
+    if (el) {
+      el.dataset.status = e.status;
+      const body = el.querySelector('.action-body');
+      body.innerHTML =
+        `<div class="action-title">${actionLabel(e.action, e.status)}</div>` +
+        `<div class="action-msg">${esc(entry.message)}</div>` +
+        (entry.detail ? renderDetail(e.action, entry.detail) : '');
+    }
+  }
+  if (e.action === 'poll') delete appState.pollActionId[e.step_id];
+}
+
+function onStepEnd(e) {
+  const sid = e.step_id;
+  appState.stepStatus[sid] = e.status;
+  if (appState.currentRunStep === sid) appState.currentRunStep = null;
+  updateSidebarItem(sid);
+  if (appState.selectedStep === sid) renderActionLog(sid);
+
+  // Sequential locking: advance eligible index on success or skip
+  if (e.status === 'ok' || e.status === 'skipped') {
+    const idx = appState.steps.findIndex(s => s.step_id === sid);
+    if (idx >= appState.nextEligibleStepIndex) {
+      appState.nextEligibleStepIndex = idx + 1;
+      updateAllStepLockState();
+    }
+  }
+  // On failure: keep index unchanged (operator decides via interrupt modal)
+}
+
+function onInterrupt(e) {
+  appState.interrupted = true;
+  document.getElementById('modal-step').textContent        = e.step_id || '';
+  document.getElementById('modal-diagnosis').textContent   = e.diagnosis || '';
+  document.getElementById('modal-instructions').textContent = e.user_instructions || '';
+  document.getElementById('modal-overlay').classList.add('visible');
+  document.getElementById('param-override').value = '';
+  setStatus(`⚠ Waiting for decision on ${e.step_id}`);
+}
+
+function onRunEnd(e) {
+  appState.running = false;
+  appState.interrupted = false;
+  appState.autoFollow = true;
+  // Completed periods cannot be re-run; failed runs keep nextEligibleStepIndex
+  // at the failed step so clicking Start retries from the right place.
+  document.getElementById('btn-start').disabled = (e.status === 'completed');
+  updateAllStepLockState();
+  let s;
+  if (e.status === 'completed') {
+    s = 'Run completed ✓';
+  } else if (e.status === 'aborted') {
+    s = 'Run aborted';
+  } else if (e.message) {
+    s = `Run failed: ${e.message}`;
+    showToast(`Run failed: ${e.message}`);
+  } else {
+    s = `Run ended: ${e.status}`;
+  }
+  setStatus(s);
+  document.getElementById('sb-step').textContent = '';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Rollback event handlers
+// ═══════════════════════════════════════════════════════════
+
+// Per-run rollback panel state (lives in action-log for the virtual __rollback__ step)
+let _rollbackBanner = null;
+
+function _ensureRollbackBanner(steps) {
+  const log = document.getElementById('action-log');
+  const es  = document.getElementById('empty-state');
+  if (es) es.remove();
+  if (_rollbackBanner) return _rollbackBanner;
+  const div = document.createElement('div');
+  div.className = 'rollback-banner';
+  div.id = 'rollback-banner';
+  div.innerHTML =
+    `<div class="rb-title">↩ Rolling back ${steps.length} step(s)…</div>` +
+    `<div id="rb-progress"></div>`;
+  log.appendChild(div);
+  _rollbackBanner = div;
+  return div;
+}
+
+function onRollbackStart(e) {
+  appState.running = true;
+  _rollbackBanner = null;
+  document.getElementById('btn-start').disabled = true;
+  // Show rollback in action log under the first step (or a virtual header)
+  const log = document.getElementById('action-log');
+  const es  = document.getElementById('empty-state');
+  if (es) es.remove();
+  log.innerHTML = '';
+  _rollbackBanner = null;
+  const steps = e.steps || [];
+  _ensureRollbackBanner(steps);
+  setStatus(`↩ Rolling back ${steps.length} step(s)…`);
+}
+
+function onRollbackStepStart(e) {
+  _ensureRollbackBanner([]);
+  const prog = document.getElementById('rb-progress');
+  if (prog) {
+    const row = document.createElement('div');
+    row.className = 'rollback-step-entry';
+    row.id = `rb-step-${e.step_id}`;
+    row.innerHTML =
+      `<span class="rb-entry-icon rb-entry-running">↺</span>` +
+      `<span style="color:var(--text-bright);font-weight:600">${esc(e.step_id)}</span>` +
+      `<span style="color:var(--text-dim);margin-left:4px">${esc(e.message || '')}</span>`;
+    prog.appendChild(row);
+    prog.scrollTop = prog.scrollHeight;
+  }
+  // Mark step as rolling back in sidebar
+  const el = document.querySelector(`.step-item[data-step-id="${e.step_id}"]`);
+  if (el) {
+    el.dataset.status = 'running';
+    el.querySelector('.step-icon').innerHTML = '<span class="spinner"></span>';
+  }
+  // Add a rollback entry to this step's action log so it shows in the detail panel.
+  if (!appState.stepActions[e.step_id]) appState.stepActions[e.step_id] = [];
+  const entry = {id: newId(), action: 'rollback', status: 'running', message: e.message || '', detail: null};
+  appState.stepActions[e.step_id].push(entry);
+  if (appState.selectedStep === e.step_id) appendActionEntry(e.step_id, entry);
+}
+
+function onRollbackStepEnd(e) {
+  const row = document.getElementById(`rb-step-${e.step_id}`);
+  if (row) {
+    const iconCls = e.status === 'ok' ? 'rb-entry-ok' : e.status === 'skipped' ? 'rb-entry-skipped' : 'rb-entry-error';
+    const iconCh  = e.status === 'ok' ? '✓' : e.status === 'skipped' ? '—' : '✗';
+    row.querySelector('.rb-entry-icon').className = `rb-entry-icon ${iconCls}`;
+    row.querySelector('.rb-entry-icon').textContent = iconCh;
+    const msgEl = row.querySelector('span:last-child');
+    if (msgEl) msgEl.textContent = e.message || '';
+  }
+  // Update the rollback action entry in this step's action log.
+  const list = appState.stepActions[e.step_id] || [];
+  const entry = list.slice().reverse().find(x => x.action === 'rollback' && x.status === 'running');
+  if (entry) {
+    const finalSt = e.status === 'ok' ? 'ok' : e.status === 'skipped' ? 'skipped' : 'failed';
+    entry.status  = finalSt;
+    entry.message = e.message || '';
+    const dom = document.getElementById(`action-${entry.id}`);
+    if (dom) {
+      dom.dataset.status = finalSt;
+      dom.querySelector('.action-title').innerHTML = actionLabel('rollback', finalSt);
+      dom.querySelector('.action-msg').textContent   = entry.message;
+    }
+  }
+  // Update sidebar icon based on rollback result
+  const el = document.querySelector(`.step-item[data-step-id="${e.step_id}"]`);
+  if (el) {
+    const newSt = e.status === 'ok' ? 'pending' : 'failed';
+    el.dataset.status = newSt;
+    el.querySelector('.step-icon').innerHTML = statusIcon(newSt);
+    appState.stepStatus[e.step_id] = newSt;
+    // Walk nextEligibleStepIndex back so this step becomes eligible again.
+    if (newSt === 'pending') {
+      const idx = appState.steps.findIndex(s => s.step_id === e.step_id);
+      if (idx >= 0 && idx < appState.nextEligibleStepIndex) {
+        appState.nextEligibleStepIndex = idx;
+      }
+    }
+    updateAllStepLockState();
+  }
+}
+
+function onRollbackEnd(e) {
+  const banner = document.getElementById('rollback-banner');
+  if (banner) {
+    banner.querySelector('.rb-title').textContent =
+      e.status === 'ok'
+        ? `↩ Rollback complete — ${e.message || ''}`
+        : `↩ Rollback finished with errors — ${e.message || ''}`;
+  }
+  setStatus('Rollback done — restarting…');
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Rollback dialog
+// ═══════════════════════════════════════════════════════════
+
+function showRollbackDialog(stepId) {
+  // Find all steps from stepId onwards that have status "ok" or "skipped"
+  const idx = appState.steps.findIndex(s => s.step_id === stepId);
+  if (idx < 0) return;
+  const stepsToRollback = appState.steps
+    .slice(idx)
+    .filter(s => {
+      const st = appState.stepStatus[s.step_id];
+      return st === 'ok' || st === 'skipped';
+    })
+    .map(s => s.step_id);
+
+  if (stepsToRollback.length === 0) {
+    // Nothing actually completed at or after this step — just start from here
+    wsSend({type: 'start', ...(idx > 0 ? {start_from_step: stepId} : {})});
+    document.getElementById('btn-start').disabled = true;
+    return;
+  }
+
+  appState.rollbackTargetStep = stepId;
+  document.getElementById('rb-target-step').textContent = stepId;
+  const listEl = document.getElementById('rb-steps-list');
+  listEl.innerHTML = stepsToRollback.map(sid =>
+    `<div class="rb-step-item">↩ ${esc(sid)}</div>`
+  ).join('');
+  document.getElementById('rollback-overlay').classList.add('visible');
+}
+
+function confirmRollback() {
+  const stepId = appState.rollbackTargetStep;
+  document.getElementById('rollback-overlay').classList.remove('visible');
+  if (!stepId) return;
+  // Close interrupt modal if open
+  document.getElementById('modal-overlay').classList.remove('visible');
+  wsSend({type: 'rollback_and_restart', start_from_step: stepId});
+  document.getElementById('btn-start').disabled = true;
+  setStatus(`↩ Initiating rollback from ${stepId}…`);
+}
+
+function openRollbackFromModal() {
+  // Close interrupt modal, then show rollback picker for the current (failed) step
+  document.getElementById('modal-overlay').classList.remove('visible');
+  const stepId = document.getElementById('modal-step').textContent.trim();
+  if (stepId) showRollbackDialog(stepId);
+}
+
+document.getElementById('btn-rb-confirm').addEventListener('click', confirmRollback);
+document.getElementById('btn-rb-cancel').addEventListener('click', () => {
+  document.getElementById('rollback-overlay').classList.remove('visible');
+  appState.rollbackTargetStep = null;
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Sequential step locking
+// ═══════════════════════════════════════════════════════════
+
+function updateAllStepLockState() {
+  appState.steps.forEach((s, idx) => {
+    const el  = document.querySelector(`.step-item[data-step-id="${s.step_id}"]`);
+    if (!el) return;
+    el.classList.remove('locked', 'eligible', 'done');
+    const st  = appState.stepStatus[s.step_id];
+    const isDone = st === 'ok' || st === 'skipped';
+    if (idx < appState.nextEligibleStepIndex || isDone) {
+      // "done" class enables rollback button on hover
+      el.classList.add('done');
+    } else if (idx === appState.nextEligibleStepIndex) {
+      el.classList.add('eligible');
+    } else {
+      el.classList.add('locked');
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Interrupt decision
+// ═══════════════════════════════════════════════════════════
+
+function sendDecision(action) {
+  const raw = document.getElementById('param-override').value.trim();
+  let overrides = null;
+  if (raw) { try { overrides = JSON.parse(raw); } catch { alert('Invalid JSON in overrides'); return; } }
+  wsSend({type: 'decision', action, param_overrides: overrides});
+  document.getElementById('modal-overlay').classList.remove('visible');
+  setStatus(`Decision sent: ${action}`);
+}
+
+document.querySelectorAll('.btn-retry, .btn-execute').forEach(btn => {
+  btn.addEventListener('click', () => document.getElementById('param-override-wrap').classList.add('visible'), true);
+});
+document.querySelectorAll('.btn-skip, .btn-abort').forEach(btn => {
+  btn.addEventListener('click', () => document.getElementById('param-override-wrap').classList.remove('visible'), true);
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Start button
+// ═══════════════════════════════════════════════════════════
+
+document.getElementById('btn-start').addEventListener('click', () => {
+  if (appState.running) return;
+  const eligibleStep = appState.steps[appState.nextEligibleStepIndex];
+  const st = eligibleStep && appState.stepStatus[eligibleStep.step_id];
+  if (st === 'ok' || st === 'skipped') { showAlreadyCalculated(eligibleStep.step_id); return; }
+  appState.autoFollow = true;
+  const fromStep = (eligibleStep && appState.nextEligibleStepIndex > 0)
+    ? eligibleStep.step_id : null;
+  wsSend({type: 'start', period: appState.period, fiscal_year: appState.fiscal_year,
+          ...(fromStep ? {start_from_step: fromStep} : {})});
+  document.getElementById('btn-start').disabled = true;
+  setStatus(fromStep ? `Starting from ${fromStep}…` : 'Starting run…');
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Sidebar rendering
+// ═══════════════════════════════════════════════════════════
+
+function renderSidebar() {
+  const list = document.getElementById('step-list');
+  list.innerHTML = '';
+  let lastGroup = null;
+
+  appState.steps.forEach((s, idx) => {
+    if (s.group && s.group !== lastGroup) {
+      const header = document.createElement('div');
+      header.style.cssText = 'padding:8px 12px 3px;font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:#5a5a5a;font-weight:600;';
+      header.textContent = `◈ ${s.group}`;
+      list.appendChild(header);
+      lastGroup = s.group;
+    }
+
+    const item = document.createElement('div');
+    item.className = 'step-item';
+    item.dataset.stepId = s.step_id;
+    item.dataset.status = 'pending';
+    item.innerHTML = `
+      <div class="step-icon">${statusIcon('pending')}</div>
+      <div class="step-meta">
+        <div class="step-id">${s.step_id}</div>
+        <div class="step-desc">${s.description || ''}</div>
+      </div>
+      <button class="step-rollback-btn" title="Roll back and restart from this step">↩</button>`;
+
+    item.addEventListener('click', (e) => {
+      if (e.target.classList.contains('step-rollback-btn')) return;
+      const status = appState.stepStatus[s.step_id];
+      // Locked+pending steps have no actions yet — block click
+      if (item.classList.contains('locked') && (!status || status === 'pending')) return;
+      // User manually picks a step — disengage auto-follow unless clicking the running step
+      if (appState.running) {
+        appState.autoFollow = (s.step_id === appState.currentRunStep);
+      }
+      selectStep(s.step_id);
+    });
+    item.querySelector('.step-rollback-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (appState.running && !appState.interrupted) {
+        showToast('Cannot roll back while a run is in progress');
+        return;
+      }
+      showRollbackDialog(s.step_id);
+    });
+    list.appendChild(item);
+  });
+}
+
+function updateSidebarItem(step_id) {
+  const st = appState.stepStatus[step_id] || 'pending';
+  const el = document.querySelector(`.step-item[data-step-id="${step_id}"]`);
+  if (!el) return;
+  el.dataset.status = st;
+  el.querySelector('.step-icon').innerHTML = statusIcon(st);
+  if (st === 'running') {
+    el.classList.add('current');
+    el.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  } else {
+    el.classList.remove('current');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Step selection / action log
+// ═══════════════════════════════════════════════════════════
+
+function selectStep(step_id) {
+  appState.selectedStep = step_id;
+  document.querySelectorAll('.step-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.stepId === step_id);
+  });
+  const info = appState.steps.find(s => s.step_id === step_id);
+  document.getElementById('content-breadcrumb').textContent =
+    info ? `${step_id}  —  ${info.description || step_id}` : step_id;
+  renderActionLog(step_id);
+}
+
+function renderActionLog(step_id) {
+  const log     = document.getElementById('action-log');
+  const actions = appState.stepActions[step_id] || [];
+  if (actions.length === 0) {
+    log.innerHTML = '';
+    const status = appState.stepStatus[step_id] || 'pending';
+    const d = document.createElement('div');
+    d.id = 'empty-state';
+    d.style.cssText = 'flex:1;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:12px;color:var(--text-dim);';
+    const emptyMsg = status === 'running' ? 'Step is running — waiting for first action…'
+                   : status === 'ok'      ? 'Step completed successfully.'
+                   : status === 'failed'  ? 'Step failed — no action log recorded.'
+                   : status === 'skipped' ? 'Step was skipped.'
+                   : 'No actions yet.';
+    d.innerHTML = `<div style="font-size:48px;opacity:.3;text-align:center;padding-top:60px">🗂️</div>
+      <div style="text-align:center;font-size:13px">${emptyMsg}</div>`;
+    log.appendChild(d);
+    return;
+  }
+  log.innerHTML = '';
+  actions.forEach(a => appendActionEntry(step_id, a, false));
+  log.scrollTop = log.scrollHeight;
+}
+
+function appendActionEntry(step_id, entry, scroll = true) {
+  const log = document.getElementById('action-log');
+  const es  = document.getElementById('empty-state');
+  if (es) es.remove();
+
+  if (entry.action === '__divider__') {
+    const sep = document.createElement('div');
+    sep.id = `action-${entry.id}`;
+    sep.style.cssText = 'display:flex;align-items:center;gap:8px;padding:10px 0;color:var(--text-dim);font-size:11px;letter-spacing:.05em;';
+    sep.innerHTML = '<div style="flex:1;height:1px;background:var(--border)"></div>' +
+                    '<span>↺ Restart</span>' +
+                    '<div style="flex:1;height:1px;background:var(--border)"></div>';
+    log.appendChild(sep);
+    if (scroll) log.scrollTop = log.scrollHeight;
+    return;
+  }
+
+  const div = document.createElement('div');
+  div.className = 'action-entry';
+  div.id = `action-${entry.id}`;
+  div.dataset.status = entry.status;
+  div.innerHTML =
+    `<div class="action-icon">${actionIcon(entry.action)}</div>` +
+    `<div class="action-body">` +
+      `<div class="action-title">${actionLabel(entry.action, entry.status)}</div>` +
+      `<div class="action-msg">${esc(entry.message)}</div>` +
+      (entry.detail ? renderDetail(entry.action, entry.detail) : '') +
+    `</div>`;
+  log.appendChild(div);
+  if (scroll) log.scrollTop = log.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Detail panel renderer
+// ═══════════════════════════════════════════════════════════
+
+function renderDetail(action, detail) {
+  if (!detail) return '';
+  const parts = [];
+
+  if (action === 'pre_check') {
+    if (detail.table && detail.rows && detail.rows.length > 0) {
+      const row  = detail.rows[0];
+      const keys = Object.keys(row);
+      const hdr  = keys.map(k => `<th>${esc(k)}</th>`).join('');
+      const cells = keys.map(k => `<td>${esc(String(row[k] ?? ''))}</td>`).join('');
+      parts.push(`<div class="det-row"><span class="det-lbl">Table:</span> <b>${esc(detail.table)}</b></div>` +
+        `<table class="det-table"><tr>${hdr}</tr><tr>${cells}</tr></table>`);
+    }
+    if (detail.field !== undefined) {
+      const pass = detail.passed;
+      const cls  = pass ? 'det-pass' : 'det-fail';
+      parts.push(`<div class="det-check">Check: <b>${esc(detail.field)}</b> ${esc(detail.operator)} <b>"${esc(String(detail.expected))}"</b>` +
+        ` → actual: <b>"${esc(String(detail.actual))}"</b>` +
+        ` → <span class="${cls}">${pass ? '✓ PASSED' : '✗ FAILED'}</span></div>`);
+    }
+    if (detail.llm_response) {
+      parts.push(`<div class="det-row"><span class="det-lbl">LLM:</span> ${esc(detail.llm_response)}</div>`);
+    }
+  } else if (action === 'execute') {
+    if (detail.job_name) parts.push(`<div class="det-row"><span class="det-lbl">Job:</span> <b>${esc(detail.job_name)}</b> / <b>${esc(detail.job_id)}</b></div>`);
+    if (detail.status) parts.push(`<div class="det-row"><span class="det-lbl">Status:</span> ${esc(detail.status)}` +
+      (detail.requires_poll ? ' <span style="color:var(--running)">→ poll required</span>' : '') + `</div>`);
+    if (detail.messages && detail.messages.length > 0)
+      parts.push(`<div class="det-msgs">${detail.messages.map(m => `<div class="det-msg">• ${esc(m)}</div>`).join('')}</div>`);
+  } else if (action === 'validate') {
+    const vmap = {ok: 'det-pass', retry: 'det-warn', escalate: 'det-fail'};
+    const vcls = vmap[detail.verdict] || '';
+    parts.push(`<div class="det-row"><span class="det-lbl">Verdict:</span> <span class="${vcls}"><b>${esc((detail.verdict || '').toUpperCase())}</b></span> &nbsp;·&nbsp; <span class="det-lbl">Errors:</span> ${detail.error_count ?? 0}</div>`);
+    if (detail.reasoning) parts.push(`<div class="det-row"><span class="det-lbl">Reasoning:</span> ${esc(detail.reasoning)}</div>`);
+    if (detail.spool_preview) {
+      parts.push(`<details class="det-spool"><summary class="det-lbl">Spool preview</summary><pre class="det-pre">${esc(detail.spool_preview)}</pre></details>`);
+    } else if (detail.messages && detail.messages.length > 0) {
+      parts.push(`<div class="det-msgs">${detail.messages.slice(0, 6).map(m => `<div class="det-msg">• ${esc(m)}</div>`).join('')}</div>`);
+    }
+  }
+  if (parts.length === 0) return '';
+  return `<div class="action-detail">${parts.join('')}</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════
+
+let _uid = 0;
+function newId() { return ++_uid; }
+
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function setWsStatus(s) {
+  const el = document.getElementById('ws-status');
+  el.className = `ws-status ${s}`;
+  el.textContent = s === 'open' ? '⬤ connected' : s === 'connecting' ? '⬤ connecting' : '⬤ disconnected';
+}
+
+function statusIcon(st) {
+  switch (st) {
+    case 'ok':      return '✓';
+    case 'failed':  return '✗';
+    case 'skipped': return '—';
+    case 'running': return '<span class="spinner"></span>';
+    default:        return '○';
+  }
+}
+
+function actionIcon(action) {
+  const icons = {pre_check:'🔍', execute:'▶', poll:'⏳', validate:'✔', analysis:'🤖', user_input:'👤', rollback:'↩'};
+  return icons[action] || '•';
+}
+
+function actionLabel(action, status) {
+  const names = {pre_check:'Pre-check', execute:'Execute', poll:'Poll', validate:'Validate', analysis:'Analysis', user_input:'Operator Input', rollback:'Rollback'};
+  const sfx  = status === 'running' ? '…' : status === 'ok' ? ' ✓' : status === 'failed' ? ' ✗' : status === 'skipped' ? ' —' : '';
+  if (action === 'rollback') {
+    // Label in rollback-orange, suffix in status color so the ✓ stays green.
+    const sfxColor = status === 'ok' ? 'var(--ok)' : status === 'failed' ? 'var(--failed)'
+                   : status === 'running' ? '#ffb347' : 'var(--skipped)';
+    return `<span style="color:#ffb347">Rollback</span><span style="color:${sfxColor}">${sfx}</span>`;
+  }
+  const base = names[action] || action;
+  return base + sfx;
+}
+
+function setStatus(msg) { document.getElementById('status-text').textContent = msg; }
+
+function showAlreadyCalculated(stepId) {
+  showToast(`"${stepId}" has already been calculated`);
+}
+
+function showToast(msg, duration = 3500) {
+  let t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('visible');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('visible'), duration);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Period picker modal events
+// ═══════════════════════════════════════════════════════════
+
+document.getElementById('pm-btn-start').addEventListener('click', confirmPeriodEdit);
+document.getElementById('pm-btn-cancel').addEventListener('click', () => {
+  document.getElementById('period-overlay').classList.remove('visible');
+});
+document.getElementById('pm-year').addEventListener('keydown', e => {
+  if (e.key === 'Enter') confirmPeriodEdit();
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Login keyboard shortcut
+// ═══════════════════════════════════════════════════════════
+
+document.getElementById('login-pass').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+document.getElementById('login-user').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('login-pass').focus();
+});
+
+// ═══════════════════════════════════════════════════════════
+//  Boot
+// ═══════════════════════════════════════════════════════════
+
+checkAuth();
+</script>
+</body>
+</html>

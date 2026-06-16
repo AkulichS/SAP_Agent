@@ -1,0 +1,55 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Configuration for the SAP Period Close MCP Server.
+# The graph_builder.py reads this file to know how to start / connect to
+# the MCP server process.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+# ── MCP Server process settings ────────────────────────────────────────────
+server:
+  # Transport: "stdio" (default, same machine) or "sse" (remote / containerised)
+  transport: stdio
+
+  # --- stdio transport (used when transport=stdio) ---
+  # Command that starts the MCP server. The agent spawns this as a subprocess.
+  command: sys.executable
+  args:
+    - mcp_server.py
+
+  # --- SSE transport (used when transport=sse) ---
+  # Uncomment when running mcp_server.py as a standalone service.
+  # sse_url: http://localhost:8000/sse
+
+
+# ── Tool behaviour ─────────────────────────────────────────────────────────
+tools:
+  # How often to poll for job completion (seconds)
+  poll_interval_seconds: 10
+
+  # Maximum number of polls before treating job as timed-out
+  poll_max_attempts: 100
+
+  # SAP background job class: A (normal), B (low), C (high priority)
+  default_job_class: "A"
+
+
+# ── Tools exposed by this server ──────────────────────────────────────────
+# Informational only — FastMCP auto-discovers tools via @mcp.tool() decorator.
+# Listed here for documentation and for clients that want to validate upfront.
+exposed_tools:
+  - name: sap_check_period
+    description: >
+      Pre-check whether a posting period is open and master data is consistent.
+      Returns period_open (bool), data_ok (bool), messages list.
+
+  - name: sap_execute_step
+    description: >
+      Submit an SAP RFC-based period-close step as a background job.
+      Polls until the job reaches status F (finished) or A (aborted).
+      Returns job_id, job_name, status, success flag, messages.
+
+  - name: sap_read_spool
+    description: >
+      Read the spool output of a completed SAP background job.
+      Output is truncated to max_lines (default 500) before returning
+      to avoid flooding the LLM context window.

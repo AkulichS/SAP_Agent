@@ -1,0 +1,47 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug: config.py (load_config)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+            "program": "${workspaceFolder}/config.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
+                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
+            }
+        },
+        {
+            "name": "Debug: web_app (uvicorn)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+            "module": "uvicorn",
+            "args": ["web_app:app", "--host", "0.0.0.0", "--port", "8080"],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
+                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
+            }
+        },
+        {
+            "name": "Debug: graph_builder (CLI)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+            "program": "${workspaceFolder}/graph_builder.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
+                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
+            }
+        }
+    ]
+}

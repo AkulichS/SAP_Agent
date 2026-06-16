@@ -1,0 +1,24 @@
+# SAP Period Close — company registry
+# Each entry points to the company-specific config in configs/
+# fiscal_year and period are NOT stored here — they are chosen at run time via the dashboard.
+
+companies:
+  - code: "RU06"
+    display_name: "ООО Компания А"
+    config_file: "configs/period_close_RU06.yaml"
+
+  - code: "RU07"
+    display_name: "ООО Компания Б"
+    config_file: "configs/period_close_RU07.yaml"
+
+  - code: "RU08"
+    display_name: "ООО Компания В"
+    config_file: "configs/period_close_RU08.yaml"
+
+  - code: "RU09"
+    display_name: "ООО Компания Г"
+    config_file: "configs/period_close_RU09.yaml"
+
+  - code: "RU10"
+    display_name: "ООО Компания Д"
+    config_file: "configs/period_close_RU10.yaml"

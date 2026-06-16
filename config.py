@@ -1,91 +1,263 @@
 """
-config.py — single source of truth for the LangGraph MCP agent
-───────────────────────────────────────────────────────────────
-Imported by both agent.py (CLI) and chat_app.py (Streamlit UI).
-Edit this file to change prompts, models, servers, or tool icons.
+config.py — config loader, LLM factory and checkpointer for the SAP Period Close agent.
 """
 
-import os
-import sys
-from pathlib import Path
-import httpx
+from __future__ import annotations
 
+import copy
+import os
+from pathlib import Path
+
+import httpx
+import yaml
 from langchain_openai import ChatOpenAI
 
-# ── Paths ──────────────────────────────────────────────────────────────────────
 SERVERS_DIR = Path(__file__).parent / "tools"
 
+# ---------------------------------------------------------------------------
+# Provider registry
+# ---------------------------------------------------------------------------
 
-# ── LLM factory ───────────────────────────────────────────────────────────────
-def build_llm(api_key_name: str | None = None) -> ChatOpenAI:
-    """
-    Return a configured LLM.  Falls back to env vars when keys are not passed.
-    Priority: Groq (free, fast) → OpenAI → EnvironmentError.
-    """
-
-    if api_key_name == 'GROQ_API_KEY':
-        return ChatOpenAI(
-            model="llama-3.3-70b-versatile",
-            base_url="https://api.groq.com/openai/v1",
-            api_key=os.getenv("GROQ_API_KEY"),
-            temperature=0,
-            max_retries=3,
-            http_client=httpx.Client(verify=False),
-        )
-
-    elif api_key_name == 'OPENROUTER_API_KEY':
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        return ChatOpenAI(
-            model="openrouter/free",                  # selects a suitable available free model,
-            base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY"),   
-            temperature=0,
-            http_client=httpx.Client(verify=False),
-        )
-        
-    raise EnvironmentError("No LLM API key found. Set API_KEY in .env")
-
-
-# ── MCP server configuration ───────────────────────────────────────────────────
-def build_mcp_config(sap_conn, job_result) -> dict:
-    """
-    Config dict for MultiServerMCPClient.
-    Each entry launches a server subprocess over stdio transport.
-    """
-    return {
-        "read_job_spool": {
-            "command":   sys.executable,
-            "args":      [str(SERVERS_DIR / "tool_read_job_spool.py"), sap_conn, job_result],
-            "transport": "stdio",
-        },
-    }
-
-
-# ── System prompt ──────────────────────────────────────────────────────────────
-# Edit this to change how the agent behaves, which tools it prefers, or its tone.
-SYSTEM_PROMPT = """You are a highly capable SAP assistant with access to real SAP tools.
-
-Available tools:
-
-• read_job_spool    — Read SAP Spool when job is complited.
-
-
-Decision rules:
-
-1. Use tool read_job_spool() only after the submitted job was complited.
-2. For complex questions → chain multiple tools in order.
-3. Always base your final answer on actual tool results, not assumptions.
-4. For running tools use only proper JSON format, don't use XML
-"""
-
-
-# ── Tool display metadata (used by the Streamlit UI) ──────────────────────────
-# Maps tool name → emoji icon shown in the chat interface.
-# Add an entry here whenever you add a new MCP tool.
-TOOL_ICONS: dict[str, str] = {
-    "calculate":           "🔢",
-    "get_current_weather": "🌤️",
-    "get_forecast":        "📅",
-    "web_search":          "🔍",
-    "news_search":         "📰",
+_PROVIDERS: dict[str, dict] = {
+    "groq": {
+        "base_url":    "https://api.groq.com/openai/v1",
+        "api_key_env": "GROQ_API_KEY",
+    },
+    "openrouter": {
+        "base_url":    "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
 }
+
+# Default profiles used when llm_profiles is absent
+_DEFAULT_PROFILES: dict[str, dict] = {
+    "analysis": {
+        "provider":    "groq",
+        "model":       "llama-3.3-70b-versatile",
+        "temperature": 0,
+    },
+    "validation": {
+        "provider":    "groq",
+        "model":       "llama-3.1-8b-instant",
+        "temperature": 0,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Step merge helpers
+# ---------------------------------------------------------------------------
+
+def _merge_params(base_params: list, override_params: list) -> list:
+    """Merge params lists by selname key.
+
+    Override replaces a matching base entry in-place (preserving order).
+    Override entries with no matching selname are appended at the end.
+    """
+    override_map = {p["selname"]: dict(p) for p in override_params}
+    result: list = []
+    used: set = set()
+    for p in base_params:
+        sn = p["selname"]
+        result.append(override_map[sn] if sn in override_map else dict(p))
+        used.add(sn)
+    for p in override_params:
+        if p["selname"] not in used:
+            result.append(dict(p))
+    return result
+
+
+def _merge_step(base_step: dict, override: dict) -> dict:
+    """Deep-merge a company step override onto the base step template.
+
+    - Scalar fields: company value wins.
+    - params (list): merged by selname via _merge_params.
+    - params (dict, TOOLS action): shallow dict merge.
+    - Nested dicts (pre_check, validate, rollback, on_error): shallow merge.
+    """
+    merged = copy.deepcopy(base_step)
+    for key, val in override.items():
+        if key == "step_id":
+            continue
+        if key == "params":
+            base_params = merged.get("params")
+            if isinstance(base_params, list) and isinstance(val, list):
+                merged["params"] = _merge_params(base_params, val)
+            elif isinstance(base_params, dict) and isinstance(val, dict):
+                merged["params"] = {**base_params, **val}
+            else:
+                merged["params"] = val
+        elif isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **val}
+        else:
+            merged[key] = val
+    return merged
+
+
+def _build_steps(base_steps: list[dict], company_steps: list[dict] | None) -> list[dict]:
+    """Build the final ordered step list for a company.
+
+    Rules:
+    - company_steps is None → all base steps used as-is (backwards compat).
+    - step present in company only → included as-is (company-specific step).
+    - step present in both → merged (company overrides win on conflict).
+    - step present in base only → omitted.
+    """
+    if company_steps is None:
+        return base_steps
+
+    base_map = {s["step_id"]: s for s in base_steps}
+    result: list[dict] = []
+    for entry in company_steps:
+        step_id = entry["step_id"]
+        if step_id not in base_map:
+            result.append(entry)
+        elif len(entry) == 1:
+            result.append(base_map[step_id])
+        else:
+            result.append(_merge_step(base_map[step_id], entry))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Config loader: base.yaml + company override + runtime period/fiscal_year
+# ---------------------------------------------------------------------------
+
+def load_config(
+    company_config_path: str,
+    period: str | None = None,
+    fiscal_year: str | None = None,
+) -> dict:
+    """Load merged config: configs/base.yaml + company file + runtime period/fiscal_year.
+
+    Company file provides company_config (company_code, controlling_area, currency)
+    and an optional steps list that controls which steps run and in what order.
+    Falls back to single-file loading when base.yaml is not present (legacy CLI use).
+    """
+    company_path = Path(company_config_path)
+    if not company_path.is_absolute():
+        company_path = Path(__file__).parent / company_config_path
+    base_path = company_path.parent / "base.yaml"
+
+    if base_path.exists() and company_path.name != "base.yaml":
+        with open(base_path, encoding="utf-8") as f:
+            result: dict = yaml.safe_load(f)
+        with open(company_path, encoding="utf-8") as f:
+            company_cfg: dict = yaml.safe_load(f)
+
+        # company_config: company wins on conflict
+        run_ctx = {
+            **result.get("company_config", {}),
+            **company_cfg.get("company_config", {}),
+        }
+
+        # Allow company to partially override defaults or llm_profiles
+        for key in ("defaults", "llm_profiles"):
+            if key in company_cfg:
+                result[key] = {**result.get(key, {}), **company_cfg[key]}
+
+        # Build final steps from base library + company step declarations
+        result["steps"] = _build_steps(
+            result.get("steps", []),
+            company_cfg.get("steps"),
+        )
+    else:
+        with open(company_path, encoding="utf-8") as f:
+            result = yaml.safe_load(f)
+        run_ctx = result.get("company_config", {})
+
+    if period is not None:
+        run_ctx["period"] = period
+    if fiscal_year is not None:
+        run_ctx["fiscal_year"] = fiscal_year
+    result["company_config"] = run_ctx
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public factories
+# ---------------------------------------------------------------------------
+
+def build_llm(profile_name: str = "analysis") -> ChatOpenAI:
+    """Return an LLM from a named default profile ('analysis' | 'validation')."""
+    profile = _DEFAULT_PROFILES.get(profile_name, _DEFAULT_PROFILES["analysis"])
+    return _llm_from_profile(profile)
+
+
+def build_llms_from_config(period_cfg: dict) -> dict[str, ChatOpenAI]:
+    """
+    Return {"analysis": LLM, "validation": LLM} resolved from config.
+    Falls back to _DEFAULT_PROFILES when a profile is absent.
+    """
+    llm_profiles = period_cfg.get("llm_profiles", {})
+    result: dict[str, ChatOpenAI] = {}
+    for name in ("analysis", "validation"):
+        profile = llm_profiles.get(name, _DEFAULT_PROFILES[name])
+        result[name] = _llm_from_profile(profile)
+    return result
+
+
+def build_checkpointer(db_path: str | None = None):
+    """Sync checkpointer for CLI use. Falls back to InMemorySaver."""
+    import logging as _log
+    path = db_path or os.getenv("CHECKPOINT_DB", "period_close_checkpoints.db")
+    try:
+        import sqlite3
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        conn = sqlite3.connect(path, check_same_thread=False)
+        saver = SqliteSaver(conn)
+        _log.getLogger(__name__).info("Using SqliteSaver at %s", path)
+        return saver
+    except Exception as exc:
+        _log.getLogger(__name__).warning(
+            "SqliteSaver failed (%s) — using InMemorySaver", exc
+        )
+    from langgraph.checkpoint.memory import InMemorySaver
+    return InMemorySaver()
+
+
+async def build_async_checkpointer(db_path: str | None = None):
+    """
+    Async checkpointer for use with graph.ainvoke / astream.
+    Creates an AsyncSqliteSaver by opening an aiosqlite connection directly.
+    Falls back to InMemorySaver when aiosqlite is absent.
+    """
+    import logging as _log
+    path = db_path or os.getenv("CHECKPOINT_DB", "period_close_checkpoints.db")
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        conn = await aiosqlite.connect(path)
+        saver = AsyncSqliteSaver(conn)
+        await saver.setup()
+        _log.getLogger(__name__).info("Using AsyncSqliteSaver at %s", path)
+        return saver
+    except Exception as exc:
+        _log.getLogger(__name__).warning(
+            "AsyncSqliteSaver failed (%s) — using InMemorySaver", exc
+        )
+    from langgraph.checkpoint.memory import InMemorySaver
+    return InMemorySaver()
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _llm_from_profile(profile: dict) -> ChatOpenAI:
+    provider_name = profile.get("provider", "groq")
+    provider = _PROVIDERS.get(provider_name)
+    if provider is None:
+        raise ValueError(
+            f"Unknown LLM provider '{provider_name}'. "
+            f"Supported: {list(_PROVIDERS)}"
+        )
+    api_key = os.getenv(provider["api_key_env"])
+    return ChatOpenAI(
+        model=profile["model"],
+        base_url=provider["base_url"],
+        api_key=api_key,
+        temperature=profile.get("temperature", 0),
+        max_retries=3,
+        http_client=httpx.Client(verify=False),
+    )
