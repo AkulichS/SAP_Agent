@@ -20,7 +20,7 @@ import yaml
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 from logging_config import init_logging
 from sap_connection_manager import SAPConnectionManager, SAPConnectionParams

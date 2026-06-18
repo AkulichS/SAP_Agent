@@ -29,9 +29,10 @@ from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisco
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", override=True)
 
 import auth
+from config import load_config, reset_each_run_enabled
 from run_manager import get_company, get_run_manager, load_companies
 
 logging.basicConfig(level=logging.INFO,
@@ -76,6 +77,13 @@ def _companies_for_user(session: dict) -> list[dict]:
         if c["code"] in codes:
             entry = dict(c)
             entry["run_status"] = mgr.get_status(c["code"])
+            # Dev/testing flag: when on, a finished run can be re-run (Start stays active).
+            try:
+                cfg = load_config(c["config_file"])
+                entry["reset_each_run"] = reset_each_run_enabled(cfg.get("defaults", {}))
+            except Exception as exc:
+                logger.warning("reset_each_run lookup failed for %s: %s", c["code"], exc)
+                entry["reset_each_run"] = False
             result.append(entry)
     return result
 

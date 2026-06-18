@@ -693,6 +693,7 @@ const appState = {
   autoFollow: true,           // right panel tracks the currently running step
   interrupted: false,         // graph is paused at user_node
   rollbackTargetStep: null,   // step_id selected for rollback (pending confirmation)
+  testMode: false,            // reset_each_run on → a finished run can be re-started
 
   // Dashboard
   companies: [],              // [{code, display_name, run_status, ...}]
@@ -954,7 +955,9 @@ function cardHTML(c) {
   const rs      = (c.run_status || {status: 'idle'});
   const stBadge = statusBadge(rs.status);
   const prog    = progressText(rs);
-  const isIdle  = rs.status === 'idle' || rs.status === 'failed';
+  // In testing mode (reset_each_run) a finished run can be re-started.
+  const canStart = rs.status === 'idle' || rs.status === 'failed'
+                   || (c.reset_each_run && rs.status === 'completed');
   const p = appState.period, fy = appState.fiscal_year;
   const periodLabel = p && fy
     ? `Period ${esc(p)} / ${esc(fy)}`
@@ -974,7 +977,7 @@ function cardHTML(c) {
     <div class="company-progress" id="progress-${c.code}">${prog}</div>
     <div class="company-card-actions">
       <button class="card-btn btn-card-start" id="start-${c.code}"
-        ${isIdle ? '' : 'disabled'}
+        ${canStart ? '' : 'disabled'}
         onclick="startCompany('${esc(c.code)}')">▶ Start</button>
       <button class="card-btn btn-card-view" onclick="showDetail('${esc(c.code)}')">👁 View</button>
     </div>`;
@@ -1110,6 +1113,7 @@ function onRunInit(e) {
   const savedStatus  = isRollback ? {...appState.stepStatus}  : {};
   const savedActions = isRollback ? {...appState.stepActions} : {};
 
+  appState.testMode = !!e.test_mode;
   appState.steps = e.steps || [];
   appState.stepStatus  = {};
   appState.stepActions = {};
@@ -1303,7 +1307,7 @@ function onRunEnd(e) {
   appState.autoFollow = true;
   // Completed periods cannot be re-run; failed runs keep nextEligibleStepIndex
   // at the failed step so clicking Start retries from the right place.
-  document.getElementById('btn-start').disabled = (e.status === 'completed');
+  document.getElementById('btn-start').disabled = (e.status === 'completed' && !appState.testMode);
   updateAllStepLockState();
   let s;
   if (e.status === 'completed') {

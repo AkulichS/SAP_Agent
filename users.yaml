@@ -7,19 +7,7 @@ users:
     password_hash: "$2b$12$sLOx4dMcQKJ75fMbjBTOVOvskFKxL9ONbaUQqWTXfJ3liwoEttcWi"
     display_name: "Иванов И.И."
     role: operator
-    company_codes: ["RU06", "RU07"]
-
-  - username: petrova
-    password_hash: "$2b$12$aznj05ZYY9ZuJtKTIvleWOZ3tfYPUuNFgvYXp676DwAki5s29r0hS"
-    display_name: "Петрова А.А."
-    role: operator
-    company_codes: ["RU08", "RU09"]
-
-  - username: sidorov
-    password_hash: "$2b$12$SXGh4daWBZkaq7lq6zxXfOwNKk5Ov4gF8oXxxagoi5GWSYqOcl/Ce"
-    display_name: "Сидоров П.В."
-    role: operator
-    company_codes: ["RU10"]
+    company_codes: ["RU72", "RU06"]
 
   - username: admin
     password_hash: "$2b$12$UIwBmhW7MDWPo9NC9l8fPOr8ZtfyXfHozjw6SFwKRFuBdIBoHszfq"

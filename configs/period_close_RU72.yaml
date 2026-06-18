@@ -9,10 +9,14 @@ company_config:
 
 steps:
 
-  - step_id: "ZFK_COMPARISON"
-    params:
-      - {selname: "S_HKONT",  kind: "P", low: "7070106", high: "7070120"}:
+  # - step_id: "ZFK_COMPARISON"
+  #   params:
+  #     - {selname: "S_HKONT",  kind: "P", low: "7070106", high: "7070120"}:
   
   - step_id: "KO8G"
     params:
-      
+      - {selname: "VARIANT", kind: "P", low: "TEST"}
+
+    pre_check:
+      params:
+        - {selname: "VARIANT", kind: "P", low: "FK01_INT_ORDER"}

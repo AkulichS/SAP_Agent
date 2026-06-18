@@ -4,21 +4,13 @@
 
 companies:
   - code: "RU06"
-    display_name: "ООО Компания А"
+    display_name: "ООО Компания RU06"
     config_file: "configs/period_close_RU06.yaml"
 
-  - code: "RU07"
-    display_name: "ООО Компания Б"
-    config_file: "configs/period_close_RU07.yaml"
+  - code: "RU72"
+    display_name: "ООО Компания RU72"
+    config_file: "configs/period_close_RU72.yaml"
 
-  - code: "RU08"
-    display_name: "ООО Компания В"
-    config_file: "configs/period_close_RU08.yaml"
-
-  - code: "RU09"
-    display_name: "ООО Компания Г"
-    config_file: "configs/period_close_RU09.yaml"
-
-  - code: "RU10"
-    display_name: "ООО Компания Д"
-    config_file: "configs/period_close_RU10.yaml"
+  - code: "RU47"
+    display_name: "ООО Компания RU47"
+    config_file: "configs/period_close_RU47.yaml"

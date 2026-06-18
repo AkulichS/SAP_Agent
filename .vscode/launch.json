@@ -9,10 +9,8 @@
             "program": "${workspaceFolder}/config.py",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "env": {
-                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
-                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
-            }
+            "cwd": "${workspaceFolder}",
+            "envFile": "${workspaceFolder}/.env"
         },
         {
             "name": "Debug: web_app (uvicorn)",
@@ -24,10 +22,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "cwd": "${workspaceFolder}",
-            "env": {
-                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
-                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
-            }
+            "envFile": "${workspaceFolder}/.env"
         },
         {
             "name": "Debug: graph_builder (CLI)",
@@ -38,10 +33,7 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "cwd": "${workspaceFolder}",
-            "env": {
-                "GROQ_API_KEY": "${env:GROQ_API_KEY}",
-                "OPENROUTER_API_KEY": "${env:OPENROUTER_API_KEY}"
-            }
+            "envFile": "${workspaceFolder}/.env"
         }
     ]
 }

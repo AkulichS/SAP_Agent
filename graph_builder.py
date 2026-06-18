@@ -30,12 +30,13 @@ import re
 import sys, os
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
+from uuid import uuid4
 
 import yaml
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env", override=True)
 from langgraph.graph.message import add_messages
 from langchain_core.tools import tool as lc_tool
 from langchain_openai import ChatOpenAI
@@ -47,7 +48,8 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from config import build_async_checkpointer, build_checkpointer, build_llms_from_config, load_config
+from config import (build_async_checkpointer, build_checkpointer, build_llms_from_config,
+                    load_config, reset_each_run_enabled)
 
 logger = logging.getLogger(__name__)
 
@@ -163,11 +165,35 @@ def _defaults(state: PeriodCloseState) -> dict:
     return state.get("global_defaults", {})
 
 
-def _compare(actual: str, op: str, expected: str) -> bool:
-    ops = {"eq": lambda a, b: a == b, "ne": lambda a, b: a != b,
-           "gt": lambda a, b: a > b,  "lt": lambda a, b: a < b,
-           "contains": lambda a, b: b in a}
-    return ops.get(op, lambda a, b: False)(str(actual), str(expected))
+def _as_number(x: Any) -> float | None:
+    """Best-effort numeric parse; tolerates thousands separators and SAP sign suffix."""
+    try:
+        s = str(x).strip().replace(" ", "").replace(",", "")
+        if s.endswith("-"):           # SAP trailing-minus notation, e.g. "100.00-"
+            s = "-" + s[:-1]
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _compare(actual: Any, op: str, expected: Any) -> bool:
+    """Compare actual vs expected. Numeric when both parse as numbers, else string.
+
+    Operators (case-insensitive): eq, ne, gt, lt, ge, le, contains.
+    """
+    op = (op or "eq").lower()
+    na, nb = _as_number(actual), _as_number(expected)
+    if op in ("eq", "ne", "gt", "lt", "ge", "le") and na is not None and nb is not None:
+        a, b = na, nb
+    else:
+        a, b = str(actual), str(expected)
+    ops = {
+        "eq": lambda a, b: a == b, "ne": lambda a, b: a != b,
+        "gt": lambda a, b: a > b,  "lt": lambda a, b: a < b,
+        "ge": lambda a, b: a >= b, "le": lambda a, b: a <= b,
+        "contains": lambda a, b: str(b) in str(a),
+    }
+    return ops.get(op, lambda a, b: False)(a, b)
 
 
 # ---------------------------------------------------------------------------
@@ -253,36 +279,59 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         if mode == "comparison":
             cmp    = pc["comparison"]
             rows   = raw_data.get("rows", [])
-            actual = rows[0].get(cmp["field"], "") if rows else ""
-            passed = _compare(actual, cmp["operator"], cmp["value"])
+            if not isinstance(rows, list):
+                rows = []
+            select = cmp.get("select", "first")
             on_pass, on_fail = cmp.get("on_pass", "execute"), cmp.get("on_fail", "skip")
 
+            # Determine the comparison outcome.
+            if select in ("empty", "non_empty"):
+                # Table-level emptiness check; field/operator/value are ignored.
+                passed = (len(rows) == 0) if select == "empty" else (len(rows) > 0)
+                actual = f"{len(rows)} row(s)"
+                cond   = f"table is {select.replace('_', '-')}"
+            else:
+                row    = rows[-1] if (select == "last" and rows) else (rows[0] if rows else {})
+                actual = row.get(cmp["field"], "") if row else ""
+                passed = _compare(actual, cmp.get("operator", "eq"), cmp.get("value", ""))
+                cond   = (f"{cmp.get('field', '')}={actual!r} "
+                          f"{cmp.get('operator', 'eq')} {cmp.get('value', '')!r}")
+
+            params   = pc.get("params")
+            table_id = params.get("table", "") if isinstance(params, dict) else pc.get("object_name", "")
             _det = {
-                "table":    pc.get("params", {}).get("table", ""),
-                "rows":     raw_data.get("rows", [])[:5],
-                "field":    cmp["field"],
+                "table":    table_id,
+                "rows":     rows[:5],
+                "select":   select,
+                "field":    cmp.get("field", ""),
                 "actual":   actual,
-                "operator": cmp["operator"],
-                "expected": cmp["value"],
+                "operator": cmp.get("operator", ""),
+                "expected": cmp.get("value", ""),
                 "passed":   passed,
             }
             if passed:
                 result: PreCheckResult = {"step_id": step_id, "passed": True,
                     "skip_step": on_pass == "skip", "raw_data": raw_data, "error": None}
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
-                             "status": "ok",
-                             "message": f"{cmp['field']}={actual!r} {cmp['operator']} {cmp['value']!r} ✓",
-                             "detail": _det})
-            else:
-                is_error = on_fail == "error"
-                err_msg  = (f"Pre-check: {cmp['field']}={actual!r} ✗ "
-                            f"(expected {cmp['operator']} {cmp['value']!r})") if is_error else None
-                result = {"step_id": step_id, "passed": not is_error,
-                    "skip_step": on_fail == "skip", "raw_data": raw_data, "error": err_msg}
-                st = "failed" if is_error else "skipped"
+                             "status": "ok", "message": f"{cond} ✓", "detail": _det})
+            elif on_fail == "skip":
+                result = {"step_id": step_id, "passed": True, "skip_step": True,
+                          "raw_data": raw_data, "error": None}
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
-                             "status": st, "message": err_msg or "Pre-check not met → skip",
-                             "detail": _det})
+                             "status": "skipped", "message": f"{cond} ✗ → skip step", "detail": _det})
+            elif on_fail == "execute":
+                result = {"step_id": step_id, "passed": True, "skip_step": False,
+                          "raw_data": raw_data, "error": None}
+                await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
+                             "status": "ok", "message": f"{cond} ✗ → execute anyway", "detail": _det})
+            else:
+                # on_fail in ("error", "llm") → hand the offending rows to the analyst node,
+                # which produces an explanation and interrupts for the operator to fix & restart.
+                err_msg = f"Pre-check failed: {cond}"
+                result = {"step_id": step_id, "passed": False, "skip_step": False,
+                          "raw_data": raw_data, "error": err_msg}
+                await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
+                             "status": "failed", "message": f"{err_msg} → {on_fail}", "detail": _det})
             return {"current_pre_check": result}
 
         if mode == "llm":
@@ -527,25 +576,43 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         elif mode == "llm":
             llm     = llms["validation"]
             lcfg    = vcfg.get("llm", {})
-            prompt  = lcfg.get("prompt", "Was this SAP step successful?")
-            content = spool_text or " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
+            raw_prompt    = lcfg.get("prompt", "Was this SAP step successful?")
+            messages_text = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
+
+            # Runtime placeholders. _resolve only replaces {{token}}; literal single
+            # braces { } (e.g. a JSON schema written into the prompt) pass through unchanged.
+            ctx = {"spool_text": spool_text or "", "messages_text": messages_text}
+            default_system = (
+                "You are an SAP job result analyser. "
+                "Respond ONLY with JSON: "
+                '{"verdict":"ok"|"retry"|"escalate","error_count":int,"reasoning":"one sentence"}'
+            )
+            system_prompt = _resolve(lcfg.get("system_prompt", default_system), ctx)
+            prompt        = _resolve(raw_prompt, ctx)
+
+            # If the prompt embeds the output itself, use it verbatim; otherwise append it.
+            if "{{spool_text}}" in raw_prompt or "{{messages_text}}" in raw_prompt:
+                human = prompt
+            else:
+                content = spool_text or messages_text
+                human   = f"Task: {prompt}\n\nOutput:\n{content}"
             try:
                 await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
                              "message": "Sending spool to LLM for analysis…"})
                 response = await llm.ainvoke([
-                    SystemMessage(content=(
-                        "You are an SAP job result analyser. "
-                        "Respond ONLY with JSON: "
-                        '{"verdict":"ok"|"retry"|"escalate","error_count":int,"reasoning":"one sentence"}'
-                    )),
-                    HumanMessage(content=f"Task: {prompt}\n\nOutput:\n{content}"),
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=human),
                 ])
                 raw = re.sub(r"```\w*\n?", "", response.content.strip()).strip()
                 try:
                     parsed      = json.loads(raw)
-                    verdict     = parsed.get("verdict", "escalate")
                     error_count = int(parsed.get("error_count", 0))
-                    reasoning   = parsed.get("reasoning", "")
+                    # verdict is optional in a custom schema → derive it from error_count.
+                    verdict     = parsed.get("verdict") or ("ok" if error_count == 0 else "retry")
+                    # Preserve any rich payload (e.g. an "errors" list) for the analyst/operator.
+                    reasoning   = parsed.get("reasoning") or (
+                        json.dumps(parsed.get("errors"), ensure_ascii=False)
+                        if parsed.get("errors") is not None else raw[:300])
                 except json.JSONDecodeError:
                     verdict   = "escalate"
                     reasoning = f"LLM returned non-JSON: {raw[:150]}"
@@ -638,6 +705,11 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 ctx_parts.append(f"Spool (first 2000 chars):\n{v['spool_text'][:2000]}")
         if (pc := state.get("current_pre_check")) and pc.get("error"):
             ctx_parts.append(f"Pre-check error: {pc['error']}")
+            pc_rows = (pc.get("raw_data") or {}).get("rows")
+            if pc_rows:
+                ctx_parts.append(
+                    "Pre-check returned these rows (the condition that must be resolved):\n"
+                    + json.dumps(pc_rows[:50], ensure_ascii=False))
         if (p := state.get("current_poll")) and p.get("timed_out"):
             ctx_parts.append(f"Poll timed out after {p['elapsed_sec']:.0f}s")
         error_ctx = "\n\n".join(ctx_parts) or "No detailed error context."
@@ -1032,6 +1104,23 @@ def build_graph(
 # Shared run helpers
 # ---------------------------------------------------------------------------
 
+def _make_thread_id(company_config: dict, defaults: dict) -> str:
+    """Checkpoint thread id for a run.
+
+    Production (default): deterministic `period_close_<year>_<period>` so a crashed
+    run can be resumed by re-running with the same id, and a finished close cannot be
+    re-run by accident.
+
+    Dev/testing: set `reset_each_run: true` in defaults (base.yaml or a company file,
+    or env RESET_EACH_RUN=1) to append a random suffix, giving every run a clean
+    checkpoint so the same period can be re-run as many times as needed.
+    """
+    base = (f"period_close_"
+            f"{company_config.get('fiscal_year', 'X')}_"
+            f"{company_config.get('period', 'X')}")
+    return f"{base}_{uuid4().hex[:8]}" if reset_each_run_enabled(defaults) else base
+
+
 def _build_initial_state(period_cfg: dict, steps: list[dict],
                          start_step_index: int = 0) -> PeriodCloseState:
     company_config = period_cfg.get("company_config", {})
@@ -1217,7 +1306,8 @@ async def run_rollback_and_restart_web(
              "async": s.get("async", False)}
             for s in steps
         ]
-        await _emit({"type": "run_init", "steps": steps_meta, "company_config": company_config, "is_rollback": True})
+        await _emit({"type": "run_init", "steps": steps_meta, "company_config": company_config,
+                     "is_rollback": True, "test_mode": reset_each_run_enabled(defaults)})
 
         steps_to_rb = steps_to_rollback or []
         step_map    = {s["step_id"]: s for s in steps}
@@ -1244,9 +1334,7 @@ async def run_rollback_and_restart_web(
                 llms         = build_llms_from_config(period_cfg)
                 checkpointer = await build_async_checkpointer()
                 if thread_id is None:
-                    thread_id = (f"period_close_"
-                                 f"{company_config.get('fiscal_year', 'X')}_"
-                                 f"{company_config.get('period', 'X')}")
+                    thread_id = _make_thread_id(company_config, period_cfg.get("defaults", {}))
                 thread_config = {"configurable": {"thread_id": thread_id}}
 
                 await _emit({"type": "run_start", "company_config": company_config,
@@ -1295,7 +1383,7 @@ async def run_period_close(
     llms           = build_llms_from_config(period_cfg)
     checkpointer   = await build_async_checkpointer()
     if thread_id is None:
-        thread_id = f"period_close_{company_config.get('fiscal_year', '')}_{company_config.get('period', '')}"
+        thread_id = _make_thread_id(company_config, period_cfg.get("defaults", {}))
     thread_config = {"configurable": {"thread_id": thread_id}}
 
     async with _build_cm(mcp_cfg) as (read, write):
@@ -1368,7 +1456,8 @@ async def run_period_close_web(
             }
             for s in steps
         ]
-        await _emit({"type": "run_init", "steps": steps_meta, "company_config": company_config})
+        await _emit({"type": "run_init", "steps": steps_meta, "company_config": company_config,
+                     "test_mode": reset_each_run_enabled(period_cfg.get("defaults", {}))})
 
         # Wait for start signal — optionally includes start_from_step
         start_msg: dict = {}
@@ -1392,9 +1481,8 @@ async def run_period_close_web(
         llms         = build_llms_from_config(period_cfg)
         checkpointer = await build_async_checkpointer()
         if thread_id is None:
-            thread_id = (f"period_close_"
-                         f"{company_config.get('fiscal_year', 'X')}_"
-                         f"{company_config.get('period', 'X')}")
+            thread_id = _make_thread_id(company_config, period_cfg.get("defaults", {}))
+        logger.info("Web run thread_id=%s", thread_id)
         thread_config = {"configurable": {"thread_id": thread_id}}
 
         await _emit({"type": "run_start", "company_config": company_config, "total": len(steps),

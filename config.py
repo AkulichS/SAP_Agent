@@ -67,28 +67,47 @@ def _merge_params(base_params: list, override_params: list) -> list:
     return result
 
 
+def _merge_params_field(base_params, override_params):
+    """Merge a params field that may be a list (selname-keyed) or dict (TOOLS action)."""
+    if isinstance(base_params, list) and isinstance(override_params, list):
+        return _merge_params(base_params, override_params)
+    if isinstance(base_params, dict) and isinstance(override_params, dict):
+        return {**base_params, **override_params}
+    return override_params
+
+
+def _merge_section(base: dict, override: dict) -> dict:
+    """Shallow-merge a nested step section (pre_check/validate/rollback/on_error),
+    but merge a nested `params` field by selname like top-level params so a company
+    override adds/overrides individual params instead of replacing the whole list."""
+    out = dict(base)
+    for key, val in override.items():
+        if key == "params":
+            out["params"] = _merge_params_field(out.get("params"), val)
+        elif isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = {**out[key], **val}
+        else:
+            out[key] = val
+    return out
+
+
 def _merge_step(base_step: dict, override: dict) -> dict:
     """Deep-merge a company step override onto the base step template.
 
     - Scalar fields: company value wins.
     - params (list): merged by selname via _merge_params.
     - params (dict, TOOLS action): shallow dict merge.
-    - Nested dicts (pre_check, validate, rollback, on_error): shallow merge.
+    - Nested dicts (pre_check, validate, rollback, on_error): merged via _merge_section,
+      which also merges their nested `params` by selname.
     """
     merged = copy.deepcopy(base_step)
     for key, val in override.items():
         if key == "step_id":
             continue
         if key == "params":
-            base_params = merged.get("params")
-            if isinstance(base_params, list) and isinstance(val, list):
-                merged["params"] = _merge_params(base_params, val)
-            elif isinstance(base_params, dict) and isinstance(val, dict):
-                merged["params"] = {**base_params, **val}
-            else:
-                merged["params"] = val
+            merged["params"] = _merge_params_field(merged.get("params"), val)
         elif isinstance(val, dict) and isinstance(merged.get(key), dict):
-            merged[key] = {**merged[key], **val}
+            merged[key] = _merge_section(merged[key], val)
         else:
             merged[key] = val
     return merged
@@ -177,6 +196,13 @@ def load_config(
 # ---------------------------------------------------------------------------
 # Public factories
 # ---------------------------------------------------------------------------
+
+def reset_each_run_enabled(defaults: dict) -> bool:
+    """True in dev/testing mode: each run gets a fresh checkpoint and a finished run
+    can be re-run. Driven by defaults.reset_each_run or env RESET_EACH_RUN=1."""
+    return (bool(defaults.get("reset_each_run", False))
+            or os.getenv("RESET_EACH_RUN") in ("1", "true", "True"))
+
 
 def build_llm(profile_name: str = "analysis") -> ChatOpenAI:
     """Return an LLM from a named default profile ('analysis' | 'validation')."""

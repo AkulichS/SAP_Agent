@@ -7,6 +7,11 @@ defaults:
   poll_interval_sec: 30
   poll_timeout_sec:  14400      # 4 hours
   test_run:          true
+  # Dev/testing only: when true, each run gets a fresh checkpoint thread_id so the
+  # same period can be re-run repeatedly without rebooting the server. Leave false in
+  # production to keep crash-recovery resume and prevent re-running a finished close.
+  # Can also be enabled per-run via env var RESET_EACH_RUN=1.
+  reset_each_run:    true
 
 llm_profiles:
   analysis:   {provider: "groq", model: "llama-3.3-70b-versatile", temperature: 0}
@@ -68,30 +73,57 @@ steps:
       - {selname: "PERIO",  kind: "P", low: "{{period}}"}
       - {selname: "GJAHR",  kind: "P", low: "{{fiscal_year}}"}
       - {selname: "VAART",  kind: "P", low: "1"}
-      - {selname: "VARIANT", kind: "P", low: "TEST"}
 
     pre_check:
       enabled:     true
       mode:        "comparison"
       action_type: "TOOLS"
-      object_name: "TOOL_READ_TABLE"
+      object_name: "RKASELRULES_OR"
       params:
-        table:    "COKP"
-        where:    "KOKRS EQ '{{controlling_area}}'"
-        fields:   "KOKRS,GJAHR,PERAB,SPERRE"
-        max_rows: 1
+        - {selname: "KOKRS",  kind: "P", low: "{{controlling_area}}"}
+        - {selname: "S_KOSTL", kind: "P", low: ""}
       comparison:
-        field:    "SPERRE"
-        operator: "ne"
-        value:    "X"
+        select:   "empty"      # empty | non_empty | first | last
+        # select: empty → pass when RKASELRULES_OR returns no rows (no orders missing
+        # settlement rules). Non-empty → on_fail sends the offending rows to the analyst
+        # LLM, which explains them to the operator; operator fixes rules in SAP and the
+        # step is restarted from pre_check.
         on_pass:  "execute"
-        on_fail:  "error"
+        on_fail:  "llm"        # execute | skip | llm | error
 
     validate:
       mode: "llm"
       llm:
-        prompt: "Analyse KO8G spool. Were all internal orders settled without errors? List any unresolved orders."
         max_spool_lines: 300
+        # Optional override of the analyser system instruction.
+        system_prompt: "You are an SAP job-log analyser. Respond ONLY with the JSON object requested. No prose."
+        # Use SINGLE braces { } for literal JSON; use {{spool_text}} for the spool placeholder.
+        # verdict is derived from error_count when omitted; the errors[] list is preserved for the operator.
+        prompt: |
+          Respond strictly in the specified format:
+
+          {
+            "error_count": integer,
+            "errors": [
+              {
+                "sender": string|null,
+                "msg_type": "E"|"A"|"X",
+                "msg_num": string|null,
+                "message": string
+              }
+            ]
+          }
+
+          Rules:
+          - Only messages of types E, A, X count as errors.
+          - "sender" extracted from a row like "Sender: ...".
+          - "msg_num" has the format 2 letters + 3 digits, e.g. KB101.
+          - "message" is located in the "Message text" column.
+          - If there are no errors, return {"error_count": 0, "errors": []}
+
+          Text:
+
+          {{spool_text}}
 
     rollback:
       enabled: true
