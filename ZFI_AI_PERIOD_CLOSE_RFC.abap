@@ -11,6 +11,15 @@
 *&============================================================*
 
 *&============================================================*
+*&    Global constants (in real system: function group TOP include)
+*&============================================================*
+CONSTANTS:
+  lc_error   TYPE c VALUE 'E',   "Error — ev_status / BAPIRET2 type
+  lc_warning TYPE c VALUE 'W',   "Warning
+  lc_success TYPE c VALUE 'S',   "Success
+  lc_async   TYPE c VALUE 'A'.   "Async — job submitted, result pending
+
+*&============================================================*
 *&    FUNCTION MODULE INTERFACE
 *&============================================================*
 
@@ -30,8 +39,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
 *"     VALUE(ET_MESSAGES) TYPE  BAPIRET2_T
 *"----------------------------------------------------------------------
 
-  DATA: lv_action TYPE string,
-        lv_progname TYPE string.
+  DATA: lv_action      TYPE string,
+        lv_object_name TYPE string.
 
   CLEAR: ev_status, ev_result_json.
   REFRESH et_messages.
@@ -46,6 +55,7 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
       PERFORM z_execute_fm
         USING    lv_object_name
                  iv_params_json
+                 iv_test_run
         CHANGING ev_status
                  ev_result_json
                  et_messages.
@@ -77,8 +87,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
                  et_messages.
 
     WHEN OTHERS.
-      ev_status  = 'E'.
-      PERFORM z_add_msg USING 'E' 'Unknown IV_ACTION_TYPE: ' && iv_action_type CHANGING et_messages.
+      ev_status  = lc_error.
+      PERFORM z_add_msg USING ev_status 'Unknown IV_ACTION_TYPE: ' && iv_action_type CHANGING et_messages.
 
   ENDCASE.
 
@@ -110,7 +120,7 @@ ENDFUNCTION.
 *      IV_PARAMS_JSON='{"COMPANYCODE":"1000","FISCALYEAR":"2024"}')
 *&============================================================*
 
-FORM z_execute_fm                                     # the z_execute_fm is not checked yet
+FORM z_execute_fm                                     
   USING    iv_funcname    TYPE string
            iv_params_json TYPE string
            iv_test_run    TYPE abap_bool
@@ -174,8 +184,8 @@ FORM z_execute_fm                                     # the z_execute_fm is not 
       OTHERS             = 4.
 
   IF sy-subrc <> 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'FM not found or not RFC-enabled: ' && iv_funcname CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'FM not found or not RFC-enabled: ' && iv_funcname CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -243,8 +253,8 @@ FORM z_execute_fm                                     # the z_execute_fm is not 
     EXCEPTION-TABLE lt_fexcep.
 
   IF sy-subrc = 99.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' iv_funcname && ' raised unhandled exception' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status iv_funcname && ' raised unhandled exception' CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -279,19 +289,19 @@ FORM z_execute_fm                                     # the z_execute_fm is not 
 
   "--- Step 12: Determine overall status ---
   READ TABLE et_messages TRANSPORTING NO FIELDS
-    WITH KEY type = 'E'.
+    WITH KEY type = lc_error.
   IF sy-subrc = 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' iv_funcname && ' completed with errors' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status iv_funcname && ' completed with errors' CHANGING et_messages.
   ELSE.
     READ TABLE et_messages TRANSPORTING NO FIELDS
-      WITH KEY type = 'W'.
+      WITH KEY type = lc_warning.
     IF sy-subrc = 0.
-      ev_status  = 'W'.
-      PERFORM z_add_msg USING 'E' iv_funcname && ' completed with warnings' CHANGING et_messages.
+      ev_status  = lc_warning.
+      PERFORM z_add_msg USING ev_status iv_funcname && ' completed with warnings' CHANGING et_messages.
     ELSE.
-      ev_status  = 'S'.
-      PERFORM z_add_msg USING 'E' iv_funcname && ' completed successfully' CHANGING et_messages.
+      ev_status  = lc_success.
+      PERFORM z_add_msg USING ev_status iv_funcname && ' completed successfully' CHANGING et_messages.
     ENDIF.
   ENDIF.
 
@@ -311,14 +321,12 @@ ENDFORM.
 *  JSON format for IV_PARAMS_JSON (array of selection params):
 *    [
 *      {"selname":"KOKRS",    "kind":"P", "low":"1000"},
-*      {"selname":"ABPER",    "kind":"P", "low":"12"},
-*      {"selname":"ABPIS",    "kind":"P", "low":"12"},
 *      {"selname":"ABGJAHR",  "kind":"P", "low":"2024"},
 *      {"selname":"ZCYKL",    "kind":"S", "sign":"I","option":"EQ","low":"CYCLE01"}
 *    ]
 *&============================================================*
 
-FORM z_execute_submit    # I tested this, it works. I can't decide how it better, using IV_ASYNC as RFC parameter or pass it into IV_PARAMS_JSON, the same question for iv_test_run
+FORM z_execute_submit    
   USING    iv_progname    TYPE string
            iv_params_json TYPE string
            iv_async       TYPE abap_bool
@@ -331,31 +339,29 @@ FORM z_execute_submit    # I tested this, it works. I can't decide how it better
         ls_selopt   LIKE LINE OF lt_selopts.
   DATA: lt_rsparams TYPE rsparams_tt,
         ls_rsparam  TYPE rsparams.
-  DATA: lv_progname TYPE sy-repid,
-        lv_jobname  TYPE btcjob,
+  DATA: lv_jobname  TYPE btcjob,
         lv_jobcount TYPE btcjobcnt.
 
   "--- Parse JSON array of selection parameters ---
   /ui2/cl_json=>deserialize(
     EXPORTING
-      json             = iv_params_json
-      pretty_name      = /ui2/cl_json=>pretty_mode-camel_case
+      json     = iv_params_json
     CHANGING
-      data             = lt_selopts ).
+      data     = lt_selopts ).
 
   "--- Build standard RSPARAMS table ---
   LOOP AT lt_selopts INTO ls_selopt.
     CLEAR ls_rsparam.
-    ls_rsparam-selname = ls_selopt-selname.
+    ls_rsparam-selname = to_upper( ls_selopt-selname ).
     ls_rsparam-kind    = COND #(
       WHEN ls_selopt-kind   IS INITIAL THEN 'P'
-      ELSE ls_selopt-kind ).
+      ELSE to_upper( ls_selopt-kind ) ).
     ls_rsparam-sign    = COND #(
       WHEN ls_selopt-sign   IS INITIAL THEN 'I'
-      ELSE ls_selopt-sign ).
+      ELSE to_upper( ls_selopt-sign ) ).
     ls_rsparam-option  = COND #(
       WHEN ls_selopt-option IS INITIAL THEN 'EQ'
-      ELSE ls_selopt-option ).
+      ELSE to_upper( ls_selopt-option ) ).
     ls_rsparam-low     = ls_selopt-low.
     ls_rsparam-high    = ls_selopt-high.
     APPEND ls_rsparam TO lt_rsparams.
@@ -376,27 +382,26 @@ FORM z_execute_submit    # I tested this, it works. I can't decide how it better
     ENDIF.
   ENDIF.
 
-  lv_progname = iv_progname.
 
   "============================================================
   "--- SYNCHRONOUS execution (short reports only) ---
   "============================================================
   IF iv_async IS INITIAL.
-    SUBMIT (lv_progname)
+    SUBMIT (iv_progname)
       WITH SELECTION-TABLE lt_rsparams
       AND RETURN.
 
     IF sy-subrc <> 0.
-      ev_status  = 'E'.
-      PERFORM z_add_msg USING 'E' 'SUBMIT failed for program: ' && iv_progname CHANGING et_messages.
+      ev_status  = lc_error.
+      PERFORM z_add_msg USING ev_status 'SUBMIT failed for program: ' && iv_progname CHANGING et_messages.
       RETURN.
     ENDIF.
 
-    ev_status  = 'S'.
+    ev_status  = lc_success.
     ev_result_json = '{"status":"completed"' &&
                      ',"mode":"sync"' &&
                      ',"program":"' && iv_progname && '"}'.
-    PERFORM z_add_msg USING 'S' 'Program ' && iv_progname && ' executed synchronously' CHANGING et_messages.
+    PERFORM z_add_msg USING ev_status 'Program ' && iv_progname && ' executed synchronously' CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -423,21 +428,21 @@ FORM z_execute_submit    # I tested this, it works. I can't decide how it better
       OTHERS           = 4.
 
   IF sy-subrc <> 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'Cannot create background job — check S_BTCH_ADM auth' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'Cannot create background job — check S_BTCH_ADM auth' CHANGING et_messages.
     RETURN.
   ENDIF.
 
   "--- Submit report step to the open job ---
-  SUBMIT (lv_progname)
+  SUBMIT (iv_progname)
     WITH SELECTION-TABLE lt_rsparams
     VIA JOB     lv_jobname
     NUMBER      lv_jobcount
     AND RETURN.
 
   IF sy-subrc <> 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'Cannot attach program ' && iv_progname && ' to job' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'Cannot attach program ' && iv_progname && ' to job' CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -458,12 +463,12 @@ FORM z_execute_submit    # I tested this, it works. I can't decide how it better
       OTHERS               = 8.
 
   IF sy-subrc <> 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'Cannot release job ' && lv_jobname CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'Cannot release job ' && lv_jobname CHANGING et_messages.
     RETURN.
   ENDIF.
 
-  ev_status  = 'A'.  "Async — job submitted
+  ev_status  = lc_async.  "Async — job submitted
 
   ev_result_json = '{"status":"submitted"' &&
                    ',"mode":"async"' &&
@@ -471,7 +476,7 @@ FORM z_execute_submit    # I tested this, it works. I can't decide how it better
                    ',"jobname":"' && lv_jobname && '"' &&
                    ',"jobcount":"' && lv_jobcount && '"}'.
 
-  PERFORM z_add_msg USING 'S' 'Job submitted: ' && lv_jobname && ' / ' && lv_jobcount CHANGING et_messages.
+  PERFORM z_add_msg USING lc_success 'Job submitted: ' && lv_jobname && ' / ' && lv_jobcount CHANGING et_messages.
 
 ENDFORM.
 
@@ -535,8 +540,8 @@ FORM z_execute_bdc                         # it is raw code, I don't check it
     CHANGING  data = lt_screens ).
 
   IF lt_screens IS INITIAL.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'BDC screen data is empty — check IV_PARAMS_JSON' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'BDC screen data is empty — check IV_PARAMS_JSON' CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -599,13 +604,13 @@ FORM z_execute_bdc                         # it is raw code, I don't check it
   ENDLOOP.
 
   "--- Determine overall status ---
-  READ TABLE et_messages TRANSPORTING NO FIELDS WITH KEY type = 'E'.
+  READ TABLE et_messages TRANSPORTING NO FIELDS WITH KEY type = lc_error.
   IF sy-subrc = 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'BDC ' && iv_tcode && ' completed with errors' CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'BDC ' && iv_tcode && ' completed with errors' CHANGING et_messages.
   ELSE.
-    ev_status  = 'S'.
-    PERFORM z_add_msg USING 'E' 'BDC ' && iv_tcode && ' completed successfully' CHANGING et_messages.
+    ev_status  = lc_success.
+    PERFORM z_add_msg USING ev_status 'BDC ' && iv_tcode && ' completed successfully' CHANGING et_messages.
   ENDIF.
 
   lv_message_count = lines( et_messages ).
@@ -616,33 +621,39 @@ FORM z_execute_bdc                         # it is raw code, I don't check it
 ENDFORM.
 
 
-FORM z_execute_tool USING iv_toolname    TYPE string    # it is new code, I don't test it
-                          iv_params_json TYPE string
-                          ev_result_json TYPE string
-                          et_messages    TYPE bapiret2_t.
+FORM z_execute_tool                                      # it is new code, I don't test it
+  USING    iv_toolname    TYPE string
+           iv_params_json TYPE string
+  CHANGING ev_status      TYPE string
+           ev_result_json TYPE string
+           et_messages    TYPE bapiret2_t.
                           
    CASE iv_toolname.
 
       WHEN 'TOOL_READ_TABLE'.
         PERFORM ztool_read_table
           USING    iv_params_json
-          CHANGING ev_result_json
+          CHANGING ev_status
+                   ev_result_json
                    et_messages.
 
       WHEN 'TOOL_JOB_STATUS'.
         PERFORM ztool_job_status
           USING    iv_params_json
-          CHANGING ev_result_json
+          CHANGING ev_status
+                   ev_result_json
                    et_messages.
 
       WHEN 'TOOL_READ_JOB_SPOOL'.
         PERFORM ztool_read_job_spool
           USING    iv_params_json
-          CHANGING ev_result_json
+          CHANGING ev_status
+                   ev_result_json
                    et_messages.
 
       WHEN OTHERS.
-        PERFORM z_add_msg USING 'E' 'Unknown TOOL: ' && iv_toolname CHANGING et_messages.
+        ev_status = lc_error.
+        PERFORM z_add_msg USING ev_status 'Unknown TOOL: ' && iv_toolname CHANGING et_messages.
 
    ENDCASE.
  
@@ -744,20 +755,20 @@ FORM ztool_read_table                               # it is raw code, I don't ch
 
   CASE sy-subrc.
     WHEN 0.
-      ev_status = 'S'.
+      ev_status = lc_success.
     WHEN 1.
-      ev_status  = 'E'.
-      PERFORM z_add_msg USING 'E' 'Table not available: ' && iv_table CHANGING et_messages.
+      ev_status  = lc_error.
+      PERFORM z_add_msg USING ev_status 'Table not available: ' && ls_params-table CHANGING et_messages.
       RETURN.
     WHEN 2.
-      ev_status  = 'W'.
-      PERFORM z_add_msg USING 'W' 'Table ' && iv_table && ' is empty for given criteria' CHANGING et_messages.
-      ev_result_json = '{"table":"' && iv_table &&
+      ev_status  = lc_warning.
+      PERFORM z_add_msg USING ev_status 'Table ' && ls_params-table && ' is empty for given criteria' CHANGING et_messages.
+      ev_result_json = '{"table":"' && ls_params-table &&
                        '","rows":[],"count":0}'.
       RETURN.
     WHEN OTHERS.
-      ev_status  = 'E'.
-      PERFORM z_add_msg USING 'E' 'RFC_READ_TABLE error on ' && iv_table && ', subrc=' && sy-subrc CHANGING et_messages.
+      ev_status  = lc_error.
+      PERFORM z_add_msg USING ev_status 'RFC_READ_TABLE error on ' && ls_params-table && ', subrc=' && sy-subrc CHANGING et_messages.
       RETURN.
   ENDCASE.
 
@@ -802,10 +813,10 @@ FORM ztool_read_table                               # it is raw code, I don't ch
   DATA: lv_cnt TYPE string.
   lv_cnt = lines( lt_rfc_data ).
 
-  PERFORM z_add_msg USING ev_status 'Read ' && lv_cnt && ' row(s) from ' && iv_table CHANGING et_messages.
-  ev_result_json = '{"table":"' && iv_table && '"' &&
+  PERFORM z_add_msg USING ev_status 'Read ' && lv_cnt && ' row(s) from ' && ls_params-table CHANGING et_messages.
+  ev_result_json = '{"table":"' && ls_params-table && '"' &&
                    ',"count":' && lv_cnt &&
-                   ',"rows":' && lv_rows_j && '}'.  " maybe I need more optimal answer structure
+                   ',"rows":' && lv_rows_j && '}'.
 
 ENDFORM.
 
@@ -862,30 +873,30 @@ FORM ztool_job_status                     # it is raw code, I don't test it
       OTHERS           = 4.
 
   IF sy-subrc <> 0.
-    ev_status  = 'E'.
-    PERFORM z_add_msg USING 'E' 'Job not found: ' && ls_job-jobname && ' / ' && ls_job-jobcount CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status 'Job not found: ' && ls_job-jobname && ' / ' && ls_job-jobcount CHANGING et_messages.
     RETURN.
   ENDIF.
 
   "--- Map state flags to a single status ---
   IF lv_finish = 'X'.
     lv_state   = 'FINISHED'.
-    ev_status  = 'S'.
+    ev_status  = lc_success.
   ELSEIF lv_aborted = 'X'.
     lv_state   = 'ABORTED'.
-    ev_status  = 'E'.
+    ev_status  = lc_error.
   ELSEIF lv_running = 'X'.
     lv_state   = 'RUNNING'.
-    ev_status  = 'A'.
+    ev_status  = lc_async.
   ELSEIF lv_ready = 'X'.
     lv_state   = 'READY'.
-    ev_status  = 'A'.
+    ev_status  = lc_async.
   ELSE.
     lv_state   = 'SCHEDULED'.
-    ev_status  = 'A'.
+    ev_status  = lc_async.
   ENDIF.
 
-  PERFORM z_add_msg USING 'E' 'Job ' && ls_job-jobname && ': ' && lv_state CHANGING et_messages.
+  PERFORM z_add_msg USING ev_status 'Job ' && ls_job-jobname && ': ' && lv_state CHANGING et_messages.
   ev_result_json = '{"jobname":"'  && ls_job-jobname  && '"' &&
                    ',"jobcount":"' && ls_job-jobcount && '"' &&
                    ',"state":"'    && lv_state        && '"' &&
@@ -894,9 +905,11 @@ FORM ztool_job_status                     # it is raw code, I don't test it
 ENDFORM.
 
 
-FORM ztool_read_job_spool USING iv_params_json TYPE string                 # I tested this, it works.
-                                 ev_result_json TYPE string
-                                 et_messages    TYPE bapiret2_t.
+FORM ztool_read_job_spool                                                   # I tested this, it works.
+  USING    iv_params_json TYPE string
+  CHANGING ev_status      TYPE string
+           ev_result_json TYPE string
+           et_messages    TYPE bapiret2_t.
 
   DATA: lt_buffer    TYPE TABLE OF buffer,
         lv_rqident   TYPE tsp01-rqident,
@@ -914,8 +927,9 @@ FORM ztool_read_job_spool USING iv_params_json TYPE string                 # I t
     /ui2/cl_json=>deserialize( EXPORTING json = iv_params_json
                                CHANGING data = ls_job ).
   CATCH cx_root INTO DATA(lx_json).
+    ev_status  = lc_error.
     lv_message = 'JSON deserialize error: ' && lx_json->get_text( ).
-    PERFORM z_add_msg USING 'E' lv_message CHANGING et_messages.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDTRY.
 
@@ -932,8 +946,9 @@ FORM ztool_read_job_spool USING iv_params_json TYPE string                 # I t
   lv_rqident = lv_listident.
 
   IF sy-subrc <> 0 OR lv_rqident IS INITIAL.
+    ev_status  = lc_error.
     lv_message = |Spool not found for jobname={ ls_job-jobname } jobcount={ ls_job-jobcount }|.
-    PERFORM z_add_msg USING 'E' lv_message CHANGING et_messages.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -976,7 +991,8 @@ FORM ztool_read_job_spool USING iv_params_json TYPE string                 # I t
         lv_message = |Unexpected error while reading spool. rqident={ lv_rqident }|.
     ENDCASE.
 
-    PERFORM z_add_msg USING 'E' lv_message CHANGING et_messages.
+    ev_status  = lc_error.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
@@ -992,13 +1008,15 @@ FORM ztool_read_job_spool USING iv_params_json TYPE string                 # I t
   TRY.
     ev_result_json = /ui2/cl_json=>serialize( data = lt_lines ).
   CATCH cx_root INTO DATA(lx_json_ser).
+    ev_status  = lc_error.
     lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
-    PERFORM z_add_msg USING 'E' lv_message CHANGING et_messages.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDTRY.
 
+  ev_status  = lc_success.
   lv_message = |Spool read successfully. rqident={ lv_rqident }. Lines={ lines( lt_buffer ) }|.
-  PERFORM z_add_msg USING 'S' lv_message CHANGING et_messages.
+  PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
 
 ENDFORM.
 
@@ -1107,7 +1125,7 @@ ENDFORM.
 *& FORM z_add_msg
 *&  Appends a simple message to ET_MESSAGES (BAPIRET2).
 *&--------------------------------------------------------------------*
-FORM z_add_msg USING    iv_type     TYPE c                                 # it works
+FORM z_add_msg USING    iv_type     TYPE string                                 # it works
                         iv_text     TYPE string
                CHANGING et_messages TYPE bapiret2_t.
 

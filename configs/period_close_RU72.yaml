@@ -1,0 +1,18 @@
+company_config:
+  company_code:     "RU72"
+  controlling_area: "X500"
+  currency:         "RUB"
+
+# steps: omitted — all steps from base.yaml run in base order.
+# Add a steps: list here to control which steps run, their order,
+# and any per-step overrides (async, poll_timeout_sec, params, etc.).
+
+steps:
+
+  - step_id: "ZFK_COMPARISON"
+    params:
+      - {selname: "S_HKONT",  kind: "P", low: "7070106", high: "7070120"}:
+  
+  - step_id: "KO8G"
+    params:
+      

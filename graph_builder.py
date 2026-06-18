@@ -27,12 +27,15 @@ import asyncio
 import json
 import logging
 import re
-import sys
+import sys, os
 from pathlib import Path
 from typing import Annotated, Any, TypedDict
 
 import yaml
+from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+
+load_dotenv(Path(__file__).parent / ".env")
 from langgraph.graph.message import add_messages
 from langchain_core.tools import tool as lc_tool
 from langchain_openai import ChatOpenAI
@@ -1065,10 +1068,11 @@ def _build_cm(mcp_cfg: dict):
         command = sys.executable
     transport = server_cfg.get("transport", "stdio")
     if transport == "stdio":
+        env = dict(os.environ) | (server_cfg.get("env") or {})
         return stdio_client(StdioServerParameters(
             command=command,
             args=server_cfg.get("args", []),
-            env=server_cfg.get("env"),
+            env=env,
         ))
     return sse_client(server_cfg["sse_url"])
 

@@ -17,7 +17,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv(Path(__file__).parent / ".env")
 
 from logging_config import init_logging
 from sap_connection_manager import SAPConnectionManager, SAPConnectionParams
@@ -90,7 +93,7 @@ def _rfc(conn, action_type: str, object_name: str, params: dict,
         RFC,
         IV_ACTION_TYPE = action_type,
         IV_OBJECT_NAME = object_name,
-        IV_PARAMS_JSON = json.dumps(params),
+        IV_PARAMS_JSON = json.dumps(params, separators=(',', ':')),
         IV_ASYNC       = "X" if async_mode else "",
         IV_TEST_RUN    = "X" if test_run else "",
     )

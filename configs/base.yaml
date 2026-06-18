@@ -14,19 +14,23 @@ llm_profiles:
 
 steps:
 
-################################ 1 — Z_FI_COMPARISON ############################
-  - step_id:     "Z_FI_COMPARISON"
+################################ 1 — ZFK_COMPARISON ############################
+  - step_id:     "ZFK_COMPARISON"
     description: "FI Data Comparison & Reconciliation"
     group:       null
     action_type: "SUBMIT"
-    object_name: "Z_FI_COMPARISON"
+    object_name: "ZFK_COMPARISON"
     async:       true
     test_run:    true
 
     params:
-      - {selname: "BUKRS",  kind: "P", low: "{{company_code}}"}
-      - {selname: "GJAHR",  kind: "P", low: "{{fiscal_year}}"}
-      - {selname: "MONAT",  kind: "P", low: "{{period}}"}
+      - {selname: "S_BUKRS",  kind: "P", low: "{{company_code}}"}
+      - {selname: "P_GJAHR",  kind: "P", low: "{{fiscal_year}}"}
+      - {selname: "P_MONAT",  kind: "P", low: "{{period}}"}
+      - {selname: "P_REP",  kind: "P", low: "X"}
+      - {selname: "P_REQ",  kind: "P", low: ""}
+      - {selname: "P_LOG",  kind: "P", low: ""}
+
 
     pre_check:
       enabled: false
