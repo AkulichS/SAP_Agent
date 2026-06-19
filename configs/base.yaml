@@ -73,15 +73,17 @@ steps:
       - {selname: "PERIO",  kind: "P", low: "{{period}}"}
       - {selname: "GJAHR",  kind: "P", low: "{{fiscal_year}}"}
       - {selname: "VAART",  kind: "P", low: "1"}
+      - {selname: "AUSF",   kind: "P", low: "X"} 
 
     pre_check:
       enabled:     true
       mode:        "comparison"
-      action_type: "TOOLS"
+      action_type: "SUBMIT"
       object_name: "RKASELRULES_OR"
+      async:       false
       params:
         - {selname: "KOKRS",  kind: "P", low: "{{controlling_area}}"}
-        - {selname: "S_KOSTL", kind: "P", low: ""}
+        # - {selname: "S_KOSTL", kind: "P", low: ""}
       comparison:
         select:   "empty"      # empty | non_empty | first | last
         # select: empty → pass when RKASELRULES_OR returns no rows (no orders missing
@@ -130,20 +132,20 @@ steps:
       action_type: "SUBMIT"
       object_name: "RKO7KO8G"
       async: true
+      test_run: false
       poll_timeout_sec: 3600
       params:
         - {selname: "KOKRS",  kind: "P", low: "{{controlling_area}}"}
         - {selname: "PERIO",  kind: "P", low: "{{period}}"}
         - {selname: "GJAHR",  kind: "P", low: "{{fiscal_year}}"}
         - {selname: "VAART",  kind: "P", low: "1"}
-        - {selname: "STORNO", kind: "P", low: "X"}   # reversal flag
+        - {selname: "STOR",   kind: "P", low: "X"}   # reversal flag
 
     on_error:
       analysis_guidance: |
         KO8G settles CO internal orders for controlling area {{controlling_area}}.
         Common issues:
         - Missing settlement rule: check AUFK (order master) and KO03 for order details.
-        - COKP.SPERRE = X: CO period is locked — unlock via OKP1.
         - COSS should show secondary cost postings after successful settlement.
         Use TOOL_READ_TABLE: AUFK WHERE KOKRS = '{{controlling_area}}' AND KOSTL IS INITIAL.
 

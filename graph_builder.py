@@ -3,7 +3,7 @@ SAP Period Close Agent — LangGraph orchestration layer.
 
 Architecture (DOE principle)
 -----------------------------
-  Directive    : period_close_config.yaml  — what to do
+  Directive    : configs/base.yaml         — what to do
   Orchestration: graph_builder.py          — how to coordinate
   Execution    : mcp_server.py             — actual SAP operations via RFC
 
@@ -278,7 +278,10 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
         if mode == "comparison":
             cmp    = pc["comparison"]
-            rows   = raw_data.get("rows", [])
+            if isinstance(raw_data, dict):
+                rows = raw_data.get("rows", [])
+            else:
+                rows = raw_data
             if not isinstance(rows, list):
                 rows = []
             select = cmp.get("select", "first")
@@ -541,8 +544,7 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         error_count = 0
         reasoning   = ""
 
-        if (execute and execute.get("requires_poll")
-                and poll and poll.get("sap_status") == "FINISHED"):
+        if (execute and execute.get("requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
             max_lines = vcfg.get("llm", {}).get("max_spool_lines", 500)
             spool_res = await session.call_tool("sap_read_spool", arguments={
                 "job_name":  poll["job_name"],
@@ -1271,7 +1273,7 @@ async def execute_rollback_step(
 async def run_rollback_and_restart_web(
     send,
     msg_queue:          asyncio.Queue,
-    period_config_path: str = "period_close_config.yaml",
+    period_config_path: str = "configs/base.yaml",
     mcp_config_path:    str = "mcp_config.yaml",
     start_from_step:    str = "",
     steps_to_rollback:  list[str] | None = None,
@@ -1370,7 +1372,7 @@ async def run_rollback_and_restart_web(
 # ---------------------------------------------------------------------------
 
 async def run_period_close(
-    period_config_path: str = "period_close_config.yaml",
+    period_config_path: str = "configs/base.yaml",
     mcp_config_path:    str = "mcp_config.yaml",
     thread_id:          str | None = None,
     period:             str | None = None,
@@ -1419,7 +1421,7 @@ async def run_period_close(
 async def run_period_close_web(
     send,                        # async callable: send(event_dict) → WebSocket
     msg_queue:  asyncio.Queue,   # messages from browser: start / decision
-    period_config_path: str = "period_close_config.yaml",
+    period_config_path: str = "configs/base.yaml",
     mcp_config_path:    str = "mcp_config.yaml",
     thread_id:  str | None = None,
     period:     str | None = None,

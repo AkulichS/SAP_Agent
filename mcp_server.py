@@ -110,7 +110,13 @@ def _rfc(conn, action_type: str, object_name: str, params: dict,
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def sap_check_period(action_type: str, object_name: str, params_json: str) -> dict:
+def sap_check_period(
+    action_type: str,
+    object_name: str,
+    params_json: str,
+    async_mode:  bool = False,
+    test_run:    bool = True
+) -> dict:
     """
     Run a period-close pre-check RFC call and return the raw result.
 
@@ -126,44 +132,12 @@ def sap_check_period(action_type: str, object_name: str, params_json: str) -> di
     """
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
-    result = _rfc(conn, action_type, object_name, params)
+    result = _rfc(conn, action_type, object_name, params, async_mode, test_run)
     has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"])
     result["status"] = "E" if has_errors else result["status"] or "S"
     logger.info("sap_check_period action=%s object=%s status=%s",
                 action_type, object_name, result["status"])
     return result
-
-
-# ---------------------------------------------------------------------------
-# Tool: sap_read_table
-# Direct diagnostic table read — used by analysis_node
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> dict:
-    """
-    Read rows from any SAP transparent table via RFC_READ_TABLE.
-
-    Returns
-    -------
-    {"table": str, "count": int, "rows": [{"FIELD": "value"}], "status": str}
-    """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_READ_TABLE", {
-        "table":    table,
-        "where":    where,
-        "fields":   fields,
-        "max_rows": max_rows,
-    })
-    rj = result["result_json"]
-    rows = rj.get("rows", [])
-    logger.info("sap_read_table table=%s rows=%d", table, len(rows))
-    return {
-        "table":  table,
-        "count":  len(rows),
-        "rows":   rows,
-        "status": result["status"],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +173,7 @@ def sap_execute_step(
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
 
-    result = _rfc(conn, action_type, object_name, params,
-                  async_mode=async_mode, test_run=test_run)
+    result = _rfc(conn, action_type, object_name, params, async_mode=async_mode, test_run=test_run)
     messages    = result["messages"]
     result_json = result["result_json"]
 
@@ -250,6 +223,38 @@ def sap_execute_step(
         "job_id":        "",
         "messages":      [{"TYPE": "E", "MESSAGE": f"Unknown action_type: {action_type}"}],
         "result_json":   {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: sap_read_table
+# Direct diagnostic table read — used by analysis_node
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> dict:
+    """
+    Read rows from any SAP transparent table via RFC_READ_TABLE.
+
+    Returns
+    -------
+    {"table": str, "count": int, "rows": [{"FIELD": "value"}], "status": str}
+    """
+    conn = conn_mgr.get_connection()
+    result = _rfc(conn, "TOOLS", "TOOL_READ_TABLE", {
+        "table":    table,
+        "where":    where,
+        "fields":   fields,
+        "max_rows": max_rows,
+    })
+    rj = result["result_json"]
+    rows = rj.get("rows", [])
+    logger.info("sap_read_table table=%s rows=%d", table, len(rows))
+    return {
+        "table":  table,
+        "count":  len(rows),
+        "rows":   rows,
+        "status": result["status"],
     }
 
 
