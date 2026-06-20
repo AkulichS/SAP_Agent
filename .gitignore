@@ -20,3 +20,9 @@ __pycache__/
 
 # Claude Code local settings
 .claude/
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/

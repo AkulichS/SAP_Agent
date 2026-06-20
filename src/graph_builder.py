@@ -196,6 +196,63 @@ def _compare(actual: Any, op: str, expected: Any) -> bool:
     return ops.get(op, lambda a, b: False)(a, b)
 
 
+async def _run_action(session: ClientSession, action_type: str, object_name: str,
+                      params: Any, async_mode: bool = False, test_run: bool = True) -> dict:
+    """Run one SAP action of any mode and normalise its output.
+
+    Used by pre_check_node, validate_node (and conceptually execute_node) so a
+    precondition / verification can be a table read, an FM/BAPI/BDC call, or a
+    SUBMIT report — without each caller re-implementing the branching.
+
+    Returns ``{"status","rows","spool_text","messages","result_json"}``:
+      - ``TOOLS``        → ``sap_read_table`` (``params`` is a dict with
+                           table/where/fields/max_rows) → ``rows``.
+      - ``FM``/``BAPI``/``BDC`` → ``sap_execute_step`` (synchronous) →
+                           ``messages``/``result_json`` (``rows`` if present).
+      - ``SUBMIT``       → ``sap_execute_step`` with ``async_mode=False`` runs the
+                           background job and waits inline, returning ``spool_text``.
+                           (``async_mode=True`` returns no spool — the caller then
+                           owns polling; pre_check/validate always pass False.)
+    """
+    at = (action_type or "").upper()
+
+    if at == "TOOLS":
+        p     = params if isinstance(params, dict) else {}
+        table = p.get("table", object_name)
+        r = await session.call_tool("sap_read_table", arguments={
+            "table":    table,
+            "where":    p.get("where", ""),
+            "fields":   p.get("fields", ""),
+            "max_rows": p.get("max_rows", 100),
+        })
+        data = _parse_tool_result(r)
+        return {
+            "status":      "error" if data.get("status") == "E" else "ok",
+            "rows":        data.get("rows", []),
+            "spool_text":  "",
+            "messages":    [],
+            "result_json": data,
+        }
+
+    r = await session.call_tool("sap_execute_step", arguments={
+        "action_type": at,
+        "object_name": object_name,
+        "params_json": json.dumps(params),
+        "async_mode":  async_mode,
+        "test_run":    test_run,
+    })
+    data = _parse_tool_result(r)
+    rj   = data.get("result_json", {})
+    rows = rj.get("rows", []) if isinstance(rj, dict) else []
+    return {
+        "status":      "error" if data.get("status") == "error" else "ok",
+        "rows":        rows,
+        "spool_text":  data.get("spool_text", ""),
+        "messages":    data.get("messages", []),
+        "result_json": rj,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Node: router_node
 # ---------------------------------------------------------------------------
@@ -268,20 +325,20 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 "raw_data": {}, "error": None,
             }}
 
-        tool_result = await session.call_tool("sap_check_period", arguments={
-            "action_type": pc["action_type"],
-            "object_name": pc["object_name"],
-            "params_json": json.dumps(pc.get("params", {})),
-        })
-        data     = _parse_tool_result(tool_result)
-        raw_data = data.get("result_json", data)
+        # Run the pre-check action in any mode (TOOLS/FM/BAPI/BDC/SUBMIT). A SUBMIT
+        # report uses inline-wait (async=false) so its spool comes back in one call.
+        run = await _run_action(
+            session, pc["action_type"], pc["object_name"], pc.get("params", {}),
+            async_mode=pc.get("async", False), test_run=pc.get("test_run", True),
+        )
+        rows       = run["rows"]
+        spool_text = run["spool_text"]
+        # raw_data is what comparison/LLM/operator inspect: table rows when present,
+        # otherwise the SUBMIT spool text.
+        raw_data   = run["result_json"] if rows else (spool_text or run["result_json"])
 
         if mode == "comparison":
-            cmp    = pc["comparison"]
-            if isinstance(raw_data, dict):
-                rows = raw_data.get("rows", [])
-            else:
-                rows = raw_data
+            cmp = pc["comparison"]
             if not isinstance(rows, list):
                 rows = []
             select = cmp.get("select", "first")
@@ -341,10 +398,12 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             llm       = llms["validation"]
             lcfg      = pc.get("llm", {})
             pass_vals = lcfg.get("pass_values", ["yes", "true", "pass", "ok"])
+            # Feed the SUBMIT spool verbatim when present; otherwise the table rows.
+            data_block = spool_text if (spool_text and not rows) else json.dumps(raw_data)
             try:
                 response  = await llm.ainvoke([
                     SystemMessage(content="Analyse this SAP data and answer the question concisely."),
-                    HumanMessage(content=f"Data:\n{json.dumps(raw_data)}\n\nQuestion: {lcfg.get('prompt', 'Is this valid?')}"),
+                    HumanMessage(content=f"Data:\n{data_block}\n\nQuestion: {lcfg.get('prompt', 'Is this valid?')}"),
                 ])
                 answer = response.content.lower().strip()
             except Exception as exc:
@@ -540,11 +599,28 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                      "message": f"Validating result ({mode} mode)…"})
 
         spool_text  = ""
+        rows        = []
         messages    = execute.get("messages", []) if execute else []
         error_count = 0
         reasoning   = ""
 
-        if (execute and execute.get("requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
+        run_cfg = vcfg.get("run")
+        if run_cfg:
+            # Run a dedicated verification action and validate ITS output. Useful when
+            # the main step executed async with no useful spool — confirm the result by
+            # reading a table, calling an FM, or running a check report (any mode).
+            await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
+                         "message": f"Running verification "
+                                    f"{run_cfg['action_type']}/{run_cfg['object_name']}…"})
+            run = await _run_action(
+                session, run_cfg["action_type"], run_cfg["object_name"], run_cfg.get("params", {}),
+                async_mode=run_cfg.get("async", False), test_run=run_cfg.get("test_run", True),
+            )
+            spool_text = run["spool_text"]
+            rows       = run["rows"]
+            if run["messages"]:
+                messages = run["messages"]
+        elif (execute and execute.get("requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
             max_lines = vcfg.get("llm", {}).get("max_spool_lines", 500)
             spool_res = await session.call_tool("sap_read_spool", arguments={
                 "job_name":  poll["job_name"],
@@ -552,14 +628,28 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 "max_lines": max_lines,
             })
             spool_text = _parse_tool_result(spool_res).get("spool_text", "")
+        elif execute:
+            # SUBMIT that ran inline-wait (async=false) carries its spool in result_json;
+            # TOOLS/FM steps carry rows there. Pick up whatever is present.
+            rj    = execute.get("result_json") or {}
+            spool = rj.get("spool", [])
+            if isinstance(spool, list) and spool:
+                spool_text = "\n".join(spool)
+            if isinstance(rj.get("rows"), list):
+                rows = rj["rows"]
 
         if mode == "keyword":
             kw       = vcfg.get("keyword", {})
             ok_pats  = kw.get("ok_patterns", [])
             err_pats = kw.get("error_patterns", ["error", "Error"])
             src      = kw.get("source", "messages")
-            haystack = (spool_text if src == "spool"
-                        else " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)).lower()
+            if src == "spool":
+                haystack = spool_text
+            elif src == "rows":
+                haystack = json.dumps(rows, ensure_ascii=False)
+            else:
+                haystack = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
+            haystack = haystack.lower()
             hits        = [p for p in err_pats if p.lower() in haystack]
             error_count = len(hits)
             if error_count > 0:
@@ -581,9 +671,12 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             raw_prompt    = lcfg.get("prompt", "Was this SAP step successful?")
             messages_text = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
 
+            rows_text = json.dumps(rows, ensure_ascii=False) if rows else ""
+
             # Runtime placeholders. _resolve only replaces {{token}}; literal single
             # braces { } (e.g. a JSON schema written into the prompt) pass through unchanged.
-            ctx = {"spool_text": spool_text or "", "messages_text": messages_text}
+            ctx = {"spool_text": spool_text or "", "messages_text": messages_text,
+                   "rows_text": rows_text}
             default_system = (
                 "You are an SAP job result analyser. "
                 "Respond ONLY with JSON: "
@@ -593,10 +686,11 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             prompt        = _resolve(raw_prompt, ctx)
 
             # If the prompt embeds the output itself, use it verbatim; otherwise append it.
-            if "{{spool_text}}" in raw_prompt or "{{messages_text}}" in raw_prompt:
+            if ("{{spool_text}}" in raw_prompt or "{{messages_text}}" in raw_prompt
+                    or "{{rows_text}}" in raw_prompt):
                 human = prompt
             else:
-                content = spool_text or messages_text
+                content = spool_text or rows_text or messages_text
                 human   = f"Task: {prompt}\n\nOutput:\n{content}"
             try:
                 await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
@@ -636,6 +730,7 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                          "error_count":   error_count,
                          "reasoning":     reasoning,
                          "spool_preview": "\n".join(spool_text.splitlines()[:15]) if spool_text else "",
+                         "rows":          rows[:5] if rows else [],
                          "messages":      [m.get("MESSAGE", str(m)) for m in (messages or [])],
                      }})
 
@@ -1160,10 +1255,15 @@ def _build_cm(mcp_cfg: dict):
     transport = server_cfg.get("transport", "stdio")
     if transport == "stdio":
         env = dict(os.environ) | (server_cfg.get("env") or {})
+        # Spawn the MCP server with its working directory pinned to this package
+        # (src/), so a relative `mcp_server.py` arg resolves regardless of where
+        # uvicorn/CLI was launched from.
+        cwd = server_cfg.get("cwd") or str(Path(__file__).parent)
         return stdio_client(StdioServerParameters(
             command=command,
             args=server_cfg.get("args", []),
             env=env,
+            cwd=cwd,
         ))
     return sse_client(server_cfg["sse_url"])
 

@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    p = Path("mcp_config.yaml")
+    p = Path(__file__).parent / "mcp_config.yaml"
     if not p.exists():
         raise FileNotFoundError(f"MCP config not found: {p}")
     with open(p) as f:
@@ -189,30 +189,55 @@ def sap_execute_step(
             "job_id":        "",
             "messages":      messages,
             "result_json":   result_json,
+            "spool_text":    "",
         }
 
     if action_type == "SUBMIT":
         job_name = result_json.get("jobname", "")
         job_id   = result_json.get("jobcount", "")
 
-        if not job_id:
+        # ABAP runs SUBMIT as a background job either way. With async_mode=True it
+        # returns EV_STATUS='A' (lc_async) and the caller polls. With async_mode=False
+        # it waits inline and returns EV_STATUS='S'/'E' plus the spool inline under
+        # result_json["spool"] (mode="sync_wait") — no separate sap_read_spool needed.
+        is_async = (result["status"] == "A")
+
+        if is_async:
+            if not job_id:
+                return {
+                    "status":        "error",
+                    "requires_poll": False,
+                    "job_name":      "",
+                    "job_id":        "",
+                    "messages":      messages + [{"TYPE": "E", "MESSAGE": "No job ID returned"}],
+                    "result_json":   {},
+                    "spool_text":    "",
+                }
+            logger.info("SUBMIT submitted (async): job=%s/%s", job_name, job_id)
             return {
-                "status":        "error",
-                "requires_poll": False,
-                "job_name":      "",
-                "job_id":        "",
-                "messages":      messages + [{"TYPE": "E", "MESSAGE": "No job ID returned"}],
-                "result_json":   {},
+                "status":        "submitted",
+                "requires_poll": True,
+                "job_name":      job_name,
+                "job_id":        job_id,
+                "messages":      messages,
+                "result_json":   result_json,
+                "spool_text":    "",
             }
 
-        logger.info("SUBMIT submitted: job=%s/%s", job_name, job_id)
+        # Inline-wait outcome: surface the spool as joined text.
+        spool_lines = result_json.get("spool", [])
+        spool_text  = "\n".join(spool_lines) if isinstance(spool_lines, list) else str(spool_lines)
+        has_errors  = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
+        logger.info("SUBMIT completed (inline-wait): job=%s/%s lines=%d status=%s",
+                    job_name, job_id, len(spool_text.splitlines()), result["status"])
         return {
-            "status":        "submitted",
-            "requires_poll": True,
+            "status":        "error" if has_errors else "ok",
+            "requires_poll": False,
             "job_name":      job_name,
             "job_id":        job_id,
             "messages":      messages,
             "result_json":   result_json,
+            "spool_text":    spool_text,
         }
 
     # Unknown action_type

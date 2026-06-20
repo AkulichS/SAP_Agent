@@ -269,16 +269,30 @@ class _StubConnection:
             return {"EV_STATUS": "S", "EV_RESULT_JSON": "{}", "ET_MESSAGES": []}
 
         # ── SUBMIT ──────────────────────────────────────────────────────────
+        # SUBMIT always runs as a background job. async → EV_STATUS 'A' + job ids
+        # (caller polls); sync → EV_STATUS 'S' with the spool embedded inline
+        # (mode="sync_wait"), mirroring z_execute_submit's inline-wait path.
         if action == "SUBMIT":
             self._job_counter += 1
             job_name = f"STUB_{obj[:10]}"
             job_id   = f"{self._job_counter:08d}"
             suffix   = " (test-run)" if test else ""
+            if async_:
+                return {
+                    "EV_STATUS":      "A",
+                    "EV_RESULT_JSON": _json.dumps({"status": "submitted", "mode": "async",
+                                                   "jobname": job_name, "jobcount": job_id}),
+                    "ET_MESSAGES":    [{"TYPE": "S",
+                                        "MESSAGE": f"Job {job_name}/{job_id} submitted{suffix}"}],
+                }
+            spool = self._SPOOL_TEXT.get(obj, self._SPOOL_TEXT["default"])
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"jobname": job_name, "jobcount": job_id}),
+                "EV_RESULT_JSON": _json.dumps({"status": "completed", "mode": "sync_wait",
+                                               "jobname": job_name, "jobcount": job_id,
+                                               "spool": spool}),
                 "ET_MESSAGES":    [{"TYPE": "S",
-                                    "MESSAGE": f"Job {job_name}/{job_id} submitted{suffix}"}],
+                                    "MESSAGE": f"Job {job_name}/{job_id} completed inline{suffix}"}],
             }
 
         # ── FM / BAPI / BDC ─────────────────────────────────────────────────

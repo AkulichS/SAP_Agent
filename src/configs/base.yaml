@@ -19,6 +19,40 @@ llm_profiles:
 
 steps:
 
+# ---------------------------------------------------------------------------
+# Step schema notes (SUBMIT model + runnable pre_check/validate)
+# ---------------------------------------------------------------------------
+# SUBMIT always runs as a background job (never an inline GUI SUBMIT), so reports
+# that show ALV/lists are safe and their output is always captured to spool:
+#   async: true   → main long-running steps; the agent polls then reads the spool.
+#   async: false  → the RFC submits the job, waits inline, and returns the spool
+#                   in one call (use for short pre_check / validate.run reports).
+#
+# pre_check can run ANY action mode (TOOLS | FM | BAPI | BDC | SUBMIT):
+#   pre_check:
+#     enabled: true
+#     mode: comparison        # comparison (on rows) | llm (on rows or spool) | skip
+#     action_type: SUBMIT
+#     object_name: ZSOME_CHECK
+#     async: false            # SUBMIT → inline-wait, spool fed to the check
+#     params: [...]           # list for FM/BAPI/BDC/SUBMIT, dict for TOOLS
+#     comparison: {select: empty, on_pass: execute, on_fail: llm}
+#
+# validate can read the executed step's spool (default) OR run its own check
+# action via an optional `run:` block — handy when the main step ran async with
+# no useful spool and you must confirm the result by reading a table / running a
+# verification report:
+#   validate:
+#     mode: llm               # keyword | llm
+#     run:                    # OPTIONAL — if present, run this and validate ITS output
+#       action_type: TOOLS    # TOOLS | FM | BAPI | BDC | SUBMIT
+#       object_name: TOOL_READ_TABLE
+#       async: false          # SUBMIT here uses inline-wait (returns spool)
+#       params: {table: CKMLHD, where: "...", fields: "...", max_rows: 1}
+#     keyword: {source: rows, error_patterns: ["error"]}   # source: spool | rows | messages
+#     # llm prompts may embed {{spool_text}}, {{messages_text}} or {{rows_text}}
+# ---------------------------------------------------------------------------
+
 ################################ 1 — ZFK_COMPARISON ############################
   - step_id:     "ZFK_COMPARISON"
     description: "FI Data Comparison & Reconciliation"

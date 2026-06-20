@@ -1,0 +1,5 @@
+# Test/development dependencies. Install into a venv WITHOUT pyrfc so the
+# SAP connection runs in stub mode (offline, no real SAP system).
+pytest>=8.0
+pytest-asyncio>=0.23
+pytest-cov>=5.0

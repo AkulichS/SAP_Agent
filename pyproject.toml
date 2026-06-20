@@ -1,0 +1,20 @@
+[project]
+name = "sap-period-close-agent"
+version = "0.1.0"
+description = "LangGraph agent orchestrating SAP period-close procedures via RFC, with a FastAPI web UI."
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+# Flat modules live in src/ and import each other by top-level name
+# (e.g. `import config`), so src must be on the import path.
+pythonpath = ["src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --cov=src --cov-report=term-missing"

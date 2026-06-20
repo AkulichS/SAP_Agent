@@ -17,7 +17,10 @@ CONSTANTS:
   lc_error   TYPE c VALUE 'E',   "Error — ev_status / BAPIRET2 type
   lc_warning TYPE c VALUE 'W',   "Warning
   lc_success TYPE c VALUE 'S',   "Success
-  lc_async   TYPE c VALUE 'A'.   "Async — job submitted, result pending
+  lc_async   TYPE c VALUE 'A',   "Async — job submitted, result pending
+  "--- inline-wait (sync_wait) tuning for SUBMIT with iv_async = '' ---
+  lc_sync_wait_interval TYPE i VALUE 2,    "poll interval while waiting (s)
+  lc_sync_wait_timeout  TYPE i VALUE 300.  "guard timeout for inline wait (s)
 
 *&============================================================*
 *&    FUNCTION MODULE INTERFACE
@@ -315,9 +318,16 @@ ENDFORM.
 *& HANDLER 2: SUBMIT — Background Program Submission
 *&============================================================*
 *
-*  Submits any ABAP report/program.
-*  In async mode (IV_ASYNC=X) schedules a background job
-*  In sync mode executes inline (for short reports only).
+*  Submits any ABAP report/program. ALWAYS runs via a background job
+*  (JOB_OPEN / SUBMIT VIA JOB / JOB_CLOSE) — never an inline SUBMIT — so
+*  reports that produce ALV/list output cannot raise CNTL_ERROR in the
+*  GUI-less RFC context, and their output is always captured to spool.
+*
+*  IV_ASYNC = 'X' : return immediately (EV_STATUS = lc_async) with
+*                   jobname/jobcount; the caller polls via TOOL_JOB_STATUS.
+*  IV_ASYNC = ''  : wait inline until the job finishes (guarded by
+*                   lc_sync_wait_timeout), then fetch the spool and return
+*                   it in EV_RESULT_JSON {"...,"spool":[..lines..]}.
 *
 *  JSON format for IV_PARAMS_JSON (array of selection params):
 *    [
@@ -336,13 +346,21 @@ FORM z_execute_submit
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: lt_selopts  TYPE ty_zai_selparam_tab,
-        ls_selopt   LIKE LINE OF lt_selopts,
-        lt_rsparams TYPE rsparams_tt,
-        ls_rsparam  TYPE rsparams,
-        lv_jobname  TYPE btcjob,
-        lv_jobcount TYPE btcjobcnt,
-        lv_msg      TYPE string.
+  DATA: lt_selopts   TYPE ty_zai_selparam_tab,
+        ls_selopt    LIKE LINE OF lt_selopts,
+        lt_rsparams  TYPE rsparams_tt,
+        ls_rsparam   TYPE rsparams,
+        lv_jobname   TYPE btcjob,
+        lv_jobcount  TYPE btcjobcnt,
+        lv_ts        TYPE string,
+        lv_msg       TYPE string,
+        "--- inline-wait (sync_wait) locals ---
+        lv_state     TYPE string,
+        lv_waited    TYPE i,
+        lt_lines     TYPE stringtab,
+        lv_subrc     TYPE i,
+        lv_spoolmsg  TYPE string,
+        lv_spooljson TYPE string.
 
   "--- Parse JSON array of selection parameters ---
   /ui2/cl_json=>deserialize( EXPORTING json = iv_params_json CHANGING data = lt_selopts ).
@@ -375,44 +393,10 @@ FORM z_execute_submit
 
 
   "============================================================
-  "--- SYNCHRONOUS execution (short reports only) ---
-  "============================================================
-  IF iv_async IS INITIAL.
-    TRY. 
-      SUBMIT (iv_progname)
-        WITH SELECTION-TABLE lt_rsparams
-        AND RETURN.
-
-      IF sy-subrc <> 0. " in debuger I saw that the program newer ends up here, that is return empty to web, maybe cause is CNTL_ERROR when try to CALL SCREEN or ALV Grid
-        ev_status  = lc_error.
-        ev_result_json = '{"status":"error"' && ',"mode":"sync"' && ',"program":"' && iv_progname && '"}'.
-        lv_msg = 'SUBMIT failed for program: ' && iv_progname.
-        PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
-        RETURN.
-      ENDIF.
-
-    CATCH cx_root INTO DATA(lx_error).
-      ev_status = lc_error.
-      ev_result_json = '{"status":"error"' && ',"mode":"sync"' && ',"program":"' && iv_progname && '"}'.
-      lv_msg = |Program crashed: { lx_error->get_text( ) }|.
-      PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
-      RETURN.
-    ENDTRY.
-
-    ev_status  = lc_success.
-    ev_result_json = '{"status":"completed"' && ',"mode":"sync"' && ',"program":"' && iv_progname && '"}'.
-    lv_msg = 'Program ' && iv_progname && ' executed synchronously'.
-    PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
-    RETURN.
-  ENDIF.
-
-  "============================================================
-  "--- ASYNCHRONOUS: background job submission ---
+  "--- Submit as a background job (ALWAYS — never inline SUBMIT) ---
   "============================================================
 
   "--- Generate unique job name (max 32 chars) ---
-  DATA: lv_ts TYPE string.
-
   lv_ts = sy-uzeit.
   CONCATENATE 'ZAI_PC_' iv_progname(8) '_' lv_ts(6)
     INTO lv_jobname.
@@ -473,16 +457,76 @@ FORM z_execute_submit
     RETURN.
   ENDIF.
 
-  ev_status  = lc_async.  "Async — job submitted
+  "============================================================
+  "--- IV_ASYNC = 'X' : return immediately; caller polls ---
+  "============================================================
+  IF iv_async = abap_true.
+    ev_status  = lc_async.  "Async — job submitted, result pending
+    ev_result_json = '{"status":"submitted"' &&
+                     ',"mode":"async"' &&
+                     ',"program":"'  && iv_progname && '"' &&
+                     ',"jobname":"'  && lv_jobname  && '"' &&
+                     ',"jobcount":"' && lv_jobcount && '"}'.
+    lv_msg = 'Job submitted: ' && lv_jobname && ' / ' && lv_jobcount.
+    PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
+    RETURN.
+  ENDIF.
 
-  ev_result_json = '{"status":"submitted"' &&
-                   ',"mode":"async"' &&
-                   ',"program":"' && iv_progname && '"' &&
-                   ',"jobname":"' && lv_jobname && '"' &&
-                   ',"jobcount":"' && lv_jobcount && '"}'.
+  "============================================================
+  "--- IV_ASYNC = '' : wait inline for the job, return spool ---
+  "============================================================
+  lv_waited = 0.
+  DO.
+    PERFORM z_get_jobstate USING lv_jobname lv_jobcount CHANGING lv_state.
+    IF lv_state = 'FINISHED' OR lv_state = 'ABORTED' OR lv_state = 'NOTFOUND'.
+      EXIT.
+    ENDIF.
+    IF lv_waited >= lc_sync_wait_timeout.
+      EXIT.
+    ENDIF.
+    WAIT UP TO lc_sync_wait_interval SECONDS.
+    lv_waited = lv_waited + lc_sync_wait_interval.
+  ENDDO.
 
-  lv_msg = 'Job submitted: ' && lv_jobname && ' / ' && lv_jobcount.
-  PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
+  IF lv_state <> 'FINISHED'.
+    ev_status = lc_error.
+    ev_result_json = '{"status":"error"' &&
+                     ',"mode":"sync_wait"' &&
+                     ',"program":"'  && iv_progname && '"' &&
+                     ',"jobname":"'  && lv_jobname  && '"' &&
+                     ',"jobcount":"' && lv_jobcount && '"' &&
+                     ',"state":"'    && lv_state    && '"}'.
+    lv_msg = 'Job ' && lv_jobname && ' did not finish (state=' && lv_state && ')'.
+    PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
+    RETURN.
+  ENDIF.
+
+  "--- Job finished: fetch spool and embed it in the result ---
+  PERFORM z_fetch_spool USING    lv_jobname lv_jobcount
+                        CHANGING lt_lines lv_subrc lv_spoolmsg.
+
+  TRY.
+    lv_spooljson = /ui2/cl_json=>serialize( data = lt_lines ).
+  CATCH cx_root.
+    lv_spooljson = '[]'.
+  ENDTRY.
+
+  ev_status = lc_success.
+  ev_result_json = '{"status":"completed"' &&
+                   ',"mode":"sync_wait"' &&
+                   ',"program":"'  && iv_progname && '"' &&
+                   ',"jobname":"'  && lv_jobname  && '"' &&
+                   ',"jobcount":"' && lv_jobcount && '"' &&
+                   ',"spool":'     && lv_spooljson && '}'.
+
+  IF lv_subrc <> 0.
+    "Spool unavailable is not fatal — the job itself finished OK.
+    lv_msg = 'Job finished, spool unavailable: ' && lv_spoolmsg.
+    PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
+  ELSE.
+    lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lines( lt_lines ).
+    PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
+  ENDIF.
 
 ENDFORM.
 
@@ -858,61 +902,31 @@ FORM ztool_job_status
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: ls_job     TYPE ty_zai_job_params.
-  DATA: lv_aborted TYPE c LENGTH 1,
-        lv_finish  TYPE c LENGTH 1,
-        lv_running TYPE c LENGTH 1,
-        lv_ready   TYPE c LENGTH 1,
-        lv_schedul TYPE c LENGTH 1,
-        lv_state   TYPE string,
-        lv_msg     TYPE string.
+  DATA: ls_job   TYPE ty_zai_job_params,
+        lv_state TYPE string,
+        lv_msg   TYPE string.
 
   "--- Deserialize JSON ---
   /ui2/cl_json=>deserialize(
      EXPORTING json = iv_params_json
      CHANGING  data = ls_job ).
 
-  "--- Query job status ---
-  CALL FUNCTION 'SHOW_JOBSTATE'
-    EXPORTING
-      jobcount         = ls_job-jobcount
-      jobname          = ls_job-jobname
-    IMPORTING
-      aborted          = lv_aborted
-      finished         = lv_finish
-      preliminary      = lv_schedul
-      ready            = lv_ready
-      running          = lv_running
-    EXCEPTIONS
-      jobcount_missing = 1
-      jobname_missing  = 2
-      job_notex        = 3
-      OTHERS           = 4.
+  "--- Query job status (shared helper) ---
+  PERFORM z_get_jobstate USING ls_job-jobname ls_job-jobcount CHANGING lv_state.
 
-  IF sy-subrc <> 0.
+  IF lv_state = 'NOTFOUND'.
     ev_status  = lc_error.
     lv_msg = 'Job not found: ' && ls_job-jobname && ' / ' && ls_job-jobcount.
     PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
     RETURN.
   ENDIF.
 
-  "--- Map state flags to a single status ---
-  IF lv_finish = 'X'.
-    lv_state   = 'FINISHED'.
-    ev_status  = lc_success.
-  ELSEIF lv_aborted = 'X'.
-    lv_state   = 'ABORTED'.
-    ev_status  = lc_error.
-  ELSEIF lv_running = 'X'.
-    lv_state   = 'RUNNING'.
-    ev_status  = lc_async.
-  ELSEIF lv_ready = 'X'.
-    lv_state   = 'READY'.
-    ev_status  = lc_async.
-  ELSE.
-    lv_state   = 'SCHEDULED'.
-    ev_status  = lc_async.
-  ENDIF.
+  "--- Map state to a single status ---
+  CASE lv_state.
+    WHEN 'FINISHED'. ev_status = lc_success.
+    WHEN 'ABORTED'.  ev_status = lc_error.
+    WHEN OTHERS.     ev_status = lc_async.   "RUNNING | READY | SCHEDULED
+  ENDCASE.
 
   lv_msg = 'Job ' && ls_job-jobname && ': ' && lv_state.
   PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
@@ -931,14 +945,10 @@ FORM ztool_read_job_spool
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: lt_buffer    TYPE TABLE OF buffer,
-        lv_rqident   TYPE tsp01-rqident,
-        lv_listident TYPE tbtcp-listident,
-        ls_job       TYPE ty_zai_job_params,
-        lv_json      TYPE string,
-        lv_message   TYPE string,
-        lv_line      TYPE string,
-        lt_lines     TYPE STANDARD TABLE OF string WITH EMPTY KEY.
+  DATA: ls_job     TYPE ty_zai_job_params,
+        lv_message TYPE string,
+        lv_subrc   TYPE i,
+        lt_lines   TYPE stringtab.
 
   "------------------------------------------------------------
   " 1. Deserialize input JSON
@@ -954,28 +964,127 @@ FORM ztool_read_job_spool
   ENDTRY.
 
   "------------------------------------------------------------
-  " 2. Get RQIDENT by JOBNAME / JOBCOUNT
+  " 2. Resolve + read spool (shared helper)
   "------------------------------------------------------------
+  PERFORM z_fetch_spool USING    ls_job-jobname ls_job-jobcount
+                        CHANGING lt_lines lv_subrc lv_message.
 
-  SELECT SINGLE listident
-    INTO lv_listident
-    FROM tbtcp
-   WHERE jobname  = ls_job-jobname
-     AND jobcount = ls_job-jobcount.
-
-  lv_rqident = lv_listident.
-
-  IF sy-subrc <> 0 OR lv_rqident IS INITIAL.
+  IF lv_subrc <> 0.
     ev_status  = lc_error.
-    lv_message = |Spool not found for jobname={ ls_job-jobname } jobcount={ ls_job-jobcount }|.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
   "------------------------------------------------------------
-  " 3. Read spool
+  " 3. Serialise result to JSON (array of lines)
   "------------------------------------------------------------
+  TRY.
+    ev_result_json = /ui2/cl_json=>serialize( data = lt_lines ).
+  CATCH cx_root INTO DATA(lx_json_ser).
+    ev_status  = lc_error.
+    lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+    RETURN.
+  ENDTRY.
 
+  ev_status  = lc_success.
+  lv_message = |Spool read successfully. Lines={ lines( lt_lines ) }|.
+  PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+
+ENDFORM.
+
+
+*&--------------------------------------------------------------------*
+*& FORM z_get_jobstate
+*&   Wraps SHOW_JOBSTATE and maps the flags to a single state string:
+*&   FINISHED | ABORTED | RUNNING | READY | SCHEDULED | NOTFOUND
+*&--------------------------------------------------------------------*
+FORM z_get_jobstate
+  USING    iv_jobname  TYPE btcjob
+           iv_jobcount TYPE btcjobcnt
+  CHANGING ev_state    TYPE string.
+
+  DATA: lv_aborted TYPE c LENGTH 1,
+        lv_finish  TYPE c LENGTH 1,
+        lv_running TYPE c LENGTH 1,
+        lv_ready   TYPE c LENGTH 1,
+        lv_schedul TYPE c LENGTH 1.
+
+  CLEAR ev_state.
+
+  CALL FUNCTION 'SHOW_JOBSTATE'
+    EXPORTING
+      jobcount         = iv_jobcount
+      jobname          = iv_jobname
+    IMPORTING
+      aborted          = lv_aborted
+      finished         = lv_finish
+      preliminary      = lv_schedul
+      ready            = lv_ready
+      running          = lv_running
+    EXCEPTIONS
+      jobcount_missing = 1
+      jobname_missing  = 2
+      job_notex        = 3
+      OTHERS           = 4.
+
+  IF sy-subrc <> 0.
+    ev_state = 'NOTFOUND'.
+    RETURN.
+  ENDIF.
+
+  IF lv_finish = 'X'.
+    ev_state = 'FINISHED'.
+  ELSEIF lv_aborted = 'X'.
+    ev_state = 'ABORTED'.
+  ELSEIF lv_running = 'X'.
+    ev_state = 'RUNNING'.
+  ELSEIF lv_ready = 'X'.
+    ev_state = 'READY'.
+  ELSE.
+    ev_state = 'SCHEDULED'.
+  ENDIF.
+
+ENDFORM.
+
+
+*&--------------------------------------------------------------------*
+*& FORM z_fetch_spool
+*&   Resolves the spool request for a (finished) job via TBTCP→RQIDENT
+*&   and returns its lines. ev_subrc = 0 on success; on error ev_subrc
+*&   is non-zero and ev_message carries the explanation.
+*&--------------------------------------------------------------------*
+FORM z_fetch_spool
+  USING    iv_jobname  TYPE btcjob
+           iv_jobcount TYPE btcjobcnt
+  CHANGING ct_lines    TYPE stringtab
+           ev_subrc    TYPE i
+           ev_message  TYPE string.
+
+  DATA: lt_buffer    TYPE TABLE OF buffer,
+        lv_rqident   TYPE tsp01-rqident,
+        lv_listident TYPE tbtcp-listident,
+        lv_line      TYPE string.
+
+  CLEAR: ct_lines, ev_message.
+  ev_subrc = 0.
+
+  "--- Get RQIDENT by JOBNAME / JOBCOUNT ---
+  SELECT SINGLE listident
+    INTO lv_listident
+    FROM tbtcp
+   WHERE jobname  = iv_jobname
+     AND jobcount = iv_jobcount.
+
+  lv_rqident = lv_listident.
+
+  IF sy-subrc <> 0 OR lv_rqident IS INITIAL.
+    ev_subrc   = 4.
+    ev_message = |Spool not found for jobname={ iv_jobname } jobcount={ iv_jobcount }|.
+    RETURN.
+  ENDIF.
+
+  "--- Read spool ---
   CALL FUNCTION 'RSPO_RETURN_ABAP_SPOOLJOB'
     EXPORTING
       rqident              = lv_rqident
@@ -992,51 +1101,25 @@ FORM ztool_read_job_spool
       OTHERS               = 8.
 
   IF sy-subrc <> 0.
+    ev_subrc = sy-subrc.
     CASE sy-subrc.
-      WHEN 1.
-        lv_message = |No such spool job. rqident={ lv_rqident }|.
-      WHEN 2.
-        lv_message = |Spool job contains no data. rqident={ lv_rqident }|.
-      WHEN 3.
-        lv_message = |Selection empty. rqident={ lv_rqident }|.
-      WHEN 4.
-        lv_message = |No permission to read spool. rqident={ lv_rqident }|.
-      WHEN 5.
-        lv_message = |Can not access spool. rqident={ lv_rqident }|.
-      WHEN 6.
-        lv_message = |Read error spool. rqident={ lv_rqident }|.
-      WHEN 7.
-        lv_message = |Type no match while reading spool. rqident={ lv_rqident }|.
-      WHEN OTHERS.
-        lv_message = |Unexpected error while reading spool. rqident={ lv_rqident }|.
+      WHEN 1. ev_message = |No such spool job. rqident={ lv_rqident }|.
+      WHEN 2. ev_message = |Spool job contains no data. rqident={ lv_rqident }|.
+      WHEN 3. ev_message = |Selection empty. rqident={ lv_rqident }|.
+      WHEN 4. ev_message = |No permission to read spool. rqident={ lv_rqident }|.
+      WHEN 5. ev_message = |Can not access spool. rqident={ lv_rqident }|.
+      WHEN 6. ev_message = |Read error spool. rqident={ lv_rqident }|.
+      WHEN 7. ev_message = |Type no match while reading spool. rqident={ lv_rqident }|.
+      WHEN OTHERS. ev_message = |Unexpected error while reading spool. rqident={ lv_rqident }|.
     ENDCASE.
-
-    ev_status  = lc_error.
-    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
-  "------------------------------------------------------------
-  " 4. Serialise result to JSON
-  "------------------------------------------------------------
-
+  "--- Convert CHAR(255) buffer rows to string lines ---
   LOOP AT lt_buffer INTO DATA(lv_buf).
-    lv_line = lv_buf. " convert char 255 to string
-    APPEND lv_line TO lt_lines.
+    lv_line = lv_buf.
+    APPEND lv_line TO ct_lines.
   ENDLOOP.
-
-  TRY.
-    ev_result_json = /ui2/cl_json=>serialize( data = lt_lines ).
-  CATCH cx_root INTO DATA(lx_json_ser).
-    ev_status  = lc_error.
-    lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
-    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
-    RETURN.
-  ENDTRY.
-
-  ev_status  = lc_success.
-  lv_message = |Spool read successfully. rqident={ lv_rqident }. Lines={ lines( lt_buffer ) }|.
-  PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
 
 ENDFORM.
 

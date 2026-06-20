@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -39,19 +40,20 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SAP Period Close Agent")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Pre-import graph_builder on startup so the first Start click isn't delayed by
+    # ~60s of cold module loading on Windows (langgraph + langchain + mcp deps).
+    import graph_builder  # noqa: F401
+    logger.info("graph_builder pre-imported — first run will start immediately")
+    yield
+
+
+app = FastAPI(title="SAP Period Close Agent", lifespan=lifespan)
 
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-
-@app.on_event("startup")
-async def _warmup_imports():
-    """Pre-import graph_builder so the first Start click isn't delayed by ~60s of
-    cold module loading on Windows (langgraph + langchain + mcp transitive deps)."""
-    import graph_builder  # noqa: F401
-    logger.info("graph_builder pre-imported — first run will start immediately")
 
 
 # ---------------------------------------------------------------------------
