@@ -19,11 +19,9 @@ steps:
       - {selname: "VARIANT", kind: "P", low: "TEST"}
 
     pre_check:
-      enabled: true
       params:
         - {selname: "VARIANT", kind: "P", low: "FK01_INT_ORDER"}
 
     rollback:
-      enabled: true
       params:
         - {selname: "VARIANT", kind: "P", low: "TEST"}

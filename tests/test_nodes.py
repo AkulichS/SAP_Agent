@@ -59,6 +59,8 @@ async def test_precheck_comparison_field_mismatch_on_fail_skip(make_session, mak
 
 
 async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_state):
+    # "error" is a backward-compatible alias of "analyse": failure → passed=False and a
+    # uniform ErrorContext handed to the source-aware analysis_node (no inline current_analysis).
     session = make_session(sap_read_table={"rows": [{"SPERRE": "X"}], "status": "S"})
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "first", "field": "SPERRE", "operator": "eq",
@@ -66,6 +68,9 @@ async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_s
     out = await node(make_state([step]))
     pc = out["current_pre_check"]
     assert pc["passed"] is False and pc["error"]
+    assert out["current_error_context"]["source"] == "pre_check"
+    assert out["current_error_context"]["default_depth"] == "explain"
+    assert "current_analysis" not in out
 
 
 async def test_precheck_llm_pass(make_session, make_llms, make_state):
@@ -87,6 +92,86 @@ async def test_precheck_llm_fail_skips(make_session, make_llms, make_state):
         "params": {"table": "COKP"}, "llm": {"prompt": "ok?", "pass_values": ["yes"]}}}
     out = await node(make_state([step]))
     assert out["current_pre_check"]["skip_step"] is True
+
+
+# --- SUBMIT pre-check: emptiness decided from the ABAP-provided spool row count ---
+
+def _submit_cmp_step(comparison, llm=None):
+    pc = {"step_id": "A", "pre_check": {
+        "enabled": True, "mode": "comparison", "action_type": "SUBMIT",
+        "object_name": "RKASELRULES_OR", "async": False, "comparison": comparison}}
+    if llm is not None:
+        pc["pre_check"]["llm"] = llm
+    return pc
+
+
+def _submit_result(*, status="ok", spool_rows=None, spool_text=""):
+    """Build a fake sap_execute_step payload. spool_rows=None → no spool object."""
+    rj = {"status": "completed"}
+    if spool_rows is not None:
+        rj["spool"] = {"rows": spool_rows, "spool_context": spool_text}
+    return {"status": status, "result_json": rj, "spool_text": spool_text, "messages": []}
+
+
+async def test_precheck_submit_empty_spool_executes(make_session, make_llms, make_state):
+    session = make_session(sap_execute_step=_submit_result(spool_rows=0))
+    node = make_pre_check_node(session, make_llms())
+    step = _submit_cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "analyse"})
+    out = await node(make_state([step]))
+    pc = out["current_pre_check"]
+    assert pc["passed"] is True and pc["skip_step"] is False
+    assert out.get("current_error_context") is None
+
+
+async def test_precheck_submit_nonempty_spool_to_analysis(make_session, make_llms, make_state):
+    # Non-empty spool → pre_check fails and hands the offending spool to analysis_node
+    # via a uniform ErrorContext (explain depth). No inline LLM call / current_analysis.
+    session = make_session(
+        sap_execute_step=_submit_result(spool_rows=24, spool_text="order 1\norder 2"))
+    llms = make_llms()
+    node = make_pre_check_node(session, llms)
+    step = _submit_cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "analyse"})
+    out = await node(make_state([step]))
+    pc = out["current_pre_check"]
+    assert pc["passed"] is False
+    ec = out["current_error_context"]
+    assert ec["source"] == "pre_check" and ec["default_depth"] == "explain"
+    assert "order 1" in ec["spool_text"]
+    assert "current_analysis" not in out
+    assert llms["validation"].calls == []  # explanation is deferred to analysis_node
+
+
+async def test_precheck_submit_no_spool_not_verified(make_session, make_llms, make_state):
+    session = make_session(sap_execute_step=_submit_result(status="error", spool_rows=None))
+    node = make_pre_check_node(session, make_llms())
+    step = _submit_cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "analyse"})
+    out = await node(make_state([step]))
+    pc = out["current_pre_check"]
+    assert pc["passed"] is False
+    ec = out["current_error_context"]
+    assert ec["source"] == "pre_check" and "spool" in ec["summary"].lower()
+
+
+async def test_precheck_submit_finished_but_spool_unreadable_not_verified(make_session, make_llms, make_state):
+    # Job FINISHED (status ok, spool object present with rows=0) but ABAP warns the
+    # spool was unavailable → must be treated as "not verified", not "empty → ok".
+    payload = _submit_result(status="ok", spool_rows=0)
+    payload["messages"] = [{"TYPE": "W", "MESSAGE": "Job finished, spool unavailable: read error"}]
+    session = make_session(sap_execute_step=payload)
+    node = make_pre_check_node(session, make_llms())
+    step = _submit_cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "analyse"})
+    out = await node(make_state([step]))
+    assert out["current_pre_check"]["passed"] is False
+    assert out["current_error_context"]["source"] == "pre_check"
+
+
+async def test_precheck_submit_completed_without_spool_not_verified(make_session, make_llms, make_state):
+    session = make_session(sap_execute_step=_submit_result(status="ok", spool_rows=None))
+    node = make_pre_check_node(session, make_llms())
+    step = _submit_cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "analyse"})
+    out = await node(make_state([step]))
+    assert out["current_pre_check"]["passed"] is False
+    assert out["current_error_context"]["source"] == "pre_check"
 
 
 # ===========================================================================
@@ -254,6 +339,8 @@ async def test_validate_llm_retry(make_session, make_llms, make_state):
     out = await node(state)
     assert out["current_validate"]["verdict"] == "retry"
     assert out["current_validate"]["error_count"] == 2
+    ec = out["current_error_context"]
+    assert ec["source"] == "validate" and ec["default_depth"] == "diagnose"
 
 
 async def test_validate_llm_non_json_escalates(make_session, make_llms, make_state):
@@ -281,18 +368,19 @@ async def test_validate_run_verification_action(make_session, make_llms, make_st
 
 
 # ===========================================================================
-# analysis_node  (create_react_agent patched at the seam)
+# analysis_node  (source-aware dispatcher: explain vs diagnose)
 # ===========================================================================
 
-_VALIDATE = {"step_id": "A", "verdict": "retry", "spool_text": "boom",
-             "messages": [], "error_count": 1, "reasoning": "bad"}
+# A validate-sourced failure → diagnose depth (heavy ReAct path).
+_DIAGNOSE_CTX = {"source": "validate", "summary": "bad", "spool_text": "boom",
+                 "error_count": 1, "default_depth": "diagnose"}
 
 
 async def test_analysis_retry_decision(make_session, make_llms, make_state, patch_react_agent):
     patch_react_agent('{"action":"retry","corrected_params":null,'
                       '"diagnosis":"transient","user_instructions":null}')
     node = make_analysis_node(make_session(), make_llms())
-    state = make_state([{"step_id": "A"}], retry_count=0, current_validate=_VALIDATE)
+    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
     out = await node(state)
     assert out["current_analysis"]["action"] == "retry"
     assert out["retry_count"] == 1
@@ -302,7 +390,7 @@ async def test_analysis_skip_decision(make_session, make_llms, make_state, patch
     patch_react_agent('{"action":"skip","corrected_params":null,'
                       '"diagnosis":"benign","user_instructions":null}')
     node = make_analysis_node(make_session(), make_llms())
-    state = make_state([{"step_id": "A"}], retry_count=0, current_validate=_VALIDATE)
+    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
     out = await node(state)
     assert out["current_analysis"]["action"] == "skip"
 
@@ -311,6 +399,42 @@ async def test_analysis_non_json_requires_user_input(make_session, make_llms, ma
                                                      patch_react_agent):
     patch_react_agent("I could not parse this")
     node = make_analysis_node(make_session(), make_llms())
-    state = make_state([{"step_id": "A"}], retry_count=0, current_validate=_VALIDATE)
+    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
+    out = await node(state)
+    assert out["current_analysis"]["action"] == "user_input"
+
+
+async def test_analysis_explain_depth_lists_rows_no_react(make_session, make_llms, make_state,
+                                                          monkeypatch):
+    # A pre_check-sourced failure resolves to the cheap "explain" depth: one validation
+    # call over the offending rows, action=user_input, and the ReAct agent is NOT built.
+    import graph_builder
+    def _boom(*a, **k):
+        raise AssertionError("create_agent must not run on the explain path")
+    monkeypatch.setattr(graph_builder, "create_agent", _boom)
+
+    llms = make_llms(validation="Orders 1,2 lack settlement rules; maintain KO02.")
+    node = make_analysis_node(make_session(), llms)
+    ec = {"source": "pre_check", "summary": "Pre-check failed",
+          "rows": [{"AUFNR": "1"}, {"AUFNR": "2"}], "default_depth": "explain"}
+    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=ec)
+    out = await node(state)
+    assert out["current_analysis"]["action"] == "user_input"
+    assert "KO02" in out["current_analysis"]["diagnosis"]
+    assert len(llms["validation"].calls) == 1
+    assert "analysis_messages" not in out   # explain path is stateless
+
+
+async def test_analysis_explain_depth_via_on_error_mode_map(make_session, make_llms, make_state,
+                                                            monkeypatch):
+    # on_error.mode as a {source: depth} map overrides the context default_depth.
+    import graph_builder
+    monkeypatch.setattr(graph_builder, "create_agent",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no react")))
+    llms = make_llms(validation="explanation")
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "A", "on_error": {"mode": {"validate": "explain"}}}
+    ec = {"source": "validate", "summary": "x", "default_depth": "diagnose"}
+    state = make_state([step], retry_count=0, current_error_context=ec)
     out = await node(state)
     assert out["current_analysis"]["action"] == "user_input"

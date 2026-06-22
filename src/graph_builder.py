@@ -34,15 +34,17 @@ from uuid import uuid4
 
 import yaml
 from dotenv import load_dotenv
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    BaseMessage, HumanMessage, SystemMessage, RemoveMessage,
+)
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
-from langgraph.graph.message import add_messages
+from langgraph.graph.message import add_messages, REMOVE_ALL_MESSAGES
 from langchain_core.tools import tool as lc_tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import create_react_agent
+from langchain.agents import create_agent
 from langgraph.types import Command, Send, interrupt
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -86,8 +88,27 @@ def _resolve(obj: Any, ctx: dict) -> Any:
 # State TypedDicts
 # ---------------------------------------------------------------------------
 
-class PreCheckResult(TypedDict):
+class PreCheckResult(TypedDict, total=False):
     step_id: str; passed: bool; skip_step: bool; raw_data: dict; error: str | None
+
+
+class ErrorContext(TypedDict, total=False):
+    """Uniform failure payload handed to the source-aware analysis_node.
+
+    Every failing node (pre_check / validate / execute / poll) fills this in and
+    routes to ``analysis``; the node reads ``source`` + ``default_depth`` to pick
+    the cheap ``explain`` path or the heavy ``diagnose`` (ReAct) path.
+    """
+    source: str            # "pre_check" | "validate" | "execute" | "poll"
+    summary: str           # one-line reason
+    rows: list[dict]       # offending rows already in hand
+    spool_text: str
+    messages: list[dict]
+    error_count: int
+    errors: list[dict]     # structured errors[] from _llm_verdict (e.g. KO8G shape)
+    default_depth: str     # "explain" | "diagnose"
+    job_name: str
+    job_id: str
 
 
 class ExecuteResult(TypedDict):
@@ -131,6 +152,7 @@ class PeriodCloseState(TypedDict):
     current_poll: PollStatus | None
     current_validate: ValidateResult | None
     current_analysis: AnalysisResult | None
+    current_error_context: ErrorContext | None
     retry_count: int
     parallel_results: Annotated[dict[str, dict], _merge_parallel]
     step_records: list[StepRecord]
@@ -242,15 +264,128 @@ async def _run_action(session: ClientSession, action_type: str, object_name: str
         "test_run":    test_run,
     })
     data = _parse_tool_result(r)
-    rj   = data.get("result_json", {})
-    rows = rj.get("rows", []) if isinstance(rj, dict) else []
+    rj   = data.get("result_json", {}) if isinstance(data.get("result_json"), dict) else {}
+    rows = rj.get("rows") or []                      # TOOLS path: list of dicts
+    spool_meta      = rj.get("spool")                # SUBMIT sync_wait: {"rows": N, "spool_context": "..."}
+    # spool_present distinguishes "report ran and produced a spool we read"
+    # (object present, even if 0 rows) from "no spool obtained at all" (key
+    # absent/null — job errored, or the spool could not be fetched).
+    # A job can FINISH yet have an unreadable spool: ABAP still emits {"rows":0}
+    # but adds a "spool unavailable" warning (z_execute_submit) — treat that as
+    # "no spool" too, so an empty pre-check isn't mistaken for "0 offending rows".
+    spool_unreadable = any("spool unavailable" in (m.get("MESSAGE", "").lower())
+                           for m in data.get("messages", []))
+    spool_present   = isinstance(spool_meta, dict) and not spool_unreadable
+    spool_row_count = spool_meta.get("rows", 0) if spool_present else len(rows)
     return {
-        "status":      "error" if data.get("status") == "error" else "ok",
-        "rows":        rows,
-        "spool_text":  data.get("spool_text", ""),
-        "messages":    data.get("messages", []),
-        "result_json": rj,
+        "status":          "error" if data.get("status") == "error" else "ok",
+        "rows":            rows,
+        "spool_row_count": spool_row_count,
+        "spool_present":   spool_present,
+        "spool_text":      data.get("spool_text", ""),
+        "messages":        data.get("messages", []),
+        "result_json":     rj,
     }
+
+
+def _analysis_depth(step: dict, ec: dict) -> str:
+    """Resolve the analysis depth for a failure: cheap "explain" vs heavy "diagnose".
+
+    Precedence: on_error.mode (a string, or a {source: depth} map) →
+    error_context.default_depth → "diagnose".
+    """
+    src = ec.get("source", "")
+    oem = (step.get("on_error", {}) or {}).get("mode")
+    depth = (oem.get(src) if isinstance(oem, dict) else oem) \
+            or ec.get("default_depth") or "diagnose"
+    return depth
+
+
+# ---------------------------------------------------------------------------
+# Shared LLM job: the verdict / judge gate
+# ---------------------------------------------------------------------------
+
+async def _llm_verdict(
+    llm,
+    *,
+    prompt: str,
+    system_prompt: str | None = None,
+    spool_text: str = "",
+    rows: list | None = None,
+    messages: list | None = None,
+    pass_values: list[str] | None = None,
+) -> dict:
+    """Single LLM gate shared by pre_check(mode:llm) and validate(mode:llm).
+
+    Returns ``{"verdict","error_count","errors","reasoning"}`` where verdict is
+    ``ok`` | ``retry`` | ``escalate``.
+
+    * ``pass_values`` set  → boolean mode (pre_check parity): the model answers in
+      prose; verdict is ``ok`` when any pass word appears, else ``retry``.
+    * ``pass_values`` None → JSON mode (validate parity): parse
+      ``{error_count, errors?, verdict?, reasoning?}``; verdict is derived from
+      ``error_count`` when omitted; non-JSON → ``escalate``.
+
+    Fail-open: an LLM exception returns verdict ``ok`` so a provider outage never
+    wedges a period close.
+    """
+    rows     = rows or []
+    messages = messages or []
+    messages_text = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
+    rows_text     = json.dumps(rows, ensure_ascii=False) if rows else ""
+
+    # _resolve only replaces {{token}}; literal single braces (e.g. a JSON schema
+    # written into the prompt) pass through unchanged.
+    ctx = {"spool_text": spool_text or "", "messages_text": messages_text,
+           "rows_text": rows_text}
+    resolved_prompt = _resolve(prompt, ctx)
+
+    # If the prompt embeds the output itself, use it verbatim; otherwise append it.
+    if any(tok in prompt for tok in ("{{spool_text}}", "{{messages_text}}", "{{rows_text}}")):
+        human = resolved_prompt
+    else:
+        content = spool_text or rows_text or messages_text
+        human   = f"Task: {resolved_prompt}\n\nOutput:\n{content}"
+
+    if pass_values is not None:
+        default_system = "Analyse this SAP data and answer the question concisely."
+    else:
+        default_system = (
+            "You are an SAP job result analyser. Respond ONLY with JSON: "
+            '{"verdict":"ok"|"retry"|"escalate","error_count":int,"reasoning":"one sentence"}'
+        )
+    system = _resolve(system_prompt or default_system, ctx)
+
+    try:
+        response = await llm.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=human),
+        ])
+        raw = re.sub(r"```\w*\n?", "", (response.content or "").strip()).strip()
+    except Exception as exc:
+        logger.warning("_llm_verdict LLM not available: %s", exc)
+        return {"verdict": "ok", "error_count": 0, "errors": [],
+                "reasoning": f"LLM not available — skipping LLM check ({str(exc)[:120]})"}
+
+    if pass_values is not None:
+        answer = raw.lower()
+        passed = any(v in answer for v in pass_values)
+        return {"verdict": "ok" if passed else "retry",
+                "error_count": 0 if passed else 1, "errors": [],
+                "reasoning": raw[:300]}
+
+    try:
+        parsed      = json.loads(raw)
+        error_count = int(parsed.get("error_count", 0))
+        errors      = parsed.get("errors") or []
+        verdict     = parsed.get("verdict") or ("ok" if error_count == 0 else "retry")
+        reasoning   = parsed.get("reasoning") or (
+            json.dumps(errors, ensure_ascii=False) if errors else raw[:300])
+        return {"verdict": verdict, "error_count": error_count,
+                "errors": errors, "reasoning": reasoning}
+    except json.JSONDecodeError:
+        return {"verdict": "escalate", "error_count": 0, "errors": [],
+                "reasoning": f"LLM returned non-JSON: {raw[:150]}"}
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +423,7 @@ def make_router_node():
             "current_poll":       None,
             "current_validate":   None,
             "current_analysis":   None,
+            "current_error_context": None,
             "retry_count":        0,
             "user_decision":      None,
             "restart_from":       None,
@@ -331,11 +467,29 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             session, pc["action_type"], pc["object_name"], pc.get("params", {}),
             async_mode=pc.get("async", False), test_run=pc.get("test_run", True),
         )
-        rows       = run["rows"]
-        spool_text = run["spool_text"]
+        rows            = run["rows"]
+        spool_text      = run["spool_text"]
+        spool_row_count = run.get("spool_row_count", len(rows))
         # raw_data is what comparison/LLM/operator inspect: table rows when present,
         # otherwise the SUBMIT spool text.
         raw_data   = run["result_json"] if rows else (spool_text or run["result_json"])
+
+        # A failed pre-check no longer renders its own explanation. It marks the
+        # pre-check failed and hands a uniform ErrorContext to the source-aware
+        # analysis_node, which (cheap "explain" depth by default for pre_check)
+        # explains the finding to the operator through user_node.
+        def _fail_to_analysis(summary: str, detail: dict, emit_msg: str) -> dict:
+            return {
+                "current_pre_check": {
+                    "step_id": step_id, "passed": False, "skip_step": False,
+                    "raw_data": raw_data, "error": summary,
+                },
+                "current_error_context": {
+                    "source": "pre_check", "summary": summary,
+                    "rows": (rows or [])[:50], "spool_text": spool_text or "",
+                    "default_depth": "explain",
+                },
+            }
 
         if mode == "comparison":
             cmp = pc["comparison"]
@@ -343,12 +497,32 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 rows = []
             select = cmp.get("select", "first")
             on_pass, on_fail = cmp.get("on_pass", "execute"), cmp.get("on_fail", "skip")
+            pc_action = (pc.get("action_type") or "").upper()
+            obj       = pc.get("object_name", "")
+
+            # --- No verification artifact: a SUBMIT pre-check whose report errored or
+            #     returned no spool cannot judge the precondition. Route to analysis so
+            #     the operator is told the step was not verified (fix-and-retry or skip).
+            if pc_action == "SUBMIT" and (run["status"] == "error" or not run.get("spool_present", False)):
+                summary = (f"Step {step_id} could not be verified: pre-check report "
+                           f"{obj} returned no spool. Ensure the report runs and produces a "
+                           f"spool, then retry the pre-check — or skip the step.")
+                await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
+                             "status": "failed", "message": f"not verified — no spool from {obj}",
+                             "detail": {"object_name": obj, "status": run["status"],
+                                        "spool_present": run.get("spool_present", False)}})
+                return _fail_to_analysis(
+                    summary,
+                    {"object_name": obj, "status": run["status"]},
+                    f"not verified — no spool from {obj}")
 
             # Determine the comparison outcome.
             if select in ("empty", "non_empty"):
-                # Table-level emptiness check; field/operator/value are ignored.
-                passed = (len(rows) == 0) if select == "empty" else (len(rows) > 0)
-                actual = f"{len(rows)} row(s)"
+                # Use the ABAP-provided spool row count for SUBMIT pre-checks; fall
+                # back to len(rows) for TOOLS (table reads) where rows is a list.
+                count  = spool_row_count if not rows else len(rows)
+                passed = (count == 0) if select == "empty" else (count > 0)
+                actual = f"{count} row(s)"
                 cond   = f"table is {select.replace('_', '-')}"
             else:
                 row    = rows[-1] if (select == "last" and rows) else (rows[0] if rows else {})
@@ -385,38 +559,37 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
                              "status": "ok", "message": f"{cond} ✗ → execute anyway", "detail": _det})
             else:
-                # on_fail in ("error", "llm") → hand the offending rows to the analyst node,
-                # which produces an explanation and interrupts for the operator to fix & restart.
-                err_msg = f"Pre-check failed: {cond}"
-                result = {"step_id": step_id, "passed": False, "skip_step": False,
-                          "raw_data": raw_data, "error": err_msg}
+                # Condition violated → hand the offending output to the source-aware
+                # analysis_node. Canonical on_fail is "analyse"; "llm"/"error" are kept
+                # as backward-compatible aliases (any other value also routes here).
+                summary = f"Pre-check failed: {cond} ({actual})"
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
-                             "status": "failed", "message": f"{err_msg} → {on_fail}", "detail": _det})
+                             "status": "failed", "message": f"{cond} ✗ → analysis", "detail": _det})
+                return _fail_to_analysis(summary, _det, f"{cond} ✗ → analysis")
             return {"current_pre_check": result}
 
         if mode == "llm":
-            llm       = llms["validation"]
+            # Boolean gate via the shared verdict helper: pass → execute, fail → skip
+            # the step (unchanged semantics; no operator interrupt for mode:llm).
             lcfg      = pc.get("llm", {})
             pass_vals = lcfg.get("pass_values", ["yes", "true", "pass", "ok"])
-            # Feed the SUBMIT spool verbatim when present; otherwise the table rows.
-            data_block = spool_text if (spool_text and not rows) else json.dumps(raw_data)
-            try:
-                response  = await llm.ainvoke([
-                    SystemMessage(content="Analyse this SAP data and answer the question concisely."),
-                    HumanMessage(content=f"Data:\n{data_block}\n\nQuestion: {lcfg.get('prompt', 'Is this valid?')}"),
-                ])
-                answer = response.content.lower().strip()
-            except Exception as exc:
-                logger.warning("pre_check LLM error step=%s: %s", step_id, exc)
-                answer = f"llm error: {exc}"
-            passed = any(v in answer for v in pass_vals)
+            v = await _llm_verdict(
+                llms["validation"],
+                prompt=lcfg.get("prompt", "Is this valid?"),
+                # Feed the SUBMIT spool verbatim when present; otherwise the table rows.
+                spool_text=spool_text if (spool_text and not rows) else "",
+                rows=rows,
+                pass_values=pass_vals,
+            )
+            passed = v["verdict"] == "ok"
             st = "ok" if passed else "skipped"
             await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
-                         "status": st, "message": answer[:120],
-                         "detail": {"raw_data": raw_data, "llm_response": answer[:300], "passed": passed}})
+                         "status": st, "message": v["reasoning"][:120],
+                         "detail": {"raw_data": raw_data, "llm_response": v["reasoning"][:300],
+                                    "passed": passed}})
             return {"current_pre_check": {
                 "step_id": step_id, "passed": passed, "skip_step": not passed,
-                "raw_data": raw_data, "error": None if passed else answer,
+                "raw_data": raw_data, "error": None if passed else v["reasoning"],
             }}
 
         await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
@@ -479,7 +652,14 @@ def make_execute_node(session: ClientSession):
                          "detail": {"table": table, "count": count,
                                     "rows": data.get("rows", [])[:5],
                                     "status": data.get("status", "")}})
-            return {"current_execute": tools_result}
+            out = {"current_execute": tools_result}
+            if has_error:
+                out["current_error_context"] = {
+                    "source": "execute", "summary": msg,
+                    "rows": data.get("rows", [])[:50], "messages": [{"MESSAGE": msg}],
+                    "default_depth": "diagnose",
+                }
+            return out
 
         tool_result = await session.call_tool("sap_execute_step", arguments={
             "action_type": step["action_type"],
@@ -519,7 +699,14 @@ def make_execute_node(session: ClientSession):
                          "messages":      [m.get("MESSAGE", str(m))
                                            for m in data.get("messages", [])],
                      }})
-        return {"current_execute": execute_result}
+        out = {"current_execute": execute_result}
+        if data.get("status") == "error":
+            out["current_error_context"] = {
+                "source": "execute", "summary": msg,
+                "messages": data.get("messages", []),
+                "default_depth": "diagnose",
+            }
+        return out
 
     return execute_node
 
@@ -574,10 +761,20 @@ def make_poll_node(session: ClientSession):
             await _emit({"type": "action_update", "step_id": step["step_id"], "action": "poll",
                          "message": f"Poll #{poll_count} — {elapsed:.0f}s / {poll_timeout}s — RUNNING"})
 
-        return {"current_poll": {
+        out = {"current_poll": {
             "job_name": job_name, "job_id": job_id, "sap_status": final_st,
             "poll_count": poll_count, "elapsed_sec": elapsed, "timed_out": timed_out,
         }}
+        # ABORTED / timed-out → route_after_poll sends us to analysis. Hand it a
+        # uniform ErrorContext (heavy diagnose depth: the job log needs investigating).
+        if final_st == "ABORTED":
+            summary = (f"Job {job_name}/{job_id} timed out after {elapsed:.0f}s"
+                       if timed_out else f"Job {job_name}/{job_id} aborted")
+            out["current_error_context"] = {
+                "source": "poll", "summary": summary,
+                "default_depth": "diagnose", "job_name": job_name, "job_id": job_id,
+            }
+        return out
 
     return poll_node
 
@@ -603,6 +800,7 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         messages    = execute.get("messages", []) if execute else []
         error_count = 0
         reasoning   = ""
+        errors: list[dict] = []
 
         run_cfg = vcfg.get("run")
         if run_cfg:
@@ -666,57 +864,19 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 reasoning = "No OK patterns matched"
 
         elif mode == "llm":
-            llm     = llms["validation"]
-            lcfg    = vcfg.get("llm", {})
-            raw_prompt    = lcfg.get("prompt", "Was this SAP step successful?")
-            messages_text = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
-
-            rows_text = json.dumps(rows, ensure_ascii=False) if rows else ""
-
-            # Runtime placeholders. _resolve only replaces {{token}}; literal single
-            # braces { } (e.g. a JSON schema written into the prompt) pass through unchanged.
-            ctx = {"spool_text": spool_text or "", "messages_text": messages_text,
-                   "rows_text": rows_text}
-            default_system = (
-                "You are an SAP job result analyser. "
-                "Respond ONLY with JSON: "
-                '{"verdict":"ok"|"retry"|"escalate","error_count":int,"reasoning":"one sentence"}'
+            lcfg = vcfg.get("llm", {})
+            await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
+                         "message": "Sending spool to LLM for analysis…"})
+            v = await _llm_verdict(
+                llms["validation"],
+                prompt=lcfg.get("prompt", "Was this SAP step successful?"),
+                system_prompt=lcfg.get("system_prompt"),
+                spool_text=spool_text, rows=rows, messages=messages,
             )
-            system_prompt = _resolve(lcfg.get("system_prompt", default_system), ctx)
-            prompt        = _resolve(raw_prompt, ctx)
-
-            # If the prompt embeds the output itself, use it verbatim; otherwise append it.
-            if ("{{spool_text}}" in raw_prompt or "{{messages_text}}" in raw_prompt
-                    or "{{rows_text}}" in raw_prompt):
-                human = prompt
-            else:
-                content = spool_text or rows_text or messages_text
-                human   = f"Task: {prompt}\n\nOutput:\n{content}"
-            try:
-                await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
-                             "message": "Sending spool to LLM for analysis…"})
-                response = await llm.ainvoke([
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=human),
-                ])
-                raw = re.sub(r"```\w*\n?", "", response.content.strip()).strip()
-                try:
-                    parsed      = json.loads(raw)
-                    error_count = int(parsed.get("error_count", 0))
-                    # verdict is optional in a custom schema → derive it from error_count.
-                    verdict     = parsed.get("verdict") or ("ok" if error_count == 0 else "retry")
-                    # Preserve any rich payload (e.g. an "errors" list) for the analyst/operator.
-                    reasoning   = parsed.get("reasoning") or (
-                        json.dumps(parsed.get("errors"), ensure_ascii=False)
-                        if parsed.get("errors") is not None else raw[:300])
-                except json.JSONDecodeError:
-                    verdict   = "escalate"
-                    reasoning = f"LLM returned non-JSON: {raw[:150]}"
-            except Exception as exc:
-                logger.warning("validate LLM not available step=%s: %s", step_id, exc)
-                verdict     = "ok"
-                error_count = 0
-                reasoning   = f"LLM not available — skipping LLM check ({str(exc)[:120]})"
+            verdict     = v["verdict"]
+            error_count = v["error_count"]
+            errors      = v["errors"]
+            reasoning   = v["reasoning"]
         else:
             verdict   = "ok"
             reasoning = "No validation configured"
@@ -734,10 +894,22 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                          "messages":      [m.get("MESSAGE", str(m)) for m in (messages or [])],
                      }})
 
-        return {"current_validate": {
+        out: dict = {"current_validate": {
             "step_id": step_id, "verdict": verdict, "spool_text": spool_text,
             "messages": messages, "error_count": error_count, "reasoning": reasoning,
         }}
+        if verdict != "ok":
+            # Hand a uniform ErrorContext to the source-aware analysis_node. Post-step
+            # failures default to the heavy "diagnose" (ReAct + SAP tools) depth.
+            out["current_error_context"] = {
+                "source": "validate", "summary": reasoning,
+                "spool_text": spool_text or "", "rows": (rows or [])[:50],
+                "messages": messages, "error_count": error_count, "errors": errors,
+                "default_depth": "diagnose",
+                "job_name": (poll or {}).get("job_name", "") if poll else "",
+                "job_id":   (poll or {}).get("job_id", "")   if poll else "",
+            }
+        return out
 
     return validate_node
 
@@ -783,8 +955,60 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
         return [sap_read_table, sap_read_spool, sap_job_status, sap_check_period]
 
-    async def analysis_node(state: PeriodCloseState) -> dict:
-        step    = _get_step(state)
+    def _ctx_text(ec: dict) -> str:
+        """Render the uniform ErrorContext into a prompt-ready block for either depth."""
+        parts: list[str] = []
+        if ec.get("summary"):
+            parts.append(str(ec["summary"]))
+        if ec.get("error_count"):
+            parts.append(f"error_count={ec['error_count']}")
+        if ec.get("errors"):
+            parts.append("Errors:\n" + json.dumps(ec["errors"][:50], ensure_ascii=False))
+        if ec.get("rows"):
+            parts.append("Offending rows (the condition that must be resolved):\n"
+                         + json.dumps(ec["rows"][:50], ensure_ascii=False))
+        if ec.get("spool_text"):
+            parts.append(f"Spool (first 2000 chars):\n{ec['spool_text'][:2000]}")
+        if ec.get("messages"):
+            msgs = " ".join(m.get("MESSAGE", m.get("text", "")) for m in ec["messages"])
+            if msgs.strip():
+                parts.append(f"Messages: {msgs}")
+        return "\n\n".join(parts) or "No detailed error context."
+
+    async def _analyse_explain(state: PeriodCloseState, ec: dict, step: dict) -> dict:
+        """Cheap depth: one validation-model call over data already in hand. No tools,
+        no SAP re-fetch, no analysis_messages. Always returns user_input → operator."""
+        step_id = step["step_id"]
+        await _emit({"type": "action_start", "step_id": step_id, "action": "analysis",
+                     "message": "Explaining finding to operator…"})
+        oe       = step.get("on_error", {})
+        guidance = oe.get("analysis_guidance", "")
+        # Prompt precedence: on_error.explain_prompt → legacy pre_check.llm.prompt → default.
+        prompt = (oe.get("explain_prompt")
+                  or (step.get("pre_check", {}) or {}).get("llm", {}).get("prompt")
+                  or "Explain this SAP finding to the operator and suggest how to correct it.")
+        system = ("You are an SAP period-close pre-check analyst. Explain the finding to the "
+                  "operator in plain language and suggest how to correct it. Be concise."
+                  + (f"\n\nDomain guidance:\n{guidance}" if guidance else ""))
+        try:
+            resp = await llms["validation"].ainvoke([
+                SystemMessage(content=system),
+                HumanMessage(content=f"Data:\n{_ctx_text(ec)}\n\n{prompt}"),
+            ])
+            diagnosis = (resp.content or "").strip() or ec.get("summary", "Pre-check failed.")
+        except Exception as exc:
+            logger.warning("analysis explain LLM error step=%s: %s", step_id, exc)
+            diagnosis = ec.get("summary", "Pre-check failed; manual review required.")
+        instructions = ("Correct the listed items in SAP, then retry the step from the "
+                        "pre-check — or skip the step if the check is not required.")
+        await _emit({"type": "action_end", "step_id": step_id, "action": "analysis",
+                     "status": "user_input", "message": diagnosis[:200]})
+        return {"current_analysis": {
+            "step_id": step_id, "action": "user_input", "corrected_params": None,
+            "diagnosis": diagnosis, "user_instructions": instructions, "tools_used": [],
+        }}
+
+    async def _analyse_diagnose(state: PeriodCloseState, ec: dict, step: dict) -> dict:
         step_id = step["step_id"]
         defs    = _defaults(state)
         max_ret = step.get("max_retries", defs.get("max_retries", 3))
@@ -794,22 +1018,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         await _emit({"type": "action_start", "step_id": step_id, "action": "analysis",
                      "message": f"Analysing error (attempt {retry + 1}/{max_ret})…"})
 
-        ctx_parts: list[str] = []
-        if (v := state.get("current_validate")):
-            ctx_parts.append(
-                f"Validation: verdict={v['verdict']} errors={v['error_count']}\n{v['reasoning']}")
-            if v.get("spool_text"):
-                ctx_parts.append(f"Spool (first 2000 chars):\n{v['spool_text'][:2000]}")
-        if (pc := state.get("current_pre_check")) and pc.get("error"):
-            ctx_parts.append(f"Pre-check error: {pc['error']}")
-            pc_rows = (pc.get("raw_data") or {}).get("rows")
-            if pc_rows:
-                ctx_parts.append(
-                    "Pre-check returned these rows (the condition that must be resolved):\n"
-                    + json.dumps(pc_rows[:50], ensure_ascii=False))
-        if (p := state.get("current_poll")) and p.get("timed_out"):
-            ctx_parts.append(f"Poll timed out after {p['elapsed_sec']:.0f}s")
-        error_ctx = "\n\n".join(ctx_parts) or "No detailed error context."
+        error_ctx = _ctx_text(ec)
 
         system_prompt = (
             f"You are an SAP period-close error analyst.\n"
@@ -823,7 +1032,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
         llm   = llms["analysis"]
         tools = _make_tools(session)
-        agent = create_react_agent(llm, tools, prompt=system_prompt)
+        agent = create_agent(llm, tools, system_prompt=system_prompt)
         prior = list(state.get("analysis_messages", []))
         new_messages: list = []
         try:
@@ -831,8 +1040,10 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
                          "message": "Sending request to LLM…"})
             async for update in agent.astream({"messages": input_msgs}, stream_mode="updates"):
-                if "agent" in update:
-                    agent_msgs = update["agent"].get("messages", [])
+                # langchain.agents.create_agent names the model node "model"
+                # (langgraph's create_react_agent used "agent") — accept either.
+                if (model_update := update.get("model") or update.get("agent")) is not None:
+                    agent_msgs = model_update.get("messages", [])
                     new_messages.extend(agent_msgs)
                     last = agent_msgs[-1] if agent_msgs else None
                     if last and getattr(last, "tool_calls", None):
@@ -886,6 +1097,17 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             "retry_count": retry + 1,
         }
 
+    async def analysis_node(state: PeriodCloseState) -> dict:
+        """Source-aware dispatcher. Reads the uniform ErrorContext set by the failing
+        node and picks the depth: cheap `explain` (operator-facing, no tools) or heavy
+        `diagnose` (ReAct + SAP tools)."""
+        step = _get_step(state)
+        ec   = state.get("current_error_context") or {}
+        if _analysis_depth(step, ec) == "explain":
+            return await _analyse_explain(state, ec, step)
+        return await _analyse_diagnose(state, ec, step)
+
+    analysis_node._explain = _analyse_explain   # exposed for parallel_step_runner
     return analysis_node
 
 
@@ -983,6 +1205,10 @@ def make_finalize_step_node():
             "current_pre_check":  None, "current_execute":  None,
             "current_poll":       None, "current_validate": None,
             "current_analysis":   None, "user_decision":    None, "restart_from": None,
+            "current_error_context": None,
+            # Clear ReAct history so the next step's diagnose path starts fresh
+            # (RemoveMessage(REMOVE_ALL) is the add_messages reducer's reset signal).
+            "analysis_messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)],
         }
 
     return finalize_step_node
@@ -997,6 +1223,20 @@ def make_parallel_step_runner(session: ClientSession, llms: dict[str, ChatOpenAI
     _execute   = make_execute_node(session)
     _poll      = make_poll_node(session)
     _validate  = make_validate_node(session, llms)
+    _analysis  = make_analysis_node(session, llms)
+
+    async def _maybe_explain(s: dict):
+        """Parallel branches have no node routing, so the heavy diagnose+interrupt path
+        is unavailable. For explain-depth failures we still run the cheap one-call
+        explanation inline and attach it to the result for the operator (post fan_in)."""
+        ec = s.get("current_error_context") or {}
+        if not ec:
+            return None
+        step_def = next((st for st in s["steps"] if st["step_id"] == s["current_step_id"]), {})
+        if _analysis_depth(step_def, ec) != "explain":
+            return None
+        out = await _analysis._explain(s, ec, step_def)
+        return out.get("current_analysis")
 
     async def parallel_step_runner(state: PeriodCloseState) -> dict:
         step_id = state["current_step_id"]
@@ -1008,6 +1248,7 @@ def make_parallel_step_runner(session: ClientSession, llms: dict[str, ChatOpenAI
             return {"parallel_results": {step_id: {
                 "final_status": "skipped" if pc.get("skip_step") else "failed",
                 "pre_check": pc, "execute": None, "poll": None, "validate": None,
+                "analysis": (await _maybe_explain(s)) if pc.get("error") else None,
             }}}
 
         s = {**s, **(await _execute(s))}
@@ -1039,6 +1280,7 @@ def make_parallel_step_runner(session: ClientSession, llms: dict[str, ChatOpenAI
             "final_status": "ok" if vr.get("verdict") == "ok" else "failed",
             "pre_check": pc, "execute": execute,
             "poll": s.get("current_poll"), "validate": vr,
+            "analysis": (await _maybe_explain(s)) if vr.get("verdict") != "ok" else None,
         }}}
 
     return parallel_step_runner
@@ -1062,7 +1304,7 @@ def make_fan_in_node():
                 "step_id": step_id, "group": group,
                 "pre_check": res.get("pre_check"), "execute": res.get("execute"),
                 "poll": res.get("poll"), "validate": res.get("validate"),
-                "analysis": None, "final_status": status,
+                "analysis": res.get("analysis"), "final_status": status,
             })
             await _emit({"type": "step_end", "step_id": step_id, "status": status})
 
@@ -1099,9 +1341,9 @@ def route_after_router(state: PeriodCloseState):
 
 def route_after_precheck(state: PeriodCloseState) -> str:
     pc = state.get("current_pre_check", {})
-    if pc.get("skip_step"):  return "finalize_step"
-    if pc.get("error"):      return "analysis"
-    return "execute"
+    if pc.get("skip_step"):    return "finalize_step"
+    if pc.get("passed", True): return "execute"
+    return "analysis"          # failed → source-aware analysis_node (explain by default)
 
 
 def route_after_execute(state: PeriodCloseState) -> str:
@@ -1179,7 +1421,8 @@ def build_graph(
     g.add_conditional_edges("fan_in", route_after_fanin, {"router": "router"})
 
     g.add_conditional_edges("pre_check", route_after_precheck,
-        {"execute": "execute", "finalize_step": "finalize_step", "analysis": "analysis"})
+        {"execute": "execute", "finalize_step": "finalize_step",
+         "analysis": "analysis"})
     g.add_conditional_edges("execute", route_after_execute,
         {"poll": "poll", "validate": "validate", "analysis": "analysis"})
     g.add_conditional_edges("poll", route_after_poll,
@@ -1234,6 +1477,7 @@ def _build_initial_state(period_cfg: dict, steps: list[dict],
         "current_poll":       None,
         "current_validate":   None,
         "current_analysis":   None,
+        "current_error_context": None,
         "retry_count":        0,
         "parallel_results":   {},
         "step_records":       [],

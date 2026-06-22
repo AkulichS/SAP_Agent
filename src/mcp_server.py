@@ -224,9 +224,14 @@ def sap_execute_step(
                 "spool_text":    "",
             }
 
-        # Inline-wait outcome: surface the spool as joined text.
-        spool_lines = result_json.get("spool", [])
-        spool_text  = "\n".join(spool_lines) if isinstance(spool_lines, list) else str(spool_lines)
+        # Inline-wait outcome: spool is {"rows": N, "spool_context": "..."}.
+        spool_obj  = result_json.get("spool", {})
+        if isinstance(spool_obj, dict):
+            spool_text = spool_obj.get("spool_context", "")
+        elif isinstance(spool_obj, list):  # backward compat with old ABAP
+            spool_text = "\n".join(spool_obj)
+        else:
+            spool_text = ""
         has_errors  = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
         logger.info("SUBMIT completed (inline-wait): job=%s/%s lines=%d status=%s",
                     job_name, job_id, len(spool_text.splitlines()), result["status"])

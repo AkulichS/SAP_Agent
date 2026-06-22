@@ -15,7 +15,7 @@ Three reusable fakes are exposed as fixtures:
   * `make_llms`      — factory for a `{"analysis", "validation"}` dict of `FakeLLM`s.
 
 Plus helpers: `make_state` (initial graph state) and `patch_react_agent`
-(replaces `create_react_agent` so `analysis_node` is deterministic).
+(replaces `create_agent` so `analysis_node` is deterministic).
 """
 
 from __future__ import annotations
@@ -158,16 +158,16 @@ def make_state():
 
 @pytest.fixture
 def patch_react_agent(monkeypatch):
-    """Replace graph_builder.create_react_agent with a fake whose astream yields
-    a single agent message carrying `content` (typically a JSON decision)."""
+    """Replace graph_builder.create_agent with a fake whose astream yields
+    a single model message carrying `content` (typically a JSON decision)."""
     from langchain_core.messages import AIMessage
 
     def _patch(content: str):
         class _Agent:
             async def astream(self, _inp, stream_mode=None):
-                yield {"agent": {"messages": [AIMessage(content=content)]}}
+                yield {"model": {"messages": [AIMessage(content=content)]}}
 
-        monkeypatch.setattr(graph_builder, "create_react_agent",
+        monkeypatch.setattr(graph_builder, "create_agent",
                             lambda *a, **k: _Agent())
     return _patch
 

@@ -15,7 +15,7 @@ defaults:
 
 llm_profiles:
   analysis:   {provider: "groq", model: "llama-3.3-70b-versatile", temperature: 0}
-  validation: {provider: "groq", model: "llama-3.1-8b-instant",    temperature: 0}
+  validation: {provider: "OPENROUTER", model: "",    temperature: 0}
 
 steps:
 
@@ -36,7 +36,8 @@ steps:
 #     object_name: ZSOME_CHECK
 #     async: false            # SUBMIT → inline-wait, spool fed to the check
 #     params: [...]           # list for FM/BAPI/BDC/SUBMIT, dict for TOOLS
-#     comparison: {select: empty, on_pass: execute, on_fail: llm}
+#     comparison: {select: empty, on_pass: execute, on_fail: analyse}
+#       # on_fail: execute | skip | analyse   ("llm"/"error" accepted as aliases of analyse)
 #
 # validate can read the executed step's spool (default) OR run its own check
 # action via an optional `run:` block — handy when the main step ran async with
@@ -51,6 +52,16 @@ steps:
 #       params: {table: CKMLHD, where: "...", fields: "...", max_rows: 1}
 #     keyword: {source: rows, error_patterns: ["error"]}   # source: spool | rows | messages
 #     # llm prompts may embed {{spool_text}}, {{messages_text}} or {{rows_text}}
+#
+# Any failure (pre_check / validate / execute / poll) routes to ONE source-aware
+# analysis node. on_error picks its depth and prompts:
+#   on_error:
+#     mode: explain | diagnose | {pre_check: explain, validate: diagnose}
+#       # explain  → one cheap validation-model call over data already in hand (no tools)
+#       # diagnose → ReAct agent (analysis model) with SAP tools; can retry/skip/user_input
+#       # default depth when omitted: pre_check→explain, validate/execute/poll→diagnose
+#     explain_prompt: |       # used by the explain depth (falls back to pre_check.llm.prompt)
+#     analysis_guidance: |    # domain hints; feeds BOTH depths
 # ---------------------------------------------------------------------------
 
 ################################ 1 — ZFK_COMPARISON ############################
@@ -120,12 +131,8 @@ steps:
         # - {selname: "S_KOSTL", kind: "P", low: ""}
       comparison:
         select:   "empty"      # empty | non_empty | first | last
-        # select: empty → pass when RKASELRULES_OR returns no rows (no orders missing
-        # settlement rules). Non-empty → on_fail sends the offending rows to the analyst
-        # LLM, which explains them to the operator; operator fixes rules in SAP and the
-        # step is restarted from pre_check.
         on_pass:  "execute"
-        on_fail:  "llm"        # execute | skip | llm | error
+        on_fail:  "analyse"    # execute | skip | analyse  ("llm"/"error" still accepted as aliases)
 
     validate:
       mode: "llm"
@@ -176,6 +183,16 @@ steps:
         - {selname: "STOR",   kind: "P", low: "X"}   # reversal flag
 
     on_error:
+      # Depth per failure source: cheap operator "explain" before the step (the
+      # pre-check already holds the offending orders), heavy tool "diagnose" after
+      # the step (an unprocessed-orders failure needs SAP investigation).
+      mode: {pre_check: explain, validate: diagnose}
+      explain_prompt: |
+        The settlement-rules report RKASELRULES_OR listed the internal orders below,
+        which are missing settlement rules and would block KO8G settlement.
+        List the affected order numbers, explain the root cause, and tell the SAP
+        operator to maintain settlement rules (KO02) for these orders before KO8G —
+        then retry the pre-check, or skip the step if intentional.
       analysis_guidance: |
         KO8G settles CO internal orders for controlling area {{controlling_area}}.
         Common issues:

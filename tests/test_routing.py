@@ -45,8 +45,10 @@ def test_router_group_fans_out_with_send():
 
 @pytest.mark.parametrize("pc,expected", [
     ({"skip_step": True}, "finalize_step"),
-    ({"skip_step": False, "error": "boom"}, "analysis"),
-    ({"skip_step": False, "error": None}, "execute"),
+    ({"skip_step": True, "passed": True}, "finalize_step"),
+    ({"skip_step": False, "passed": True}, "execute"),
+    ({"skip_step": False, "passed": False, "error": "boom"}, "analysis"),
+    ({"passed": True}, "execute"),
 ])
 def test_route_after_precheck(pc, expected):
     assert route_after_precheck({"current_pre_check": pc}) == expected

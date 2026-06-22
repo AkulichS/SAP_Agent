@@ -1,6 +1,6 @@
 [project]
 name = "sap-period-close-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "LangGraph agent orchestrating SAP period-close procedures via RFC, with a FastAPI web UI."
 requires-python = ">=3.12"
 

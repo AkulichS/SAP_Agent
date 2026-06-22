@@ -346,21 +346,23 @@ FORM z_execute_submit
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: lt_selopts   TYPE ty_zai_selparam_tab,
-        ls_selopt    LIKE LINE OF lt_selopts,
-        lt_rsparams  TYPE rsparams_tt,
-        ls_rsparam   TYPE rsparams,
-        lv_jobname   TYPE btcjob,
-        lv_jobcount  TYPE btcjobcnt,
-        lv_ts        TYPE string,
-        lv_msg       TYPE string,
+  DATA: lt_selopts            TYPE ty_zai_selparam_tab,
+        ls_selopt             LIKE LINE OF lt_selopts,
+        lt_rsparams           TYPE rsparams_tt,
+        ls_rsparam            TYPE rsparams,
+        lv_jobname            TYPE btcjob,
+        lv_jobcount           TYPE btcjobcnt,
+        lv_ts                 TYPE string,
+        lv_msg                TYPE string,
         "--- inline-wait (sync_wait) locals ---
-        lv_state     TYPE string,
-        lv_waited    TYPE i,
-        lt_lines     TYPE stringtab,
-        lv_subrc     TYPE i,
-        lv_spoolmsg  TYPE string,
-        lv_spooljson TYPE string.
+        lv_state              TYPE string,
+        lv_waited             TYPE i,
+        lt_lines              TYPE stringtab,
+        lv_subrc              TYPE i,
+        lv_spoolmsg           TYPE string,
+        lv_spooljson          TYPE string,
+        lv_spool_text         TYPE string,
+        lv_spool_context_json TYPE string.
 
   "--- Parse JSON array of selection parameters ---
   /ui2/cl_json=>deserialize( EXPORTING json = iv_params_json CHANGING data = lt_selopts ).
@@ -505,11 +507,16 @@ FORM z_execute_submit
   PERFORM z_fetch_spool USING    lv_jobname lv_jobcount
                         CHANGING lt_lines lv_subrc lv_spoolmsg.
 
+  DATA(lv_spool_rows) = lines( lt_lines ).
+  CONCATENATE LINES OF lt_lines INTO lv_spool_text
+    SEPARATED BY cl_abap_char_utilities=>newline.
   TRY.
-    lv_spooljson = /ui2/cl_json=>serialize( data = lt_lines ).
+    lv_spool_context_json = /ui2/cl_json=>serialize( data = lv_spool_text ).
   CATCH cx_root.
-    lv_spooljson = '[]'.
+    lv_spool_context_json = '""'.
   ENDTRY.
+  lv_spooljson = '{"rows":' && lv_spool_rows &&
+                 ',"spool_context":' && lv_spool_context_json && '}'.
 
   ev_status = lc_success.
   ev_result_json = '{"status":"completed"' &&
@@ -524,7 +531,7 @@ FORM z_execute_submit
     lv_msg = 'Job finished, spool unavailable: ' && lv_spoolmsg.
     PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
   ELSE.
-    lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lines( lt_lines ).
+    lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lv_spool_rows.
     PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
   ENDIF.
 
