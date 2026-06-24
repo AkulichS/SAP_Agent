@@ -60,8 +60,8 @@ def test_route_after_precheck(pc, expected):
 
 @pytest.mark.parametrize("ex,expected", [
     ({"status": "error"}, "analysis"),
-    ({"status": "ok", "requires_poll": True}, "poll"),
-    ({"status": "ok", "requires_poll": False}, "validate"),
+    ({"status": "ok", "meta": {"requires_poll": True}}, "poll"),
+    ({"status": "ok", "meta": {"requires_poll": False}}, "validate"),
 ])
 def test_route_after_execute(ex, expected):
     assert route_after_execute({"current_execute": ex}) == expected

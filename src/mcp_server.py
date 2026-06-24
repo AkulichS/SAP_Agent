@@ -15,6 +15,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -105,6 +106,44 @@ def _rfc(conn, action_type: str, object_name: str, params: dict,
 
 
 # ---------------------------------------------------------------------------
+# Unified response envelope
+#
+# Every MCP tool returns exactly four top-level keys:
+#   status   — outcome of THIS call: "ok" | "error" | "submitted"
+#   messages — SAP messages (BAPIRET-style: TYPE/MESSAGE/…)
+#   meta     — derived / control fields (job ids, requires_poll, echoes)
+#   data     — verbatim RFC EV_RESULT_JSON payload (spool/rows live here, once)
+# ---------------------------------------------------------------------------
+
+def _envelope(status: str, messages: list | None = None,
+              meta: dict | None = None, data: dict | None = None) -> dict:
+    """Build the canonical {status, messages, meta, data} response."""
+    return {
+        "status":   status,
+        "messages": messages or [],
+        "meta":     meta or {},
+        "data":     data or {},
+    }
+
+
+def _norm_spool(raw: Any) -> dict | None:
+    """Normalise an ABAP spool object to {available, line_count, text}.
+
+    ABAP returns {"status": "S"/"E", "text": "..."}. Returns None when no spool
+    object is present (e.g. async submit, FM/BAPI). ``available`` means the report
+    ran and its spool was readable (status == "S").
+    """
+    if not isinstance(raw, dict):
+        return None
+    text = raw.get("text", "")
+    return {
+        "available":  raw.get("status") == "S",
+        "line_count": len(text.splitlines()),
+        "text":       text,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool: sap_check_period
 # Pre-check RFC call — used by pre_check_node for all modes
 # ---------------------------------------------------------------------------
@@ -128,16 +167,23 @@ def sap_check_period(
 
     Returns
     -------
-    {"status": "S"|"E"|"W", "result_json": dict, "messages": list}
+    {"status": "ok"|"error", "messages": list,
+     "meta": {"action_type", "object_name"}, "data": <raw RFC payload>}
     """
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
     result = _rfc(conn, action_type, object_name, params, async_mode, test_run)
-    has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"])
-    result["status"] = "E" if has_errors else result["status"] or "S"
+    has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"]) \
+                 or result["status"] == "E"
+    status = "error" if has_errors else "ok"
     logger.info("sap_check_period action=%s object=%s status=%s",
-                action_type, object_name, result["status"])
-    return result
+                action_type, object_name, status)
+    return _envelope(
+        status,
+        messages = result["messages"],
+        meta     = {"action_type": action_type, "object_name": object_name},
+        data     = result["result_json"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,24 +197,21 @@ def sap_execute_step(
     object_name: str,
     params_json: str,
     async_mode:  bool = False,
-    test_run:    bool = True,
+    test_run:    bool = False,
 ) -> dict:
     """
     Execute one period-close step via ZFI_AI_PERIOD_CLOSE_RFC.
 
     For SUBMIT with async_mode=True the job is started and the call returns
-    immediately with requires_poll=True so the graph can poll via sap_job_status.
+    immediately with meta.requires_poll=True so the graph can poll via sap_job_status.
 
     Returns
     -------
-    {
-        "status":        "ok"|"error"|"submitted",
-        "requires_poll": bool,
-        "job_name":      str,
-        "job_id":        str,
-        "messages":      list,
-        "result_json":   dict,
-    }
+    The unified envelope {status, messages, meta, data} where
+        status — "ok" | "error" | "submitted"
+        meta   — {"action_type", "requires_poll", "job_name", "job_id"}
+        data   — raw RFC payload; for an inline-wait SUBMIT the spool is normalised
+                 in place as data["spool"] = {available, line_count, text}
     """
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
@@ -180,18 +223,14 @@ def sap_execute_step(
     logger.info("sap_execute_step action=%s object=%s async=%s test=%s",
                 action_type, object_name, async_mode, test_run)
 
+    def _meta(requires_poll: bool = False, job_name: str = "", job_id: str = "") -> dict:
+        return {"action_type": action_type, "requires_poll": requires_poll,
+                "job_name": job_name, "job_id": job_id}
+
     if action_type in ("FM", "BAPI", "BDC"):
         has_errors = any(m.get("TYPE") in ("E", "A") for m in messages)
-        return {
-            "status":        "error" if has_errors else "ok",
-            "requires_poll": False,
-            "job_name":      "",
-            "job_id":        "",
-            "messages":      messages,
-            "result_json":   result_json,
-            "rows":          result_json.get("rows", []),
-            "spool":         None,
-        }
+        return _envelope("error" if has_errors else "ok",
+                         messages=messages, meta=_meta(), data=result_json)
 
     if action_type == "SUBMIT":
         job_name = result_json.get("jobname", "")
@@ -205,67 +244,35 @@ def sap_execute_step(
 
         if is_async:
             if not job_id:
-                return {
-                    "status":        "error",
-                    "requires_poll": False,
-                    "job_name":      "",
-                    "job_id":        "",
-                    "messages":      messages + [{"TYPE": "E", "MESSAGE": "No job ID returned"}],
-                    "result_json":   {},
-                    "rows":          [],
-                    "spool":         None,
-                }
+                return _envelope(
+                    "error",
+                    messages=messages + [{"TYPE": "E", "MESSAGE": "No job ID returned"}],
+                    meta=_meta())
             logger.info("SUBMIT submitted (async): job=%s/%s", job_name, job_id)
-            return {
-                "status":        "submitted",
-                "requires_poll": True,
-                "job_name":      job_name,
-                "job_id":        job_id,
-                "messages":      messages,
-                "result_json":   result_json,
-                "rows":          [],
-                "spool":         None,
-            }
+            return _envelope(
+                "submitted",
+                messages=messages,
+                meta=_meta(requires_poll=True, job_name=job_name, job_id=job_id),
+                data=result_json)
 
-        # Inline-wait outcome: spool is {"status": "S"/"E", "text": "..."}.
-        spool_obj  = result_json.get("spool", {})
-        if isinstance(spool_obj, dict):
-            spool_text = spool_obj.get("text", "")
-        elif isinstance(spool_obj, list):  # backward compat with old ABAP
-            spool_text = "\n".join(spool_obj)
-        else:
-            spool_text = ""
-        has_errors    = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
-        spool_present = isinstance(spool_obj, dict) and spool_obj.get("status") == "S"
-        spool_lines   = len(spool_text.splitlines())
+        # Inline-wait outcome: normalise the spool in place inside data.
+        spool = _norm_spool(result_json.get("spool"))
+        if spool is not None:
+            result_json["spool"] = spool
+        has_errors = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
         logger.info("SUBMIT completed (inline-wait): job=%s/%s lines=%d status=%s",
-                    job_name, job_id, len(spool_text.splitlines()), result["status"])
-        return {
-            "status":        "error" if has_errors else "ok",
-            "requires_poll": False,
-            "job_name":      job_name,
-            "job_id":        job_id,
-            "messages":      messages,
-            "result_json":   result_json,
-            "rows":          [],
-            "spool": {
-                "present": spool_present,
-                "lines":   spool_lines,
-                "text":    spool_text,
-            },
-        }
+                    job_name, job_id, (spool or {}).get("line_count", 0), result["status"])
+        return _envelope(
+            "error" if has_errors else "ok",
+            messages=messages,
+            meta=_meta(job_name=job_name, job_id=job_id),
+            data=result_json)
 
     # Unknown action_type
-    return {
-        "status":        "error",
-        "requires_poll": False,
-        "job_name":      "",
-        "job_id":        "",
-        "messages":      [{"TYPE": "E", "MESSAGE": f"Unknown action_type: {action_type}"}],
-        "result_json":   {},
-        "rows":          [],
-        "spool":         None,
-    }
+    return _envelope(
+        "error",
+        messages=[{"TYPE": "E", "MESSAGE": f"Unknown action_type: {action_type}"}],
+        meta=_meta())
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +287,9 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
 
     Returns
     -------
-    {"table": str, "count": int, "rows": [{"FIELD": "value"}], "status": str}
+    The unified envelope {status, messages, meta, data} where
+        meta — {"table", "row_count"}
+        data — {"rows": [{"FIELD": "value"}, ...]}
     """
     conn = conn_mgr.get_connection()
     result = _rfc(conn, "TOOLS", "TOOL_READ_TABLE", {
@@ -289,18 +298,14 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
         "fields":   fields,
         "max_rows": max_rows,
     })
-    rj   = result["result_json"]
-    rows = rj.get("data", [])          
+    rows = result["result_json"].get("data", [])
     logger.info("sap_read_table table=%s rows=%d", table, len(rows))
-    return {
-        "table":       table,
-        "count":       len(rows),
-        "rows":        rows,
-        "status":      "error" if result["status"] == "E" else "ok",
-        "spool":       None,
-        "messages":    [],
-        "result_json": rj,
-    }
+    return _envelope(
+        "error" if result["status"] == "E" else "ok",
+        messages = result["messages"],
+        meta     = {"table": table, "row_count": len(rows)},
+        data     = {"rows": rows},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -320,26 +325,30 @@ def sap_job_status(job_name: str, job_id: str) -> dict:
 
     Returns
     -------
-    {"job_name": str, "job_id": str, "status": str,
-     "is_running": bool, "is_finished": bool, "is_aborted": bool}
+    The unified envelope {status, messages, meta, data} where
+        status — "ok" | "error" (outcome of the status check itself)
+        meta   — {"job_name", "job_id"}
+        data   — {"state", "is_running", "is_finished", "is_aborted"}
     """
     conn = conn_mgr.get_connection()
     result = _rfc(conn, "TOOLS", "TOOL_JOB_STATUS", {
         "jobname":  job_name,
         "jobcount": job_id,
     })
-    rj = result["result_json"]
-    state = rj.get("state", "SCHEDULED")
+    state = result["result_json"].get("state", "SCHEDULED")
 
     logger.info("sap_job_status job=%s/%s state=%s", job_name, job_id, state)
-    return {
-        "job_name":    job_name,
-        "job_id":      job_id,
-        "status":      state,
-        "is_running":  state in ("SCHEDULED", "READY", "RUNNING"),
-        "is_finished": state == "FINISHED",
-        "is_aborted":  state == "ABORTED",
-    }
+    return _envelope(
+        "error" if result["status"] == "E" else "ok",
+        messages = result["messages"],
+        meta     = {"job_name": job_name, "job_id": job_id},
+        data     = {
+            "state":       state,
+            "is_running":  state in ("SCHEDULED", "READY", "RUNNING"),
+            "is_finished": state == "FINISHED",
+            "is_aborted":  state == "ABORTED",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +363,9 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
 
     Returns
     -------
-    {"job_id": str, "spool_text": str, "line_count": int, "truncated": bool}
+    The unified envelope {status, messages, meta, data} where
+        meta — {"job_name", "job_id", "line_count", "truncated"}
+        data — {"spool": {available, line_count, text}}
     """
     conn = conn_mgr.get_connection()
     result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_SPOOL", {
@@ -362,27 +373,24 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         "jobcount": job_id,
     })
 
-    raw = result["result_json"]
     # ABAP (ztool_read_job_spool) returns {"status","text"} where text is the
-    # newline-joined spool text. Older builds returned a bare JSON array of
-    # lines — keep that path for backward compatibility.
-    if isinstance(raw, dict):
-        lines = raw.get("text", "").splitlines()
-    elif isinstance(raw, list):
-        lines = raw
-    else:
-        lines = []
+    # newline-joined spool text. Normalise it, then trim to max_lines.
+    spool = _norm_spool(result["result_json"]) or {"available": False, "line_count": 0, "text": ""}
+    lines     = spool["text"].splitlines()
+    truncated = len(lines) > max_lines
+    trimmed   = lines[:max_lines]
+    spool     = {"available": spool["available"], "line_count": len(trimmed),
+                 "text": "\n".join(trimmed)}
 
-    truncated    = len(lines) > max_lines
-    trimmed      = lines[:max_lines]
     logger.info("sap_read_spool job=%s/%s lines=%d truncated=%s",
                 job_name, job_id, len(trimmed), truncated)
-    return {
-        "job_id":     job_id,
-        "spool_text": "\n".join(trimmed),
-        "line_count": len(trimmed),
-        "truncated":  truncated,
-    }
+    return _envelope(
+        "error" if result["status"] == "E" else "ok",
+        messages = result["messages"],
+        meta     = {"job_name": job_name, "job_id": job_id,
+                    "line_count": len(trimmed), "truncated": truncated},
+        data     = {"spool": spool},
+    )
 
 
 # ---------------------------------------------------------------------------

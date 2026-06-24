@@ -25,9 +25,31 @@ async def test_precheck_skip_mode(make_session, make_llms, make_state):
 
 
 def _table_result(rows, *, status="ok"):
-    """Build a fake sap_read_table payload matching the unified tool shape."""
-    return {"rows": rows, "count": len(rows), "status": status,
-            "spool": None, "messages": [], "result_json": {}}
+    """Build a fake sap_read_table envelope {status, messages, meta, data}."""
+    return {"status": status, "messages": [],
+            "meta": {"table": "COKP", "row_count": len(rows)},
+            "data": {"rows": rows}}
+
+
+def _exec_env(*, data=None, messages=None, status="ok",
+              requires_poll=False, job_name="", job_id=""):
+    """Build a fake sap_execute_step / ExecuteResult envelope."""
+    return {"status": status, "messages": messages or [],
+            "meta": {"action_type": "SUBMIT", "requires_poll": requires_poll,
+                     "job_name": job_name, "job_id": job_id},
+            "data": data or {}}
+
+
+def _spool_data(text, *, available=True, lines=None):
+    """data payload carrying a normalised spool {available, line_count, text}."""
+    return {"spool": {"available": available,
+                      "line_count": lines if lines is not None else len(text.splitlines()),
+                      "text": text}}
+
+
+def _job(state):
+    """Fake sap_job_status envelope reporting a job state."""
+    return {"status": "ok", "messages": [], "meta": {}, "data": {"state": state}}
 
 
 def _cmp_step(comparison):
@@ -112,28 +134,17 @@ def _submit_cmp_step(comparison, llm=None):
 
 
 def _submit_result(*, status="ok", spool_rows=None, spool_text="", spool_status="S"):
-    """Build a fake sap_execute_step payload matching the unified tool shape.
+    """Build a fake sap_execute_step envelope for a SUBMIT inline-wait.
 
-    spool_rows=None → no spool (spool=None).
-    spool_status "S" = the report ran and its spool was read; anything else (e.g. "E")
-    = job finished but spool unreadable → spool.present=False.
+    spool_rows=None → no spool key in data.
+    spool_status "S" = the report ran and its spool was read (available=True); anything
+    else (e.g. "E") = job finished but spool unreadable → available=False.
     """
-    rj = {"status": "completed"}
+    data = {"status": "completed"}
     if spool_rows is not None:
-        rj["spool"] = {"status": spool_status, "text": spool_text}
-    spool_present = (spool_rows is not None) and (spool_status == "S")
-    spool_obj = ({"present": spool_present, "lines": spool_rows or 0, "text": spool_text}
-                 if spool_rows is not None else None)
-    return {
-        "status":        status,
-        "requires_poll": False,
-        "job_name":      "",
-        "job_id":        "",
-        "messages":      [],
-        "result_json":   rj,
-        "rows":          [],
-        "spool":         spool_obj,
-    }
+        data["spool"] = {"available": spool_status == "S",
+                         "line_count": spool_rows, "text": spool_text}
+    return _exec_env(status=status, data=data)
 
 
 async def test_precheck_submit_empty_spool_executes(make_session, make_llms, make_state):
@@ -208,36 +219,35 @@ async def test_execute_tools(make_session, make_state):
             "params": {"table": "COKP"}}
     out = await node(make_state([step]))
     ex = out["current_execute"]
-    assert ex["status"] == "ok" and ex["action_type"] == "TOOLS"
-    assert ex["requires_poll"] is False
+    assert ex["status"] == "ok"
+    assert ex["data"]["rows"] == [{"K": "1"}]
+    assert ex["meta"].get("requires_poll") in (False, None)
 
 
 async def test_execute_submit_async(make_session, make_state):
-    session = make_session(sap_execute_step={
-        "status": "submitted", "requires_poll": True, "job_name": "J",
-        "job_id": "7", "messages": [], "result_json": {}})
+    session = make_session(sap_execute_step=_exec_env(
+        status="submitted", requires_poll=True, job_name="J", job_id="7"))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "SUBMIT", "object_name": "RKO", "async": True}
     out = await node(make_state([step]))
     ex = out["current_execute"]
-    assert ex["requires_poll"] is True and ex["job_name"] == "J"
+    assert ex["meta"]["requires_poll"] is True and ex["meta"]["job_name"] == "J"
 
 
 async def test_execute_submit_inline(make_session, make_state):
-    session = make_session(sap_execute_step={
-        "status": "ok", "requires_poll": False, "job_name": "J", "job_id": "7",
-        "messages": [], "result_json": {"spool": ["ok line"]}, "spool_text": "ok line"})
+    session = make_session(sap_execute_step=_exec_env(
+        job_name="J", job_id="7", data=_spool_data("ok line")))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "SUBMIT", "object_name": "RKO", "async": False}
     out = await node(make_state([step]))
     ex = out["current_execute"]
-    assert ex["status"] == "ok" and ex["requires_poll"] is False
+    assert ex["status"] == "ok" and ex["meta"]["requires_poll"] is False
+    assert ex["data"]["spool"]["text"] == "ok line"
 
 
 async def test_execute_fm_error(make_session, make_state):
-    session = make_session(sap_execute_step={
-        "status": "error", "requires_poll": False, "job_name": "", "job_id": "",
-        "messages": [{"MESSAGE": "boom"}], "result_json": {}})
+    session = make_session(sap_execute_step=_exec_env(
+        status="error", messages=[{"MESSAGE": "boom"}]))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "FM", "object_name": "BAPI_X"}
     out = await node(make_state([step]))
@@ -248,12 +258,11 @@ async def test_execute_fm_error(make_session, make_state):
 # poll_node
 # ===========================================================================
 
-_EXEC = {"job_name": "J", "job_id": "7", "requires_poll": True, "status": "ok",
-         "action_type": "SUBMIT", "messages": [], "result_json": {}}
+_EXEC = _exec_env(requires_poll=True, job_name="J", job_id="7")
 
 
 async def test_poll_finished(make_session, make_state):
-    session = make_session(sap_job_status={"status": "FINISHED"})
+    session = make_session(sap_job_status=_job("FINISHED"))
     node = make_poll_node(session)
     state = make_state([{"step_id": "A"}], current_execute=_EXEC)
     out = await node(state)
@@ -262,7 +271,7 @@ async def test_poll_finished(make_session, make_state):
 
 
 async def test_poll_running_then_finished(make_session, make_state, no_sleep):
-    session = make_session(sap_job_status=[{"status": "RUNNING"}, {"status": "FINISHED"}])
+    session = make_session(sap_job_status=[_job("RUNNING"), _job("FINISHED")])
     node = make_poll_node(session)
     state = make_state([{"step_id": "A"}], current_execute=_EXEC)
 
@@ -276,7 +285,7 @@ async def test_poll_running_then_finished(make_session, make_state, no_sleep):
 
 
 async def test_poll_aborted(make_session, make_state):
-    session = make_session(sap_job_status={"status": "ABORTED"})
+    session = make_session(sap_job_status=_job("ABORTED"))
     node = make_poll_node(session)
     state = make_state([{"step_id": "A"}], current_execute=_EXEC)
     out = await node(state)
@@ -284,7 +293,7 @@ async def test_poll_aborted(make_session, make_state):
 
 
 async def test_poll_timeout(make_session, make_state, no_sleep):
-    session = make_session(sap_job_status={"status": "RUNNING"})
+    session = make_session(sap_job_status=_job("RUNNING"))
     node = make_poll_node(session)
     step = {"step_id": "A", "poll_timeout_sec": 0}
     state = make_state([step], current_execute=_EXEC)
@@ -305,8 +314,7 @@ async def test_validate_keyword_spool_ok(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "spool", "ok_patterns": ["done"], "error_patterns": ["FATAL"]}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"spool": ["operation done"]}})
+    state = make_state([step], current_execute=_exec_env(data=_spool_data("operation done")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
 
@@ -315,8 +323,7 @@ async def test_validate_keyword_spool_error_retries(make_session, make_llms, mak
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "spool", "ok_patterns": ["done"], "error_patterns": ["error"]}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"spool": ["bad error here"]}})
+    state = make_state([step], current_execute=_exec_env(data=_spool_data("bad error here")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "retry"
     assert out["current_validate"]["error_count"] == 1
@@ -326,8 +333,7 @@ async def test_validate_keyword_rows(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "rows", "ok_patterns": ["x500"], "error_patterns": ["FATAL"]}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"rows": [{"KOKRS": "X500"}]}})
+    state = make_state([step], current_execute=_exec_env(data={"rows": [{"KOKRS": "X500"}]}))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
 
@@ -336,8 +342,7 @@ async def test_validate_keyword_messages(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "messages", "ok_patterns": ["good"], "error_patterns": ["FATAL"]}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [{"MESSAGE": "all good"}], "result_json": {}})
+    state = make_state([step], current_execute=_exec_env(messages=[{"MESSAGE": "all good"}]))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
 
@@ -346,8 +351,7 @@ async def test_validate_llm_ok(make_session, make_llms, make_state):
     llms = make_llms(validation='{"verdict":"ok","error_count":0,"reasoning":"fine"}')
     node = make_validate_node(make_session(), llms)
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"spool": ["x"]}})
+    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
     assert out["current_validate"]["error_count"] == 0
@@ -357,8 +361,7 @@ async def test_validate_llm_retry(make_session, make_llms, make_state):
     llms = make_llms(validation='{"verdict":"retry","error_count":2,"reasoning":"bad"}')
     node = make_validate_node(make_session(), llms)
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"spool": ["x"]}})
+    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "retry"
     assert out["current_validate"]["error_count"] == 2
@@ -369,8 +372,7 @@ async def test_validate_llm_retry(make_session, make_llms, make_state):
 async def test_validate_llm_non_json_escalates(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms(validation="totally not json"))
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute={
-        "requires_poll": False, "messages": [], "result_json": {"spool": ["x"]}})
+    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "escalate"
 

@@ -111,9 +111,12 @@ class ErrorContext(TypedDict, total=False):
     job_id: str
 
 
-class ExecuteResult(TypedDict):
-    step_id: str; action_type: str; requires_poll: bool
-    job_name: str; job_id: str; messages: list[dict]; result_json: dict; status: str
+class ExecuteResult(TypedDict, total=False):
+    step_id:  str
+    status:   str            # ok | error | submitted
+    messages: list[dict]
+    meta:     dict           # {action_type, requires_poll, job_name, job_id}
+    data:     dict           # raw RFC payload (spool/rows live here, once)
 
 
 class PollStatus(TypedDict):
@@ -173,6 +176,29 @@ def _parse_tool_result(result: Any) -> dict:
             except json.JSONDecodeError:
                 return {"raw": block.text}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Envelope accessors
+#
+# Every MCP tool / ExecuteResult carries the {status, messages, meta, data}
+# envelope. These read it; they never restructure it. ``data.spool`` is
+# legitimately None when a step produced no spool — guard for it once here.
+# ---------------------------------------------------------------------------
+
+def _spool(env: dict) -> dict:
+    """Spool object {available, line_count, text} from an envelope, or {}."""
+    return (env.get("data") or {}).get("spool") or {}
+
+
+def _rows(env: dict) -> list:
+    """Row list from an envelope's data payload, or []."""
+    return (env.get("data") or {}).get("rows") or []
+
+
+def _meta(env: dict, key: str, default: Any = None) -> Any:
+    """One field from an envelope's meta dict."""
+    return (env.get("meta") or {}).get(key, default)
 
 
 def _get_step(state: PeriodCloseState) -> dict:
@@ -421,13 +447,13 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             session, pc["action_type"], pc["object_name"], pc.get("params", {}),
             async_mode=pc.get("async", False), test_run=pc.get("test_run", True),
         )
-        rows            = run["rows"]
-        spool           = run["spool"] or {}
+        rows            = _rows(run)
+        spool           = _spool(run)
         spool_text      = spool.get("text", "")
-        spool_row_count = spool.get("lines", 0)   # only consulted for SUBMIT (rows empty)
+        spool_row_count = spool.get("line_count", 0)  # only consulted for SUBMIT (rows empty)
         # raw_data is what comparison/LLM/operator inspect: table rows when present,
         # otherwise the SUBMIT spool text.
-        raw_data = run["result_json"] if rows else (spool_text or run["result_json"])
+        raw_data = run["data"] if rows else (spool_text or run["data"])
 
         # A failed pre-check no longer renders its own explanation. It marks the
         # pre-check failed and hands a uniform ErrorContext to the source-aware
@@ -458,14 +484,14 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             # --- No verification artifact: a SUBMIT pre-check whose report errored or
             #     returned no spool cannot judge the precondition. Route to analysis so
             #     the operator is told the step was not verified (fix-and-retry or skip).
-            if pc_action == "SUBMIT" and (run["status"] == "error" or not spool.get("present", False)):
+            if pc_action == "SUBMIT" and (run["status"] == "error" or not spool.get("available", False)):
                 summary = (f"Step {step_id} could not be verified: pre-check report "
                            f"{obj} returned no spool. Ensure the report runs and produces a "
                            f"spool, then retry the pre-check — or skip the step.")
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
                              "status": "failed", "message": f"not verified — no spool from {obj}",
                              "detail": {"object_name": obj, "status": run["status"],
-                                        "spool_present": spool.get("present", False)}})
+                                        "spool_present": spool.get("available", False)}})
                 return _fail_to_analysis(
                     summary,
                     {"object_name": obj, "status": run["status"]},
@@ -576,89 +602,59 @@ def make_execute_node(session: ClientSession):
                      "message": f"Executing {step['action_type']}/{step['object_name']}"
                                 f" (async={async_mode}, test={test_run})"})
 
-        # TOOLS steps bypass sap_execute_step (which only handles FM/BAPI/BDC/SUBMIT)
-        # and call sap_read_table directly.
+        # _run_action routes TOOLS → sap_read_table and FM/BAPI/BDC/SUBMIT →
+        # sap_execute_step, returning the unified {status, messages, meta, data} envelope.
+        env = await _run_action(
+            session, step["action_type"], step["object_name"], params,
+            async_mode=async_mode, test_run=test_run,
+        )
+        execute_result: ExecuteResult = {"step_id": step_id, **env}
+        has_error = env["status"] == "error"
+
         if step["action_type"] == "TOOLS":
-            params_dict = params if isinstance(params, dict) else {}
-            table = params_dict.get("table", step["object_name"])
-            tool_result = await session.call_tool("sap_read_table", arguments={
-                "table":    table,
-                "where":    params_dict.get("where", ""),
-                "fields":   params_dict.get("fields", ""),
-                "max_rows": params_dict.get("max_rows", 100),
-            })
-            data      = _parse_tool_result(tool_result)
-            has_error = data.get("status") == "error"
-            count     = data.get("count", len(data.get("rows", [])))
-            msg       = f"error reading {table}" if has_error else f"{count} row(s) from {table}"
-            tools_result: ExecuteResult = {
-                "step_id":       step_id,
-                "action_type":   "TOOLS",
-                "requires_poll": False,
-                "job_name":      "",
-                "job_id":        "",
-                "messages":      [{"MESSAGE": msg}],
-                "result_json":   data,
-                "status":        "error" if has_error else "ok",
-            }
+            table = _meta(env, "table", step["object_name"])
+            count = _meta(env, "row_count", len(_rows(env)))
+            msg   = f"error reading {table}" if has_error else f"{count} row(s) from {table}"
             await _emit({"type": "action_end", "step_id": step_id, "action": "execute",
                          "status": "failed" if has_error else "ok",
                          "message": msg,
                          "detail": {"table": table, "count": count,
-                                    "rows": data.get("rows", [])[:5],
-                                    "status": data.get("status", "")}})
-            out = {"current_execute": tools_result}
+                                    "rows": _rows(env)[:5], "status": env["status"]}})
+            out = {"current_execute": execute_result}
             if has_error:
                 out["current_error_context"] = {
                     "source": "execute", "summary": msg,
-                    "rows": data.get("rows", [])[:50], "messages": [{"MESSAGE": msg}],
+                    "rows": _rows(env)[:50], "messages": [{"MESSAGE": msg}],
                     "default_depth": "diagnose",
                 }
             return out
 
-        tool_result = await session.call_tool("sap_execute_step", arguments={
-            "action_type": step["action_type"],
-            "object_name": step["object_name"],
-            "params_json": json.dumps(params),
-            "async_mode":  async_mode,
-            "test_run":    test_run,
-        })
-        data = _parse_tool_result(tool_result)
-
-        execute_result: ExecuteResult = {
-            "step_id":      step_id,
-            "action_type":  step["action_type"],
-            "requires_poll": data.get("requires_poll", False),
-            "job_name":     data.get("job_name", ""),
-            "job_id":       data.get("job_id", ""),
-            "messages":     data.get("messages", []),
-            "result_json":  data.get("result_json", {}),
-            "status":       data.get("status", ""),
-        }
-
-        if data.get("requires_poll"):
-            msg = f"Job submitted: {data.get('job_name', '')}/{data.get('job_id', '')}"
-        elif data.get("status") == "error":
-            msg = "; ".join(m.get("MESSAGE", "") for m in data.get("messages", []))[:200] or "Error"
+        # FM / BAPI / BDC / SUBMIT
+        requires_poll = _meta(env, "requires_poll", False)
+        job_name      = _meta(env, "job_name", "")
+        job_id        = _meta(env, "job_id", "")
+        if requires_poll:
+            msg = f"Job submitted: {job_name}/{job_id}"
+        elif has_error:
+            msg = "; ".join(m.get("MESSAGE", "") for m in env["messages"])[:200] or "Error"
         else:
             msg = "Executed synchronously"
 
         await _emit({"type": "action_end", "step_id": step_id, "action": "execute",
-                     "status": "ok" if data.get("status") != "error" else "failed",
+                     "status": "failed" if has_error else "ok",
                      "message": msg,
                      "detail": {
-                         "job_name":      data.get("job_name", ""),
-                         "job_id":        data.get("job_id", ""),
-                         "status":        data.get("status", ""),
-                         "requires_poll": data.get("requires_poll", False),
-                         "messages":      [m.get("MESSAGE", str(m))
-                                           for m in data.get("messages", [])],
+                         "job_name":      job_name,
+                         "job_id":        job_id,
+                         "status":        env["status"],
+                         "requires_poll": requires_poll,
+                         "messages":      [m.get("MESSAGE", str(m)) for m in env["messages"]],
                      }})
         out = {"current_execute": execute_result}
-        if data.get("status") == "error":
+        if has_error:
             out["current_error_context"] = {
                 "source": "execute", "summary": msg,
-                "messages": data.get("messages", []),
+                "messages": env["messages"],
                 "default_depth": "diagnose",
             }
         return out
@@ -675,8 +671,8 @@ def make_poll_node(session: ClientSession):
         execute  = state["current_execute"]
         step     = _get_step(state)
         defs     = _defaults(state)
-        job_name      = execute["job_name"]
-        job_id        = execute["job_id"]
+        job_name      = _meta(execute, "job_name", "")
+        job_id        = _meta(execute, "job_id", "")
         poll_interval = step.get("poll_interval_sec", defs.get("poll_interval_sec", 30))
         poll_timeout  = step.get("poll_timeout_sec",  defs.get("poll_timeout_sec", 14400))
 
@@ -691,7 +687,7 @@ def make_poll_node(session: ClientSession):
         tool_result = await session.call_tool("sap_job_status",
                                               arguments={"job_name": job_name, "job_id": job_id})
         data      = _parse_tool_result(tool_result)
-        raw_st    = data.get("status", "SCHEDULED")
+        raw_st    = (data.get("data") or {}).get("state", "SCHEDULED")
 
         if raw_st == "FINISHED":
             sap_status = "FINISHED"
@@ -769,29 +765,23 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 session, run_cfg["action_type"], run_cfg["object_name"], run_cfg.get("params", {}),
                 async_mode=run_cfg.get("async", False), test_run=run_cfg.get("test_run", True),
             )
-            spool_text = (run["spool"] or {}).get("text", "")
-            rows       = run["rows"]
+            spool_text = _spool(run).get("text", "")
+            rows       = _rows(run)
             if run["messages"]:
                 messages = run["messages"]
-        elif (execute and execute.get("requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
+        elif (execute and _meta(execute, "requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
             max_lines = vcfg.get("llm", {}).get("max_spool_lines", 500)
             spool_res = await session.call_tool("sap_read_spool", arguments={
                 "job_name":  poll["job_name"],
                 "job_id":    poll["job_id"],
                 "max_lines": max_lines,
             })
-            spool_text = _parse_tool_result(spool_res).get("spool_text", "")
+            spool_text = _spool(_parse_tool_result(spool_res)).get("text", "")
         elif execute:
-            # SUBMIT that ran inline-wait (async=false) carries its spool in result_json;
+            # SUBMIT that ran inline-wait (async=false) carries its spool in data;
             # TOOLS/FM steps carry rows there. Pick up whatever is present.
-            rj    = execute.get("result_json") or {}
-            spool = rj.get("spool")
-            if isinstance(spool, dict):                 # {"status","text"}
-                spool_text = spool.get("text", "")
-            elif isinstance(spool, list) and spool:     # backward compat with old ABAP
-                spool_text = "\n".join(spool)
-            if isinstance(rj.get("rows"), list):
-                rows = rj["rows"]
+            spool_text = _spool(execute).get("text", "")
+            rows       = _rows(execute)
 
         if mode == "keyword":
             kw       = vcfg.get("keyword", {})
@@ -1211,7 +1201,7 @@ def make_parallel_step_runner(session: ClientSession, llms: dict[str, ChatOpenAI
         s = {**s, **(await _execute(s))}
         execute = s.get("current_execute", {})
 
-        if execute.get("requires_poll"):
+        if _meta(execute, "requires_poll"):
             step_def     = next(st for st in s["steps"] if st["step_id"] == step_id)
             poll_timeout = step_def.get("poll_timeout_sec",
                            s.get("global_defaults", {}).get("poll_timeout_sec", 14400))
@@ -1305,8 +1295,8 @@ def route_after_precheck(state: PeriodCloseState) -> str:
 
 def route_after_execute(state: PeriodCloseState) -> str:
     ex = state.get("current_execute", {})
-    if ex.get("status") == "error": return "analysis"
-    if ex.get("requires_poll"):     return "poll"
+    if ex.get("status") == "error":    return "analysis"
+    if _meta(ex, "requires_poll"):     return "poll"
     return "validate"
 
 
@@ -1527,37 +1517,31 @@ async def execute_rollback_step(
     await _emit({"type": "rollback_step_start", "step_id": step_id,
                  "message": f"Rolling back {action_type}/{object_name}…"})
     try:
-        tool_result = await session.call_tool("sap_execute_step", arguments={
-            "action_type": action_type,
-            "object_name": object_name,
-            "params_json": json.dumps(params),
-            "async_mode":  async_mode,
-            "test_run":    test_run,
-        })
-        data = _parse_tool_result(tool_result)
+        env = await _run_action(session, action_type, object_name, params,
+                                async_mode=async_mode, test_run=test_run)
 
-        if async_mode and data.get("requires_poll"):
-            job_name = data.get("job_name", "")
-            job_id   = data.get("job_id", "")
+        if async_mode and _meta(env, "requires_poll"):
+            job_name = _meta(env, "job_name", "")
+            job_id   = _meta(env, "job_id", "")
             elapsed  = 0.0
             while elapsed < poll_timeout:
                 # Poll first so stub/already-finished jobs don't wait a full interval.
                 pr = await session.call_tool("sap_job_status",
                                              arguments={"job_name": job_name, "job_id": job_id})
                 pd = _parse_tool_result(pr)
-                sap_st = pd.get("status", "RUNNING")
+                sap_st = (pd.get("data") or {}).get("state", "RUNNING")
                 if sap_st == "FINISHED":
-                    data["status"] = "ok"
+                    env["status"] = "ok"
                     break
                 elif sap_st == "ABORTED":
-                    data["status"] = "error"
+                    env["status"] = "error"
                     break
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
 
-        has_error = data.get("status") == "error"
+        has_error = env["status"] == "error"
         status    = "error" if has_error else "ok"
-        msg = ("; ".join(m.get("MESSAGE", "") for m in data.get("messages", []))[:200]
+        msg = ("; ".join(m.get("MESSAGE", "") for m in env["messages"])[:200]
                or ("Rollback failed" if has_error else "Rollback completed"))
         await _emit({"type": "rollback_step_end", "step_id": step_id,
                      "status": status, "message": msg})

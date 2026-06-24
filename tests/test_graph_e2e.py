@@ -27,6 +27,16 @@ _SPOOL_VALIDATE = {"mode": "keyword", "keyword": {
     "source": "spool", "ok_patterns": ["settled"], "error_patterns": ["FATAL"]}}
 
 
+def _submit_env(spool_text):
+    """A sap_execute_step inline-wait envelope carrying a normalised spool."""
+    return {"status": "ok", "messages": [],
+            "meta": {"action_type": "SUBMIT", "requires_poll": False,
+                     "job_name": "J", "job_id": "1"},
+            "data": {"spool": {"available": True,
+                               "line_count": len(spool_text.splitlines()),
+                               "text": spool_text}}}
+
+
 # ---------------------------------------------------------------------------
 # 1. Happy path — pre_check (none) → execute → validate → finalize → END
 # ---------------------------------------------------------------------------
@@ -50,10 +60,8 @@ async def test_validation_failure_then_retry_succeeds(make_session, make_llms, p
     patch_react_agent('{"action":"retry","corrected_params":null,'
                       '"diagnosis":"transient","user_instructions":null}')
     session = make_session(sap_execute_step=[
-        {"status": "ok", "requires_poll": False, "job_name": "J", "job_id": "1",
-         "messages": [], "result_json": {"spool": ["bad error here"]}},
-        {"status": "ok", "requires_poll": False, "job_name": "J", "job_id": "1",
-         "messages": [], "result_json": {"spool": ["all done clean"]}},
+        _submit_env("bad error here"),
+        _submit_env("all done clean"),
     ])
     steps = [{"step_id": "S1", "action_type": "SUBMIT", "object_name": "RKO", "async": False,
               "validate": {"mode": "keyword", "keyword": {
@@ -74,9 +82,7 @@ async def test_validation_failure_then_retry_succeeds(make_session, make_llms, p
 async def test_escalation_interrupt_then_abort(make_session, make_llms, patch_react_agent):
     patch_react_agent('{"action":"retry","corrected_params":null,'
                       '"diagnosis":"stuck","user_instructions":"fix manually"}')
-    session = make_session(sap_execute_step=lambda _a: {
-        "status": "ok", "requires_poll": False, "job_name": "J", "job_id": "1",
-        "messages": [], "result_json": {"spool": ["bad error here"]}})
+    session = make_session(sap_execute_step=lambda _a: _submit_env("bad error here"))
     steps = [{"step_id": "S1", "action_type": "SUBMIT", "object_name": "RKO", "async": False,
               "max_retries": 1,
               "validate": {"mode": "keyword", "keyword": {
