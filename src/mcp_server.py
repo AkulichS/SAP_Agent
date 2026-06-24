@@ -189,7 +189,8 @@ def sap_execute_step(
             "job_id":        "",
             "messages":      messages,
             "result_json":   result_json,
-            "spool_text":    "",
+            "rows":          result_json.get("rows", []),
+            "spool":         None,
         }
 
     if action_type == "SUBMIT":
@@ -211,7 +212,8 @@ def sap_execute_step(
                     "job_id":        "",
                     "messages":      messages + [{"TYPE": "E", "MESSAGE": "No job ID returned"}],
                     "result_json":   {},
-                    "spool_text":    "",
+                    "rows":          [],
+                    "spool":         None,
                 }
             logger.info("SUBMIT submitted (async): job=%s/%s", job_name, job_id)
             return {
@@ -221,18 +223,21 @@ def sap_execute_step(
                 "job_id":        job_id,
                 "messages":      messages,
                 "result_json":   result_json,
-                "spool_text":    "",
+                "rows":          [],
+                "spool":         None,
             }
 
-        # Inline-wait outcome: spool is {"rows": N, "spool_context": "..."}.
+        # Inline-wait outcome: spool is {"status": "S"/"E", "text": "..."}.
         spool_obj  = result_json.get("spool", {})
         if isinstance(spool_obj, dict):
-            spool_text = spool_obj.get("spool_context", "")
+            spool_text = spool_obj.get("text", "")
         elif isinstance(spool_obj, list):  # backward compat with old ABAP
             spool_text = "\n".join(spool_obj)
         else:
             spool_text = ""
-        has_errors  = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
+        has_errors    = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
+        spool_present = isinstance(spool_obj, dict) and spool_obj.get("status") == "S"
+        spool_lines   = len(spool_text.splitlines())
         logger.info("SUBMIT completed (inline-wait): job=%s/%s lines=%d status=%s",
                     job_name, job_id, len(spool_text.splitlines()), result["status"])
         return {
@@ -242,7 +247,12 @@ def sap_execute_step(
             "job_id":        job_id,
             "messages":      messages,
             "result_json":   result_json,
-            "spool_text":    spool_text,
+            "rows":          [],
+            "spool": {
+                "present": spool_present,
+                "lines":   spool_lines,
+                "text":    spool_text,
+            },
         }
 
     # Unknown action_type
@@ -253,6 +263,8 @@ def sap_execute_step(
         "job_id":        "",
         "messages":      [{"TYPE": "E", "MESSAGE": f"Unknown action_type: {action_type}"}],
         "result_json":   {},
+        "rows":          [],
+        "spool":         None,
     }
 
 
@@ -277,14 +289,17 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
         "fields":   fields,
         "max_rows": max_rows,
     })
-    rj = result["result_json"]
-    rows = rj.get("rows", [])
+    rj   = result["result_json"]
+    rows = rj.get("data", [])          
     logger.info("sap_read_table table=%s rows=%d", table, len(rows))
     return {
-        "table":  table,
-        "count":  len(rows),
-        "rows":   rows,
-        "status": result["status"],
+        "table":       table,
+        "count":       len(rows),
+        "rows":        rows,
+        "status":      "error" if result["status"] == "E" else "ok",
+        "spool":       None,
+        "messages":    [],
+        "result_json": rj,
     }
 
 
@@ -348,12 +363,13 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
     })
 
     raw = result["result_json"]
-    # ABAP serialises the spool as a JSON array of lines
-    if isinstance(raw, list):
+    # ABAP (ztool_read_job_spool) returns {"status","text"} where text is the
+    # newline-joined spool text. Older builds returned a bare JSON array of
+    # lines — keep that path for backward compatibility.
+    if isinstance(raw, dict):
+        lines = raw.get("text", "").splitlines()
+    elif isinstance(raw, list):
         lines = raw
-    elif isinstance(raw, dict):
-        text = raw.get("SPOOL_TEXT", "")
-        lines = text.splitlines()
     else:
         lines = []
 

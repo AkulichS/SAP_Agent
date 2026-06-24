@@ -219,73 +219,27 @@ def _compare(actual: Any, op: str, expected: Any) -> bool:
 
 
 async def _run_action(session: ClientSession, action_type: str, object_name: str,
-                      params: Any, async_mode: bool = False, test_run: bool = True) -> dict:
-    """Run one SAP action of any mode and normalise its output.
-
-    Used by pre_check_node, validate_node (and conceptually execute_node) so a
-    precondition / verification can be a table read, an FM/BAPI/BDC call, or a
-    SUBMIT report — without each caller re-implementing the branching.
-
-    Returns ``{"status","rows","spool_text","messages","result_json"}``:
-      - ``TOOLS``        → ``sap_read_table`` (``params`` is a dict with
-                           table/where/fields/max_rows) → ``rows``.
-      - ``FM``/``BAPI``/``BDC`` → ``sap_execute_step`` (synchronous) →
-                           ``messages``/``result_json`` (``rows`` if present).
-      - ``SUBMIT``       → ``sap_execute_step`` with ``async_mode=False`` runs the
-                           background job and waits inline, returning ``spool_text``.
-                           (``async_mode=True`` returns no spool — the caller then
-                           owns polling; pre_check/validate always pass False.)
-    """
+                      params: Any, async_mode: bool = False, test_run: bool = False) -> dict:
+    """Route one SAP action to the right MCP tool and return its result."""
+    
     at = (action_type or "").upper()
-
     if at == "TOOLS":
-        p     = params if isinstance(params, dict) else {}
-        table = p.get("table", object_name)
+        p = params if isinstance(params, dict) else {}
         r = await session.call_tool("sap_read_table", arguments={
-            "table":    table,
+            "table":    p.get("table", object_name),
             "where":    p.get("where", ""),
             "fields":   p.get("fields", ""),
             "max_rows": p.get("max_rows", 100),
         })
-        data = _parse_tool_result(r)
-        return {
-            "status":      "error" if data.get("status") == "E" else "ok",
-            "rows":        data.get("rows", []),
-            "spool_text":  "",
-            "messages":    [],
-            "result_json": data,
-        }
-
-    r = await session.call_tool("sap_execute_step", arguments={
-        "action_type": at,
-        "object_name": object_name,
-        "params_json": json.dumps(params),
-        "async_mode":  async_mode,
-        "test_run":    test_run,
-    })
-    data = _parse_tool_result(r)
-    rj   = data.get("result_json", {}) if isinstance(data.get("result_json"), dict) else {}
-    rows = rj.get("rows") or []                      # TOOLS path: list of dicts
-    spool_meta      = rj.get("spool")                # SUBMIT sync_wait: {"rows": N, "spool_context": "..."}
-    # spool_present distinguishes "report ran and produced a spool we read"
-    # (object present, even if 0 rows) from "no spool obtained at all" (key
-    # absent/null — job errored, or the spool could not be fetched).
-    # A job can FINISH yet have an unreadable spool: ABAP still emits {"rows":0}
-    # but adds a "spool unavailable" warning (z_execute_submit) — treat that as
-    # "no spool" too, so an empty pre-check isn't mistaken for "0 offending rows".
-    spool_unreadable = any("spool unavailable" in (m.get("MESSAGE", "").lower())
-                           for m in data.get("messages", []))
-    spool_present   = isinstance(spool_meta, dict) and not spool_unreadable
-    spool_row_count = spool_meta.get("rows", 0) if spool_present else len(rows)
-    return {
-        "status":          "error" if data.get("status") == "error" else "ok",
-        "rows":            rows,
-        "spool_row_count": spool_row_count,
-        "spool_present":   spool_present,
-        "spool_text":      data.get("spool_text", ""),
-        "messages":        data.get("messages", []),
-        "result_json":     rj,
-    }
+    else:
+        r = await session.call_tool("sap_execute_step", arguments={
+            "action_type": at,
+            "object_name": object_name,
+            "params_json": json.dumps(params),
+            "async_mode":  async_mode,
+            "test_run":    test_run,
+        })
+    return _parse_tool_result(r)
 
 
 def _analysis_depth(step: dict, ec: dict) -> str:
@@ -468,11 +422,12 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             async_mode=pc.get("async", False), test_run=pc.get("test_run", True),
         )
         rows            = run["rows"]
-        spool_text      = run["spool_text"]
-        spool_row_count = run.get("spool_row_count", len(rows))
+        spool           = run["spool"] or {}
+        spool_text      = spool.get("text", "")
+        spool_row_count = spool.get("lines", 0)   # only consulted for SUBMIT (rows empty)
         # raw_data is what comparison/LLM/operator inspect: table rows when present,
         # otherwise the SUBMIT spool text.
-        raw_data   = run["result_json"] if rows else (spool_text or run["result_json"])
+        raw_data = run["result_json"] if rows else (spool_text or run["result_json"])
 
         # A failed pre-check no longer renders its own explanation. It marks the
         # pre-check failed and hands a uniform ErrorContext to the source-aware
@@ -503,14 +458,14 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             # --- No verification artifact: a SUBMIT pre-check whose report errored or
             #     returned no spool cannot judge the precondition. Route to analysis so
             #     the operator is told the step was not verified (fix-and-retry or skip).
-            if pc_action == "SUBMIT" and (run["status"] == "error" or not run.get("spool_present", False)):
+            if pc_action == "SUBMIT" and (run["status"] == "error" or not spool.get("present", False)):
                 summary = (f"Step {step_id} could not be verified: pre-check report "
                            f"{obj} returned no spool. Ensure the report runs and produces a "
                            f"spool, then retry the pre-check — or skip the step.")
                 await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
                              "status": "failed", "message": f"not verified — no spool from {obj}",
                              "detail": {"object_name": obj, "status": run["status"],
-                                        "spool_present": run.get("spool_present", False)}})
+                                        "spool_present": spool.get("present", False)}})
                 return _fail_to_analysis(
                     summary,
                     {"object_name": obj, "status": run["status"]},
@@ -633,7 +588,7 @@ def make_execute_node(session: ClientSession):
                 "max_rows": params_dict.get("max_rows", 100),
             })
             data      = _parse_tool_result(tool_result)
-            has_error = data.get("status") == "E"
+            has_error = data.get("status") == "error"
             count     = data.get("count", len(data.get("rows", [])))
             msg       = f"error reading {table}" if has_error else f"{count} row(s) from {table}"
             tools_result: ExecuteResult = {
@@ -814,7 +769,7 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 session, run_cfg["action_type"], run_cfg["object_name"], run_cfg.get("params", {}),
                 async_mode=run_cfg.get("async", False), test_run=run_cfg.get("test_run", True),
             )
-            spool_text = run["spool_text"]
+            spool_text = (run["spool"] or {}).get("text", "")
             rows       = run["rows"]
             if run["messages"]:
                 messages = run["messages"]
@@ -830,8 +785,10 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             # SUBMIT that ran inline-wait (async=false) carries its spool in result_json;
             # TOOLS/FM steps carry rows there. Pick up whatever is present.
             rj    = execute.get("result_json") or {}
-            spool = rj.get("spool", [])
-            if isinstance(spool, list) and spool:
+            spool = rj.get("spool")
+            if isinstance(spool, dict):                 # {"status","text"}
+                spool_text = spool.get("text", "")
+            elif isinstance(spool, list) and spool:     # backward compat with old ABAP
                 spool_text = "\n".join(spool)
             if isinstance(rj.get("rows"), list):
                 rows = rj["rows"]

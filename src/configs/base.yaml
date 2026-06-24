@@ -15,7 +15,7 @@ defaults:
 
 llm_profiles:
   analysis:   {provider: "groq", model: "llama-3.3-70b-versatile", temperature: 0}
-  validation: {provider: "OPENROUTER", model: "",    temperature: 0}
+  validation: {provider: "openrouter", model: "",    temperature: 0}
 
 steps:
 

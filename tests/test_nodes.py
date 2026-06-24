@@ -24,6 +24,12 @@ async def test_precheck_skip_mode(make_session, make_llms, make_state):
     assert out["current_pre_check"]["passed"] is True
 
 
+def _table_result(rows, *, status="ok"):
+    """Build a fake sap_read_table payload matching the unified tool shape."""
+    return {"rows": rows, "count": len(rows), "status": status,
+            "spool": None, "messages": [], "result_json": {}}
+
+
 def _cmp_step(comparison):
     return {"step_id": "A", "pre_check": {
         "enabled": True, "mode": "comparison", "action_type": "TOOLS",
@@ -32,7 +38,7 @@ def _cmp_step(comparison):
 
 
 async def test_precheck_comparison_empty_pass_executes(make_session, make_llms, make_state):
-    session = make_session(sap_read_table={"rows": [], "status": "S"})
+    session = make_session(sap_read_table=_table_result([]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "skip"})
     out = await node(make_state([step]))
@@ -41,7 +47,7 @@ async def test_precheck_comparison_empty_pass_executes(make_session, make_llms, 
 
 
 async def test_precheck_comparison_non_empty_on_pass_skip(make_session, make_llms, make_state):
-    session = make_session(sap_read_table={"rows": [{"X": "1"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"X": "1"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "non_empty", "on_pass": "skip", "on_fail": "execute"})
     out = await node(make_state([step]))
@@ -49,7 +55,7 @@ async def test_precheck_comparison_non_empty_on_pass_skip(make_session, make_llm
 
 
 async def test_precheck_comparison_field_mismatch_on_fail_skip(make_session, make_llms, make_state):
-    session = make_session(sap_read_table={"rows": [{"SPERRE": "X"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"SPERRE": "X"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "first", "field": "SPERRE", "operator": "eq",
                       "value": "", "on_fail": "skip"})
@@ -61,7 +67,7 @@ async def test_precheck_comparison_field_mismatch_on_fail_skip(make_session, mak
 async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_state):
     # "error" is a backward-compatible alias of "analyse": failure → passed=False and a
     # uniform ErrorContext handed to the source-aware analysis_node (no inline current_analysis).
-    session = make_session(sap_read_table={"rows": [{"SPERRE": "X"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"SPERRE": "X"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "first", "field": "SPERRE", "operator": "eq",
                       "value": "", "on_fail": "error"})
@@ -74,7 +80,7 @@ async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_s
 
 
 async def test_precheck_llm_pass(make_session, make_llms, make_state):
-    session = make_session(sap_read_table={"rows": [{"A": "1"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"A": "1"}]))
     node = make_pre_check_node(session, make_llms(validation="yes"))
     step = {"step_id": "A", "pre_check": {
         "enabled": True, "mode": "llm", "action_type": "TOOLS", "object_name": "COKP",
@@ -85,7 +91,7 @@ async def test_precheck_llm_pass(make_session, make_llms, make_state):
 
 
 async def test_precheck_llm_fail_skips(make_session, make_llms, make_state):
-    session = make_session(sap_read_table={"rows": [{"A": "1"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"A": "1"}]))
     node = make_pre_check_node(session, make_llms(validation="no"))
     step = {"step_id": "A", "pre_check": {
         "enabled": True, "mode": "llm", "action_type": "TOOLS", "object_name": "COKP",
@@ -105,12 +111,29 @@ def _submit_cmp_step(comparison, llm=None):
     return pc
 
 
-def _submit_result(*, status="ok", spool_rows=None, spool_text=""):
-    """Build a fake sap_execute_step payload. spool_rows=None → no spool object."""
+def _submit_result(*, status="ok", spool_rows=None, spool_text="", spool_status="S"):
+    """Build a fake sap_execute_step payload matching the unified tool shape.
+
+    spool_rows=None → no spool (spool=None).
+    spool_status "S" = the report ran and its spool was read; anything else (e.g. "E")
+    = job finished but spool unreadable → spool.present=False.
+    """
     rj = {"status": "completed"}
     if spool_rows is not None:
-        rj["spool"] = {"rows": spool_rows, "spool_context": spool_text}
-    return {"status": status, "result_json": rj, "spool_text": spool_text, "messages": []}
+        rj["spool"] = {"status": spool_status, "text": spool_text}
+    spool_present = (spool_rows is not None) and (spool_status == "S")
+    spool_obj = ({"present": spool_present, "lines": spool_rows or 0, "text": spool_text}
+                 if spool_rows is not None else None)
+    return {
+        "status":        status,
+        "requires_poll": False,
+        "job_name":      "",
+        "job_id":        "",
+        "messages":      [],
+        "result_json":   rj,
+        "rows":          [],
+        "spool":         spool_obj,
+    }
 
 
 async def test_precheck_submit_empty_spool_executes(make_session, make_llms, make_state):
@@ -153,9 +176,9 @@ async def test_precheck_submit_no_spool_not_verified(make_session, make_llms, ma
 
 
 async def test_precheck_submit_finished_but_spool_unreadable_not_verified(make_session, make_llms, make_state):
-    # Job FINISHED (status ok, spool object present with rows=0) but ABAP warns the
-    # spool was unavailable → must be treated as "not verified", not "empty → ok".
-    payload = _submit_result(status="ok", spool_rows=0)
+    # Job FINISHED (status ok) but the spool was unavailable — ABAP flags the spool
+    # object's own status as "E" → must be treated as "not verified", not "empty → ok".
+    payload = _submit_result(status="ok", spool_rows=0, spool_status="E")
     payload["messages"] = [{"TYPE": "W", "MESSAGE": "Job finished, spool unavailable: read error"}]
     session = make_session(sap_execute_step=payload)
     node = make_pre_check_node(session, make_llms())
@@ -179,7 +202,7 @@ async def test_precheck_submit_completed_without_spool_not_verified(make_session
 # ===========================================================================
 
 async def test_execute_tools(make_session, make_state):
-    session = make_session(sap_read_table={"rows": [{"K": "1"}], "count": 1, "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"K": "1"}]))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "TOOLS", "object_name": "COKP",
             "params": {"table": "COKP"}}
@@ -354,7 +377,7 @@ async def test_validate_llm_non_json_escalates(make_session, make_llms, make_sta
 
 async def test_validate_run_verification_action(make_session, make_llms, make_state):
     # validate.run executes a TOOLS read and validates ITS rows.
-    session = make_session(sap_read_table={"rows": [{"KOKRS": "X500"}], "status": "S"})
+    session = make_session(sap_read_table=_table_result([{"KOKRS": "X500"}]))
     node = make_validate_node(session, make_llms())
     step = _vstep({"mode": "keyword",
                    "run": {"action_type": "TOOLS", "object_name": "COKP",

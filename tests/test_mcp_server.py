@@ -23,7 +23,7 @@ def test_running_in_stub_mode():
 
 def test_read_table_known():
     out = mcp_server.sap_read_table("COKP", "", "", 100)
-    assert out["status"] == "S"
+    assert out["status"] == "ok"
     assert out["count"] == 1
     assert out["rows"][0]["KOKRS"] == "X500"
 
@@ -55,7 +55,7 @@ def test_submit_inline_returns_spool():
     out = mcp_server.sap_execute_step("SUBMIT", "RKO7KO8G", "[]", async_mode=False)
     assert out["status"] == "ok"
     assert out["requires_poll"] is False
-    assert "settled successfully" in out["spool_text"]
+    assert "settled successfully" in out["spool"]["text"]
 
 
 def test_execute_fm_sync_ok():

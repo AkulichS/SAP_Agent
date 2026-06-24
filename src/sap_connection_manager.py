@@ -285,7 +285,8 @@ class _StubConnection:
                     "ET_MESSAGES":    [{"TYPE": "S",
                                         "MESSAGE": f"Job {job_name}/{job_id} submitted{suffix}"}],
                 }
-            spool = self._SPOOL_TEXT.get(obj, self._SPOOL_TEXT["default"])
+            lines = self._SPOOL_TEXT.get(obj, self._SPOOL_TEXT["default"])
+            spool = {"status": "S", "text": "\n".join(lines)}
             return {
                 "EV_STATUS":      "S",
                 "EV_RESULT_JSON": _json.dumps({"status": "completed", "mode": "sync_wait",
@@ -331,7 +332,7 @@ class _StubConnection:
                 rows = [{f: r.get(f, "") for f in fields} for r in rows]
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"rows": rows}),
+                "EV_RESULT_JSON": _json.dumps({"data": rows}),
                 "ET_MESSAGES":    [{"TYPE": "S",
                                     "MESSAGE": f"STUB: {len(rows)} rows from {table}"}],
             }
@@ -352,7 +353,7 @@ class _StubConnection:
             lines    = self._SPOOL_TEXT.get(obj_key, self._SPOOL_TEXT["default"])
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps(lines),
+                "EV_RESULT_JSON": _json.dumps({"status": "S", "text": "\n".join(lines)}),
                 "ET_MESSAGES":    [],
             }
 

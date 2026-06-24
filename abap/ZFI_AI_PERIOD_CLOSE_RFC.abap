@@ -346,23 +346,23 @@ FORM z_execute_submit
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: lt_selopts            TYPE ty_zai_selparam_tab,
-        ls_selopt             LIKE LINE OF lt_selopts,
-        lt_rsparams           TYPE rsparams_tt,
-        ls_rsparam            TYPE rsparams,
-        lv_jobname            TYPE btcjob,
-        lv_jobcount           TYPE btcjobcnt,
-        lv_ts                 TYPE string,
-        lv_msg                TYPE string,
+  DATA: lt_selopts        TYPE ty_zai_selparam_tab,
+        ls_selopt         LIKE LINE OF lt_selopts,
+        lt_rsparams       TYPE rsparams_tt,
+        ls_rsparam        TYPE rsparams,
+        lv_jobname        TYPE btcjob,
+        lv_jobcount       TYPE btcjobcnt,
+        lv_ts             TYPE string,
+        lv_msg            TYPE string,
         "--- inline-wait (sync_wait) locals ---
-        lv_state              TYPE string,
-        lv_waited             TYPE i,
-        lt_lines              TYPE stringtab,
-        lv_subrc              TYPE i,
-        lv_spoolmsg           TYPE string,
-        lv_spooljson          TYPE string,
-        lv_spool_text         TYPE string,
-        lv_spool_context_json TYPE string.
+        lv_state          TYPE string,
+        lv_waited         TYPE i,
+        lt_lines          TYPE stringtab,
+        lv_subrc          TYPE i,
+        lv_spoolmsg       TYPE string,
+        lv_spooljson      TYPE string,
+        lv_spool_text     TYPE string,
+        lv_spool_context  TYPE string.
 
   "--- Parse JSON array of selection parameters ---
   /ui2/cl_json=>deserialize( EXPORTING json = iv_params_json CHANGING data = lt_selopts ).
@@ -507,16 +507,23 @@ FORM z_execute_submit
   PERFORM z_fetch_spool USING    lv_jobname lv_jobcount
                         CHANGING lt_lines lv_subrc lv_spoolmsg.
 
-  DATA(lv_spool_rows) = lines( lt_lines ).
-  CONCATENATE LINES OF lt_lines INTO lv_spool_text
-    SEPARATED BY cl_abap_char_utilities=>newline.
-  TRY.
-    lv_spool_context_json = /ui2/cl_json=>serialize( data = lv_spool_text ).
-  CATCH cx_root.
-    lv_spool_context_json = '""'.
-  ENDTRY.
-  lv_spooljson = '{"rows":' && lv_spool_rows &&
-                 ',"spool_context":' && lv_spool_context_json && '}'.
+  IF lv_subrc <> 0.
+    lv_spooljson = '{"status":"' && lc_error && '","text":""}'.
+    lv_msg = 'Job finished, spool unavailable: ' && lv_spoolmsg.
+    PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
+  ELSE.
+    DATA(lv_spool_rows) = lines( lt_lines ).
+    CONCATENATE LINES OF lt_lines INTO lv_spool_text
+      SEPARATED BY cl_abap_char_utilities=>newline.
+    TRY.
+      lv_spool_context = /ui2/cl_json=>serialize( data = lv_spool_text ).
+    CATCH cx_root.
+      lv_spool_context = '""'.
+    ENDTRY.
+    lv_spooljson = '{"status":"' && lc_success && '","text":' && lv_spool_context && '}'.
+    lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lv_spool_rows.
+    PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
+  ENDIF.
 
   ev_status = lc_success.
   ev_result_json = '{"status":"completed"' &&
@@ -525,15 +532,6 @@ FORM z_execute_submit
                    ',"jobname":"'  && lv_jobname  && '"' &&
                    ',"jobcount":"' && lv_jobcount && '"' &&
                    ',"spool":'     && lv_spooljson && '}'.
-
-  IF lv_subrc <> 0.
-    "Spool unavailable is not fatal — the job itself finished OK.
-    lv_msg = 'Job finished, spool unavailable: ' && lv_spoolmsg.
-    PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
-  ELSE.
-    lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lv_spool_rows.
-    PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
-  ENDIF.
 
 ENDFORM.
 
@@ -828,7 +826,7 @@ FORM ztool_read_table
       lv_msg = 'Table ' && ls_params-table && ' is empty for given criteria'.
       PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
       ev_result_json = '{"table":"' && ls_params-table &&
-                       '","rows":[],"count":0}'.
+                       '","data":[],"count":0}'.
       RETURN.
     WHEN OTHERS.
       ev_status  = lc_error.
@@ -883,7 +881,7 @@ FORM ztool_read_table
 
   ev_result_json = '{"table":"' && ls_params-table && '"' &&
                    ',"count":' && lv_cnt &&
-                   ',"rows":' && lv_rows_j && '}'.
+                   ',"data":' && lv_rows_j && '}'.
 
 ENDFORM.
 
@@ -952,10 +950,12 @@ FORM ztool_read_job_spool
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: ls_job     TYPE ty_zai_job_params,
-        lv_message TYPE string,
-        lv_subrc   TYPE i,
-        lt_lines   TYPE stringtab.
+  DATA: ls_job                TYPE ty_zai_job_params,
+        lv_message            TYPE string,
+        lv_subrc              TYPE i,
+        lt_lines              TYPE stringtab,
+        lv_spool_text         TYPE string,
+        lv_spool_context_json TYPE string.
 
   "------------------------------------------------------------
   " 1. Deserialize input JSON
@@ -965,6 +965,7 @@ FORM ztool_read_job_spool
                                CHANGING data = ls_job ).
   CATCH cx_root INTO DATA(lx_json).
     ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
     lv_message = 'JSON deserialize error: ' && lx_json->get_text( ).
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
@@ -978,24 +979,32 @@ FORM ztool_read_job_spool
 
   IF lv_subrc <> 0.
     ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
   "------------------------------------------------------------
-  " 3. Serialise result to JSON (array of lines)
+  " 3. Serialise result to JSON ({status, text}) — same shape as
+  "    z_execute_submit's inline-wait spool object, so both callers parse it alike.
   "------------------------------------------------------------
+  CONCATENATE LINES OF lt_lines INTO lv_spool_text
+    SEPARATED BY cl_abap_char_utilities=>newline.
   TRY.
-    ev_result_json = /ui2/cl_json=>serialize( data = lt_lines ).
+    lv_spool_context_json = /ui2/cl_json=>serialize( data = lv_spool_text ).
   CATCH cx_root INTO DATA(lx_json_ser).
     ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
     lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDTRY.
 
+  DATA(lv_spool_rows) = lines( lt_lines ).
+  ev_result_json = '{"status":"' && lc_success && '","text":' && lv_spool_context_json && '}'.
+
   ev_status  = lc_success.
-  lv_message = |Spool read successfully. Lines={ lines( lt_lines ) }|.
+  lv_message = |Spool read successfully. Lines={ lv_spool_rows }|.
   PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
 
 ENDFORM.
