@@ -1266,7 +1266,7 @@ function onActionEnd(e) {
       const body = el.querySelector('.action-body');
       body.innerHTML =
         `<div class="action-title">${actionLabel(e.action, e.status)}</div>` +
-        `<div class="action-msg">${esc(entry.message)}</div>` +
+        (e.action !== 'validate' ? `<div class="action-msg">${esc(entry.message)}</div>` : '') +
         (entry.detail ? renderDetail(e.action, entry.detail) : '');
     }
   }
@@ -1689,7 +1689,7 @@ function appendActionEntry(step_id, entry, scroll = true) {
     `<div class="action-icon">${actionIcon(entry.action)}</div>` +
     `<div class="action-body">` +
       `<div class="action-title">${actionLabel(entry.action, entry.status)}</div>` +
-      `<div class="action-msg">${esc(entry.message)}</div>` +
+      (entry.action !== 'validate' ? `<div class="action-msg">${esc(entry.message)}</div>` : '') +
       (entry.detail ? renderDetail(entry.action, entry.detail) : '') +
     `</div>`;
   log.appendChild(div);
@@ -1732,8 +1732,19 @@ function renderDetail(action, detail) {
   } else if (action === 'validate') {
     const vmap = {ok: 'det-pass', retry: 'det-warn', escalate: 'det-fail'};
     const vcls = vmap[detail.verdict] || '';
-    parts.push(`<div class="det-row"><span class="det-lbl">Verdict:</span> <span class="${vcls}"><b>${esc((detail.verdict || '').toUpperCase())}</b></span> &nbsp;·&nbsp; <span class="det-lbl">Errors:</span> ${detail.error_count ?? 0}</div>`);
-    if (detail.reasoning) parts.push(`<div class="det-row"><span class="det-lbl">Reasoning:</span> ${esc(detail.reasoning)}</div>`);
+    const errCount = detail.error_count ?? 0;
+    const errIcon = errCount > 0 ? ' <span style="color:var(--failed)">✗</span>' : '';
+    parts.push(`<div class="det-row"><span class="det-lbl">Verdict:</span> <span class="${vcls}"><b>${esc((detail.verdict || '').toUpperCase())}</b></span> &nbsp;·&nbsp; <span class="det-lbl">Errors:</span> ${errCount}${errIcon}</div>`);
+    const errList = (detail.errors && detail.errors.length > 0) ? detail.errors
+      : (() => { try { const p = JSON.parse(detail.reasoning || ''); return Array.isArray(p) ? p : null; } catch { return null; } })();
+    if (errList && errList.length > 0) {
+      const cols = Object.keys(errList[0]);
+      const hdr  = cols.map(c => `<th>${esc(c)}</th>`).join('');
+      const rows = errList.map(r => `<tr>${cols.map(c => `<td>${esc(String(r[c] ?? ''))}</td>`).join('')}</tr>`).join('');
+      parts.push(`<div class="det-row"><span class="det-lbl">Reasoning:</span></div><table class="det-table"><tr>${hdr}</tr>${rows}</table>`);
+    } else if (detail.reasoning) {
+      parts.push(`<div class="det-row"><span class="det-lbl">Reasoning:</span> ${esc(detail.reasoning)}</div>`);
+    }
     if (detail.spool_preview) {
       parts.push(`<details class="det-spool"><summary class="det-lbl">Spool preview</summary><pre class="det-pre">${esc(detail.spool_preview)}</pre></details>`);
     } else if (detail.messages && detail.messages.length > 0) {
@@ -1778,7 +1789,7 @@ function actionIcon(action) {
 
 function actionLabel(action, status) {
   const names = {pre_check:'Pre-check', execute:'Execute', poll:'Poll', validate:'Validate', analysis:'Analysis', user_input:'Operator Input', rollback:'Rollback'};
-  const sfx  = status === 'running' ? '…' : status === 'ok' ? ' ✓' : status === 'failed' ? ' ✗' : status === 'skipped' ? ' —' : '';
+  const sfx  = status === 'running' ? '…' : status === 'ok' ? ' ✓' : (status === 'failed' || status === 'retry' || status === 'escalate') ? ' <span style="color:var(--failed)">✗</span>' : status === 'skipped' ? ' —' : '';
   if (action === 'rollback') {
     // Label in rollback-orange, suffix in status color so the ✓ stays green.
     const sfxColor = status === 'ok' ? 'var(--ok)' : status === 'failed' ? 'var(--failed)'

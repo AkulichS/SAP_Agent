@@ -846,6 +846,7 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                      "detail": {
                          "verdict":       verdict,
                          "error_count":   error_count,
+                         "errors":        errors,
                          "reasoning":     reasoning,
                          "spool_preview": "\n".join(spool_text.splitlines()[:15]) if spool_text else "",
                          "rows":          rows[:5] if rows else [],
