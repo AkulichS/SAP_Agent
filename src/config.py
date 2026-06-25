@@ -286,4 +286,5 @@ def _llm_from_profile(profile: dict) -> ChatOpenAI:
         temperature=profile.get("temperature", 0),
         max_retries=3,
         http_client=httpx.Client(verify=False),
+        http_async_client=httpx.AsyncClient(verify=False),
     )

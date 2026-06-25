@@ -294,6 +294,7 @@ async def _llm_verdict(
     rows: list | None = None,
     messages: list | None = None,
     pass_values: list[str] | None = None,
+    llm_fail_verdict: str = "ok",
 ) -> dict:
     """Single LLM gate shared by pre_check(mode:llm) and validate(mode:llm).
 
@@ -306,8 +307,11 @@ async def _llm_verdict(
       ``{error_count, errors?, verdict?, reasoning?}``; verdict is derived from
       ``error_count`` when omitted; non-JSON → ``escalate``.
 
-    Fail-open: an LLM exception returns verdict ``ok`` so a provider outage never
-    wedges a period close.
+    ``llm_fail_verdict`` controls what verdict is returned when the LLM call itself
+    fails (network / auth error).  Default ``"ok"`` preserves legacy fail-open for
+    validate nodes so a provider outage never wedges a period close.  Pass
+    ``"escalate"`` from pre_check so an unavailable LLM routes to the operator
+    instead of silently marking the pre-check as passed.
     """
     rows     = rows or []
     messages = messages or []
@@ -344,7 +348,7 @@ async def _llm_verdict(
         raw = re.sub(r"```\w*\n?", "", (response.content or "").strip()).strip()
     except Exception as exc:
         logger.warning("_llm_verdict LLM not available: %s", exc)
-        return {"verdict": "ok", "error_count": 0, "errors": [],
+        return {"verdict": llm_fail_verdict, "error_count": 0, "errors": [],
                 "reasoning": f"LLM not available — skipping LLM check ({str(exc)[:120]})"}
 
     if pass_values is not None:
@@ -550,8 +554,9 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             return {"current_pre_check": result}
 
         if mode == "llm":
-            # Boolean gate via the shared verdict helper: pass → execute, fail → skip
-            # the step (unchanged semantics; no operator interrupt for mode:llm).
+            # Boolean gate via the shared verdict helper: pass → execute, fail → skip.
+            # llm_fail_verdict="escalate" ensures an LLM connection error routes to the
+            # operator (via _fail_to_analysis) rather than silently passing the pre-check.
             lcfg      = pc.get("llm", {})
             pass_vals = lcfg.get("pass_values", ["yes", "true", "pass", "ok"])
             v = await _llm_verdict(
@@ -561,7 +566,13 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 spool_text=spool_text if (spool_text and not rows) else "",
                 rows=rows,
                 pass_values=pass_vals,
+                llm_fail_verdict="escalate",
             )
+            if v["verdict"] == "escalate":
+                summary = f"Pre-check LLM unavailable for step {step_id}: {v['reasoning']}"
+                await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",
+                             "status": "failed", "message": summary[:120]})
+                return _fail_to_analysis(summary, {"llm_error": v["reasoning"]}, summary)
             passed = v["verdict"] == "ok"
             st = "ok" if passed else "skipped"
             await _emit({"type": "action_end", "step_id": step_id, "action": "pre_check",

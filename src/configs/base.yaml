@@ -14,8 +14,8 @@ defaults:
   reset_each_run:    true
 
 llm_profiles:
-  analysis:   {provider: "groq", model: "llama-3.3-70b-versatile", temperature: 0}
-  validation: {provider: "openrouter", model: "",    temperature: 0}
+  analysis:   {provider: "openrouter", model: "meta-llama/llama-3.3-70b-instruct", temperature: 0}
+  validation: {provider: "openrouter", model: "meta-llama/llama-3.3-70b-instruct", temperature: 0}
 
 steps:
 
@@ -120,21 +120,37 @@ steps:
       - {selname: "VAART",  kind: "P", low: "1"}
       - {selname: "AUSF",   kind: "P", low: "X"} 
 
-    pre_check:
+    pre_check: #----------------------------------------------------------------------
       enabled:     true
-      mode:        "comparison"
+      mode:        "llm"  # comparison, llm
       action_type: "SUBMIT"
       object_name: "RKASELRULES_OR"
       async:       false
       params:
         - {selname: "KOKRS",  kind: "P", low: "{{controlling_area}}"}
-        # - {selname: "S_KOSTL", kind: "P", low: ""}
-      comparison:
-        select:   "empty"      # empty | non_empty | first | last
-        on_pass:  "execute"
-        on_fail:  "analyse"    # execute | skip | analyse  ("llm"/"error" still accepted as aliases)
+        - {selname: "S_KOSTL", kind: "P", low: ""}
 
-    validate:
+      llm:
+        prompt: |
+          Check the spool below.
+
+          If the spool contains header lines, separator lines (----), and a message such as
+          "List does not contain any data" — that means the check passed (no wrong orders).
+          If the spool contains any rows with order numbers, that means
+          there are wrong orders and the check failed.
+          Answer with a single word: YES if the check passed, NO if wrong orders were found.
+
+          Spool:
+          {{spool_text}}
+        pass_values: ["yes"]
+
+
+      # comparison:
+      #   select:   "empty"      # empty | non_empty | first | last
+      #   on_pass:  "execute"
+      #   on_fail:  "analyse"    # execute | skip | analyse  ("llm"/"error" still accepted as aliases)
+
+    validate: #----------------------------------------------------------------------
       mode: "llm"
       llm:
         max_spool_lines: 300
@@ -168,7 +184,7 @@ steps:
 
           {{spool_text}}
 
-    rollback:
+    rollback: #----------------------------------------------------------------------
       enabled: true
       action_type: "SUBMIT"
       object_name: "RKO7KO8G"
@@ -182,7 +198,7 @@ steps:
         - {selname: "VAART",  kind: "P", low: "1"}
         - {selname: "STOR",   kind: "P", low: "X"}   # reversal flag
 
-    on_error:
+    on_error: #----------------------------------------------------------------------
       # Depth per failure source: cheap operator "explain" before the step (the
       # pre-check already holds the offending orders), heavy tool "diagnose" after
       # the step (an unprocessed-orders failure needs SAP investigation).
