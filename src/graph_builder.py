@@ -29,7 +29,7 @@ import logging
 import re
 import sys, os
 from pathlib import Path
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Awaitable, Callable, TypedDict
 from uuid import uuid4
 
 import yaml
@@ -40,11 +40,9 @@ from langchain_core.messages import (
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 from langgraph.graph.message import add_messages, REMOVE_ALL_MESSAGES
-from langchain_core.tools import tool as lc_tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langchain.agents import create_agent
 from langgraph.types import Command, Send, interrupt
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -879,40 +877,107 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
 def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
-    def _make_tools(sess: ClientSession) -> list:
-        @lc_tool
-        async def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> str:
-            """Read SAP table rows for diagnostic purposes."""
-            r = await sess.call_tool("sap_read_table",
-                                     arguments={"table": table, "where": where,
-                                                "fields": fields, "max_rows": max_rows})
-            return json.dumps(_parse_tool_result(r))
+    _tool_schema_cache: list[dict] | None = None
 
-        @lc_tool
-        async def sap_read_spool(job_name: str, job_id: str, max_lines: int = 300) -> str:
-            """Read spool output of a completed SAP background job."""
-            r = await sess.call_tool("sap_read_spool",
-                                     arguments={"job_name": job_name, "job_id": job_id,
-                                                "max_lines": max_lines})
-            return json.dumps(_parse_tool_result(r))
+    async def _call_tool(name: str, args: dict) -> dict:
+        """Generic MCP dispatcher — routes any tool call by name, no hardcoding."""
+        r = await session.call_tool(name, arguments=args)
+        return _parse_tool_result(r)
 
-        @lc_tool
-        async def sap_job_status(job_name: str, job_id: str) -> str:
-            """Check current SAP background job status."""
-            r = await sess.call_tool("sap_job_status",
-                                     arguments={"job_name": job_name, "job_id": job_id})
-            return json.dumps(_parse_tool_result(r))
+    async def _get_tool_schema() -> list[dict]:
+        """Fetch tool list from MCP once and cache for the process lifetime."""
+        nonlocal _tool_schema_cache
+        if _tool_schema_cache is None:
+            resp = await session.list_tools()
+            _tool_schema_cache = [
+                {
+                    "name": t.name,
+                    "description": t.description or "",
+                    "args": t.inputSchema.get("properties", {}),
+                }
+                for t in resp.tools
+            ]
+        return _tool_schema_cache
 
-        @lc_tool
-        async def sap_check_period(action_type: str, object_name: str, params_json: str) -> str:
-            """Run an SAP pre-check RFC call and return the result."""
-            r = await sess.call_tool("sap_check_period",
-                                     arguments={"action_type": action_type,
-                                                "object_name": object_name,
-                                                "params_json": params_json})
-            return json.dumps(_parse_tool_result(r))
+    async def _run_text_react(
+        llm: ChatOpenAI,
+        call_tool: Callable[[str, dict], Awaitable[dict]],
+        tool_schema: list[dict],
+        system_prompt: str,
+        prior_messages: list,
+        emit: Callable,
+        step_id: str,
+        max_steps: int = 8,
+    ) -> tuple[list, list[str]]:
+        """Text-based ReAct loop: plain JSON I/O, no native API tool-calling.
 
-        return [sap_read_table, sap_read_spool, sap_job_status, sap_check_period]
+        The LLM must output one of two JSON objects per turn:
+          {"type":"tool_call",   "tool":"<name>","args":{...}}
+          {"type":"final_answer","action":"retry|user_input|skip",
+           "diagnosis":"...","corrected_params":null,"user_instructions":null}
+
+        Tool errors are fed back as HumanMessages so the model can self-correct.
+        Returns (new_messages_added, tool_names_used).
+        """
+        tools_block = json.dumps(tool_schema, ensure_ascii=False, indent=2)
+        full_system = (
+            f"{system_prompt}\n\n"
+            "=== AVAILABLE TOOLS ===\n"
+            f"{tools_block}\n\n"
+            "=== RESPONSE FORMAT (strict) ===\n"
+            "Every response MUST be a single JSON object — no other text.\n"
+            "To call a tool:\n"
+            '  {"type":"tool_call","tool":"<name>","args":{<args>}}\n'
+            "To give your final answer:\n"
+            '  {"type":"final_answer","action":"retry|user_input|skip",'
+            '"diagnosis":"root cause","corrected_params":null,'
+            '"user_instructions":"operator steps or null"}\n'
+            "If a tool returns status=error, correct the arguments and call it again."
+        )
+
+        conv: list = [SystemMessage(content=full_system)] + list(prior_messages)
+        new_msgs: list = []
+        tools_used: list[str] = []
+
+        for _ in range(max_steps):
+            response = await llm.ainvoke(conv)
+            new_msgs.append(response)
+            conv.append(response)
+
+            raw = re.sub(r"```\w*\n?", "", response.content.strip()).strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                break  # model deviated from format — treat as terminal
+
+            if parsed.get("type") != "tool_call":
+                break  # final_answer or unrecognised — exit loop
+
+            tool_name = parsed.get("tool", "")
+            tool_args = parsed.get("args", {})
+
+            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
+                        "message": f"Calling SAP: {tool_name}…"})
+            try:
+                result = await call_tool(tool_name, tool_args)
+                tools_used.append(tool_name)
+            except Exception as exc:
+                result = {"status": "error",
+                          "messages": [{"TYPE": "E", "MESSAGE": str(exc)}], "data": {}}
+
+            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
+                        "message": f"Tool returned ({tool_name}): {result.get('status')}"})
+
+            feedback = json.dumps(
+                {"tool": tool_name, "status": result.get("status"),
+                 "messages": result.get("messages", []), "data": result.get("data", {})},
+                ensure_ascii=False,
+            )
+            fb_msg = HumanMessage(content=f"Tool result:\n{feedback}")
+            new_msgs.append(fb_msg)
+            conv.append(fb_msg)
+
+        return new_msgs, tools_used
 
     def _ctx_text(ec: dict) -> str:
         """Render the uniform ErrorContext into a prompt-ready block for either depth."""
@@ -983,46 +1048,23 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             f"You are an SAP period-close error analyst.\n"
             f"Step: {step_id} | {step.get('action_type')}/{step.get('object_name')}\n"
             f"Company config: {json.dumps(state.get('company_config', {}))}\n"
-            f"Retry: {retry}/{max_ret}\n\nDomain guidance:\n{guidance}\n\n"
-            "Diagnose using available tools then respond ONLY with JSON:\n"
-            '{"action":"retry|user_input|skip","corrected_params":[]|null,'
-            '"diagnosis":"root cause","user_instructions":"steps if user_input"|null}'
+            f"Retry: {retry}/{max_ret}\n\nDomain guidance:\n{guidance}"
         )
 
         llm   = llms["analysis"]
-        tools = _make_tools(session)
-        agent = create_agent(llm, tools, system_prompt=system_prompt)
         prior = list(state.get("analysis_messages", []))
         new_messages: list = []
         try:
-            input_msgs = prior + [HumanMessage(content=f"Error context:\n{error_ctx}")]
+            input_msgs   = prior + [HumanMessage(content=f"Error context:\n{error_ctx}")]
+            tool_schema  = await _get_tool_schema()
             await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
                          "message": "Sending request to LLM…"})
-            async for update in agent.astream({"messages": input_msgs}, stream_mode="updates"):
-                # langchain.agents.create_agent names the model node "model"
-                # (langgraph's create_react_agent used "agent") — accept either.
-                if (model_update := update.get("model") or update.get("agent")) is not None:
-                    agent_msgs = model_update.get("messages", [])
-                    new_messages.extend(agent_msgs)
-                    last = agent_msgs[-1] if agent_msgs else None
-                    if last and getattr(last, "tool_calls", None):
-                        names = ", ".join(tc["name"] for tc in last.tool_calls)
-                        await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
-                                     "message": f"Calling SAP: {names}…"})
-                    else:
-                        await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
-                                     "message": "LLM reasoning complete, forming decision…"})
-                if "tools" in update:
-                    tool_msgs = update["tools"].get("messages", [])
-                    new_messages.extend(tool_msgs)
-                    names = ", ".join(m.name for m in tool_msgs if hasattr(m, "name"))
-                    await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
-                                 "message": f"Tool returned ({names}), sending to LLM…"})
-            result = {"messages": input_msgs + new_messages}
-            last_msg   = result["messages"][-1]
-            raw        = re.sub(r"```\w*\n?", "", last_msg.content.strip()).strip()
-            tools_used = [m.name for m in result["messages"]
-                          if hasattr(m, "name") and hasattr(m, "tool_call_id")]
+            new_messages, tools_used = await _run_text_react(
+                llm, _call_tool, tool_schema, system_prompt,
+                input_msgs, _emit, step_id,
+            )
+            last_msg = new_messages[-1] if new_messages else HumanMessage(content="")
+            raw      = re.sub(r"```\w*\n?", "", last_msg.content.strip()).strip()
             try:
                 parsed       = json.loads(raw)
                 action       = parsed.get("action", "user_input")
@@ -1032,7 +1074,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             except json.JSONDecodeError:
                 action       = "user_input"
                 corrected    = None
-                diagnosis    = raw[:400]
+                diagnosis    = raw[:400] or "Analysis LLM returned empty response."
                 instructions = "Analysis LLM returned non-JSON. Manual review required."
         except Exception as exc:
             logger.warning("analysis LLM not available step=%s: %s", step_id, exc)

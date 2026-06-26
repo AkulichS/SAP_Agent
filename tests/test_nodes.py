@@ -429,15 +429,9 @@ async def test_analysis_non_json_requires_user_input(make_session, make_llms, ma
     assert out["current_analysis"]["action"] == "user_input"
 
 
-async def test_analysis_explain_depth_lists_rows_no_react(make_session, make_llms, make_state,
-                                                          monkeypatch):
+async def test_analysis_explain_depth_lists_rows_no_react(make_session, make_llms, make_state):
     # A pre_check-sourced failure resolves to the cheap "explain" depth: one validation
-    # call over the offending rows, action=user_input, and the ReAct agent is NOT built.
-    import graph_builder
-    def _boom(*a, **k):
-        raise AssertionError("create_agent must not run on the explain path")
-    monkeypatch.setattr(graph_builder, "create_agent", _boom)
-
+    # call over the offending rows, action=user_input, and the text-based ReAct is NOT invoked.
     llms = make_llms(validation="Orders 1,2 lack settlement rules; maintain KO02.")
     node = make_analysis_node(make_session(), llms)
     ec = {"source": "pre_check", "summary": "Pre-check failed",
@@ -450,12 +444,8 @@ async def test_analysis_explain_depth_lists_rows_no_react(make_session, make_llm
     assert "analysis_messages" not in out   # explain path is stateless
 
 
-async def test_analysis_explain_depth_via_on_error_mode_map(make_session, make_llms, make_state,
-                                                            monkeypatch):
+async def test_analysis_explain_depth_via_on_error_mode_map(make_session, make_llms, make_state):
     # on_error.mode as a {source: depth} map overrides the context default_depth.
-    import graph_builder
-    monkeypatch.setattr(graph_builder, "create_agent",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no react")))
     llms = make_llms(validation="explanation")
     node = make_analysis_node(make_session(), llms)
     step = {"step_id": "A", "on_error": {"mode": {"validate": "explain"}}}

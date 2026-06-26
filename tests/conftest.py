@@ -25,6 +25,7 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage
 
 # Defensive: keep everything offline/deterministic even if a real key is exported.
 os.environ.setdefault("GROQ_API_KEY", "test-key")
@@ -78,6 +79,9 @@ class FakeMCPSession:
             payload = h
         return make_tool_result(payload)
 
+    async def list_tools(self):
+        return SimpleNamespace(tools=[])
+
 
 class StubBackedSession:
     """Session that dispatches to the real mcp_server tool functions.
@@ -92,6 +96,9 @@ class StubBackedSession:
         fn = getattr(mcp_server, name)
         payload = fn(**(arguments or {}))
         return make_tool_result(payload)
+
+    async def list_tools(self):
+        return SimpleNamespace(tools=[])
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +118,7 @@ class FakeLLM:
     async def ainvoke(self, messages):
         self.calls.append(messages)
         text = self.content(messages) if callable(self.content) else self.content
-        return SimpleNamespace(content=text)
+        return AIMessage(content=text)
 
 
 # ---------------------------------------------------------------------------
@@ -158,17 +165,15 @@ def make_state():
 
 @pytest.fixture
 def patch_react_agent(monkeypatch):
-    """Replace graph_builder.create_agent with a fake whose astream yields
-    a single model message carrying `content` (typically a JSON decision)."""
-    from langchain_core.messages import AIMessage
+    """Make the analysis FakeLLM return a deterministic JSON decision.
 
+    Patches FakeLLM.ainvoke so _run_text_react immediately receives `content`
+    as the model response, parses it as a final_answer, and exits the loop.
+    """
     def _patch(content: str):
-        class _Agent:
-            async def astream(self, _inp, stream_mode=None):
-                yield {"model": {"messages": [AIMessage(content=content)]}}
-
-        monkeypatch.setattr(graph_builder, "create_agent",
-                            lambda *a, **k: _Agent())
+        async def _fake_ainvoke(self, messages):
+            return AIMessage(content=content)
+        monkeypatch.setattr(FakeLLM, "ainvoke", _fake_ainvoke)
     return _patch
 
 
