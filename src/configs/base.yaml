@@ -210,11 +210,84 @@ steps:
         operator to maintain settlement rules (KO02) for these orders before KO8G —
         then retry the pre-check, or skip the step if intentional.
       analysis_guidance: |
-        KO8G settles CO internal orders for controlling area {{controlling_area}}.
-        Common issues:
-        - Missing settlement rule: check AUFK (order master) and KO03 for order details.
-        - COSS should show secondary cost postings after successful settlement.
-        Use TOOL_READ_TABLE: AUFK WHERE KOKRS = '{{controlling_area}}' AND KOSTL IS INITIAL.
+        ## Context
+        KO8G performs periodic settlement of CO internal orders for controlling area {{controlling_area}},
+        fiscal year {{fiscal_year}}, period {{period}}.
+        After the settlement run, validation detected orders that were NOT settled due to errors.
+        Your task: diagnose the root cause for each failed order and provide clear resolution steps.
+
+        ## Diagnostic Procedure (follow steps in order)
+
+        ### Step 1: Retrieve order master data
+        Use TOOL_READ_TABLE to read from table AUFK with the following fields:
+          AUFNR, AUART, AUTYP, BUKRS, KOKRS, WERKS, LOEKZ, PHAS0, PHAS1, PHAS2, PHAS3
+        WHERE AUFNR IN (<list of failed order numbers from Errors section>)
+
+        **Order number formatting rules:**
+        - If the order number contains ONLY digits: pad with leading zeros to 12 characters.
+          Examples: "20001" → "000000020001", "123000" → "000000123000"
+        - If the order number contains ANY letters: use it exactly as provided.
+          Examples: "F0K01023" → "F0K01023"
+
+        ### Step 2: Check order status (most common cause)
+        Evaluate the status fields for each order:
+
+        | PHAS1 | PHAS2 | PHAS3 | LOEKZ | System Status | Settlement allowed? |
+        |-------|-------|-------|-------|---------------|---------------------|
+        | 1     | 0     | 0     | (empty) | REL (Released / ТЗКР) | ✅ YES |
+        | 0     | 0     | 0     | (empty) | CRTD (Created / ТЗАК) | ❌ NO — order not yet released |
+        | 1     | 1     | 0     | (empty) | TECO (Technically closed / ТКЗК) | ❌ NO — technically closed |
+        | any   | any   | 1     | (empty) | CLSD (Closed / ЗАКР) | ❌ NO — order is closed |
+        | any   | any   | any   | X     | DLFL (Deletion flag / УДАЛ) | ❌ NO — marked for deletion |
+
+        Additionally, check if LOEKZ = 'X' (deletion flag is set) — such orders cannot be settled.
+
+        Note on LKD (ДЕБЛ / Locked): A locked order may or may not allow settlement depending on
+        configuration. If PHAS1=1 and PHAS2=0 and PHAS3=0 and LOEKZ is empty, but the order still
+        fails, the cause is likely elsewhere — proceed to Step 3.
+
+        ### Step 3: Check controlling area assignment
+        Verify that KOKRS in AUFK matches the controlling area of the settlement run: {{controlling_area}}.
+        If KOKRS differs, the order belongs to another controlling area and will not be included in this run.
+
+        ### Step 4: Check settlement rule existence
+        Use TOOL_READ_TABLE to read from table COBRB with fields:
+          OBJNR, BURESSION, KONTY, EMPGE, PROZS
+        WHERE OBJNR IN (<construct OBJNR from order numbers: prefix "OR" + AUFNR as stored in AUFK>)
+
+        - If NO records found → settlement rule is missing. User must create it via KO02 → Settlement Rule tab.
+        - If records found but PROZS values do not sum to 100 → settlement rule is incomplete.
+
+        ### Step 5: Cross-reference with error messages
+        Match your diagnostic findings with the specific error messages returned by KO8G (from the Errors section).
+        Use the error code reference list (see system prompt) to confirm the root cause.
+
+        ## Output Format
+        For each failed order, provide:
+
+        Order: <AUFNR>
+        Order Type: <AUART>
+        Company Code: <BUKRS>
+        Status: <decoded status in both EN and RU>
+        Root Cause: <clear description>
+        KO8G Error: <original error message/code if available>
+        Recommendation: <specific action steps>
+
+        Group orders by root cause when multiple orders share the same issue. 
+        ## Important Rules 
+        - Always start with Step 1. Do NOT skip directly to assumptions. 
+        - If TOOL_READ_TABLE returns no data for an order number, flag it: the order may not exist or the number may be formatted incorrectly. 
+        - Do NOT guess. If you cannot determine the cause from available data, say so explicitly and suggest manual checks (e.g., "Check transaction KO03 for order details"). 
+        - Provide responses in the same language as the user's query.
+        
+# KO8G settles CO internal orders for controlling area {{controlling_area}}.
+# Common issues:
+# - Missing settlement rule: check AUFK (order master) and KO03 for order details.
+# - COSS should show secondary cost postings after successful settlement.
+# Use TOOL_READ_TABLE: AUFNR, AUART, AUTYP, BUKRS, WERKS, ASTKZ, ASTNR, PHAS0, PHAS1, PHAS2, PHAS3
+# table AUFK WHERE AUFNR IN (strictly copy orders number from Errors section, i.e. "123000", "f3456")
+# if orders number contain only digits add leading 0, i.e. 0000000 & 20001 -> 000000020001,
+# the length must be 12 characters, but if number also contain chars, i.e. F0K01023 then don't change it.
 
 ################################ 3+4 — S_ALR reports (parallel) #################
   - step_id:     "S_ALR_87013127"
