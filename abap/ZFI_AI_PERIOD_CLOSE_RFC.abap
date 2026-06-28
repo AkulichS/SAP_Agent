@@ -753,14 +753,14 @@ FORM ztool_read_table
            ev_result_json TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: ls_params   TYPE ty_zai_check_params.
-  DATA: lt_options  TYPE STANDARD TABLE OF rfc_db_opt,
-        ls_option   TYPE rfc_db_opt.
-  DATA: lt_rfc_flds TYPE STANDARD TABLE OF rfc_db_fld,
-        ls_rfc_fld  TYPE rfc_db_fld.
-  DATA: lt_rfc_data TYPE STANDARD TABLE OF tab512,
-        ls_rfc_row  TYPE tab512.
-  DATA: lt_field_names TYPE STANDARD TABLE OF string.
+  DATA: ls_params   TYPE ty_zai_check_params,
+        lt_options  TYPE STANDARD TABLE OF rfc_db_opt,
+        ls_option   TYPE rfc_db_opt,
+        lt_rfc_flds TYPE STANDARD TABLE OF rfc_db_fld,
+        ls_rfc_fld  TYPE rfc_db_fld,
+        lt_rfc_data TYPE STANDARD TABLE OF tab512,
+        ls_rfc_row  TYPE tab512,
+        lt_field_names TYPE STANDARD TABLE OF string.
   DATA: lv_offset   TYPE i,
         lv_len      TYPE i,
         lv_val      TYPE string,
@@ -768,12 +768,23 @@ FORM ztool_read_table
         lv_rows_j   TYPE string,
         lv_sep      TYPE string,
         lv_fsep     TYPE string,
-        lv_msg      TYPE string.
+        lv_msg      TYPE string,
+        lv_table    TYPE DD02L-TABNAME.
+
+  "--- Added for WHERE processing ---
+  DATA: lv_where    TYPE string,
+        lt_words    TYPE STANDARD TABLE OF string,
+        lv_word     TYPE string,
+        lv_line     TYPE string,
+        lv_try      TYPE string.
 
   "--- Parse query params ---
   /ui2/cl_json=>deserialize(
     EXPORTING json = iv_params_json
     CHANGING  data = ls_params ).
+
+  "Trim trailing spaces from TYPE C fields after JSON deserialization
+  CONDENSE ls_params-table.
 
   IF ls_params-max_rows = 0.
     ls_params-max_rows = 1000.
@@ -788,15 +799,53 @@ FORM ztool_read_table
   ENDLOOP.
 
   "--- Build WHERE clause ---
+  "    RFC_READ_TABLE requires single quotes for string literals.
+  "    LLM agents typically generate double quotes, so we replace them.
+  "    Also RFC_READ_TABLE OPTIONS table accepts max 72 chars per line,
+  "    so long WHERE strings must be split into chunks.
+
   IF ls_params-where IS NOT INITIAL.
-    ls_option-text = ls_params-where.
-    APPEND ls_option TO lt_options.
+    lv_where = ls_params-where.
+
+    "Step 1: Replace double quotes with single quotes e.g. AUFNR IN ("1","2") -> AUFNR IN ('1','2')
+    REPLACE ALL OCCURRENCES OF '"' IN lv_where WITH |'|.
+
+    "Step 2: Split WHERE into words and pack them into OPTIONS lines of max 72 characters each.
+    SPLIT lv_where AT ' ' INTO TABLE lt_words.
+
+    CLEAR lv_line.
+    LOOP AT lt_words INTO lv_word.
+
+      IF lv_line IS INITIAL.
+        lv_try = lv_word.
+      ELSE.
+        CONCATENATE lv_line lv_word INTO lv_try SEPARATED BY SPACE.
+      ENDIF.
+
+      IF strlen( lv_try ) <= 72.
+        lv_line = lv_try.               " Word fits into current line - keep building
+      ELSE.
+        ls_option-text = lv_line.
+        APPEND ls_option TO lt_options. " Word does not fit - append current line to OPTIONS
+        lv_line = lv_word.              " Start new line with current word
+      ENDIF.
+
+    ENDLOOP.
+
+    "Flush last line if not empty
+    IF lv_line IS NOT INITIAL.
+      ls_option-text = lv_line.
+      APPEND ls_option TO lt_options.
+    ENDIF.
+
   ENDIF.
+
+  lv_table = ls_params-table.
 
   "--- Execute RFC_READ_TABLE ---
   CALL FUNCTION 'RFC_READ_TABLE'
     EXPORTING
-      query_table          = ls_params-table
+      query_table          = lv_table
       rowcount             = ls_params-max_rows
       no_data              = ' '
       delimiter            = '|'      "Field delimiter in output rows
@@ -817,19 +866,19 @@ FORM ztool_read_table
     WHEN 0.
       ev_status = lc_success.
     WHEN 1.
-      ev_status  = lc_error.
+      ev_status = lc_error.
       lv_msg = 'Table not available: ' && ls_params-table.
       PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
       RETURN.
     WHEN 2.
-      ev_status  = lc_warning.
+      ev_status = lc_warning.
       lv_msg = 'Table ' && ls_params-table && ' is empty for given criteria'.
       PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
       ev_result_json = '{"table":"' && ls_params-table &&
                        '","data":[],"count":0}'.
       RETURN.
     WHEN OTHERS.
-      ev_status  = lc_error.
+      ev_status = lc_error.
       lv_msg = 'RFC_READ_TABLE error on ' && ls_params-table && ', subrc=' && sy-subrc.
       PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
       RETURN.
@@ -841,7 +890,7 @@ FORM ztool_read_table
   lv_sep    = ''.
 
   LOOP AT lt_rfc_data INTO ls_rfc_row.
-    DATA: lt_values TYPE STANDARD TABLE OF string,
+    DATA: lt_values  TYPE STANDARD TABLE OF string,
           lv_rowjson TYPE string.
 
     SPLIT ls_rfc_row AT '|' INTO TABLE lt_values.
@@ -876,7 +925,7 @@ FORM ztool_read_table
   DATA: lv_cnt TYPE string.
   lv_cnt = lines( lt_rfc_data ).
 
-  lv_msg  = 'Read ' && lv_cnt && ' row(s) from ' && ls_params-table.
+  lv_msg = |Read { lv_cnt } row(s) from { ls_params-table }|.
   PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
 
   ev_result_json = '{"table":"' && ls_params-table && '"' &&

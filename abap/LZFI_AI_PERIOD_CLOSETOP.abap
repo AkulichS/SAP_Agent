@@ -43,7 +43,7 @@ TYPES:
     table    TYPE string,
     where    TYPE string,  "WHERE clause e.g. "BUKRS EQ '1000' AND GJAHR EQ '2024'"
     fields   TYPE string,  "Comma-separated field list e.g. "KOKRS,GJAHR,LFMON"
-    max_rows TYPE i,       "Row limit (default 100)
+    max_rows TYPE int4,    "Row limit (default 100)
   END OF ty_zai_check_params,
 
   "--- FM/BAPI call params ---
