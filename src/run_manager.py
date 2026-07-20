@@ -22,9 +22,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
-
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -159,9 +156,10 @@ class RunManager:
                 send=send,
                 msg_queue=run.msg_queue,
                 period_config_path=config_path,
-                mcp_config_path="mcp_config.yaml",
+                mcp_config_path="configs/mcp_config.yaml",
                 period=run.period,
                 fiscal_year=run.fiscal_year,
+                company_code=run.company_code,
             )
         except asyncio.CancelledError:
             run.status = "idle"
@@ -190,8 +188,8 @@ class RunManager:
 
             # Compute rollback list from server-side step_results BEFORE reset
             try:
-                from config import load_config as _load_config
-                _cfg = _load_config(config_path, period=run.period, fiscal_year=run.fiscal_year)
+                from config_store import load_effective_config
+                _cfg = load_effective_config(company_code, period=run.period, fiscal_year=run.fiscal_year)
                 steps_order = [s["step_id"] for s in _cfg.get("steps", [])]
             except Exception as exc:
                 logger.error("rollback_start: cannot load config: %s", exc)
@@ -320,11 +318,12 @@ class RunManager:
                 send=send,
                 msg_queue=run.msg_queue,
                 period_config_path=config_path,
-                mcp_config_path="mcp_config.yaml",
+                mcp_config_path="configs/mcp_config.yaml",
                 start_from_step=start_from_step,
                 steps_to_rollback=steps_to_rollback,
                 period=run.period,
                 fiscal_year=run.fiscal_year,
+                company_code=run.company_code,
             )
         except asyncio.CancelledError:
             run.status = "idle"
@@ -501,17 +500,24 @@ def get_run_manager() -> RunManager:
 # Company registry helper
 # ---------------------------------------------------------------------------
 
-_COMPANIES_PATH = Path(__file__).parent / "companies.yaml"
-_companies_cache: list[dict] | None = None
-
-
 def load_companies(force_reload: bool = False) -> list[dict]:
-    global _companies_cache
-    if _companies_cache is None or force_reload:
-        with open(_COMPANIES_PATH, encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        _companies_cache = data.get("companies", [])
-    return _companies_cache
+    """The company registry, sourced from the DB (config_store) — companies are managed in
+    the admin UI, so one created there shows up immediately and a deleted one stays gone.
+    `config_file` is retained for backward-compat but is no longer used at runtime — the
+    run path is keyed by company_code (see graph_builder._resolve_period_cfg).
+    `force_reload` is accepted for API compatibility; the DB path is always fresh."""
+    try:
+        from config_store import get_config_store
+        reg = get_config_store().list_registry()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("registry lookup failed: %s", exc)
+        return []
+    return [
+        {"code": c["code"],
+         "display_name": c.get("display_name") or c["code"],
+         "config_file": f"configs/period_close_{c['code']}.yaml"}
+        for c in reg
+    ]
 
 
 def get_company(code: str) -> dict | None:

@@ -1,6 +1,0 @@
-company_config:
-  company_code:     "RU47"
-  controlling_area: "X500"
-  currency:         "RUB"
-
-# steps: omitted — all steps from base.yaml run in base order.

@@ -80,7 +80,8 @@ def test_me_requires_auth(client):
     assert client.get("/api/me").status_code == 401
 
 
-def test_me_with_session(client):
+def test_me_with_session(client, settings_store):
+    settings_store.create_company("RU06", "Company A", user="admin")
     _session_cookie(client, username="alice", company_codes=["RU06"])
     r = client.get("/api/me")
     assert r.status_code == 200
@@ -93,12 +94,14 @@ def test_companies_requires_auth(client):
     assert client.get("/api/companies").status_code == 401
 
 
-def test_companies_lists_only_authorized(client):
+def test_companies_lists_only_authorized(client, settings_store):
+    for code in ("RU06", "RU47"):
+        settings_store.create_company(code, code, user="admin")
     _session_cookie(client, company_codes=["RU06"])
     r = client.get("/api/companies")
     assert r.status_code == 200
     codes = [c["code"] for c in r.json()]
-    assert codes == ["RU06"]          # not RU47 / RU72
+    assert codes == ["RU06"]          # registered, but not assigned to this user → no RU47
     assert "run_status" in r.json()[0]
 
 
@@ -106,6 +109,181 @@ def test_logout_clears_cookie(client):
     _session_cookie(client)
     r = client.post("/api/logout")
     assert r.status_code == 200 and r.json()["ok"] is True
+
+
+# ===========================================================================
+# REST: admin settings (per-company config deltas)
+# ===========================================================================
+
+import config_store
+from config_store import ConfigStore
+
+
+# Minimal base step library — the repo no longer ships configs/base.yaml as a seed
+# file for a fresh DB, so the fixture seeds the DB tier directly instead.
+_SETTINGS_BASE_STEPS = [
+    {
+        "step_id": "KO8G",
+        "action_type": "SUBMIT",
+        "async": True,
+        "test_run": True,
+        "validate": {"keyword": {"source": "rows"}},
+    },
+    {
+        "step_id": "CO88",
+        "action_type": "SUBMIT",
+        "async": True,
+        "test_run": True,
+    },
+]
+
+
+@pytest.fixture
+def settings_store(tmp_path, monkeypatch):
+    """Point the process-wide store singleton at a throwaway DB, pre-seeded with a
+    minimal base step library (base version 1 after seeding)."""
+    st = ConfigStore(tmp_path / "cfg.db")
+    st.save_base({"defaults": {"max_retries": 3}}, _SETTINGS_BASE_STEPS,
+                expected_version=0, user="fixture")
+    monkeypatch.setattr(config_store, "_store", st)
+    return st
+
+
+def _admin(client, codes=("RU06",)):
+    _session_cookie(client, username="admin", role="admin", company_codes=list(codes))
+
+
+def _ko8g_field(data, path):
+    ko8g = next(s for s in data["steps"] if s["step_id"] == "KO8G")
+    return next(f for f in ko8g["fields"] if f["path"] == path)
+
+
+def test_settings_requires_admin(client, settings_store):
+    _session_cookie(client, role="operator", company_codes=["RU06"])
+    assert client.get("/api/settings/RU06").status_code == 403
+
+
+def test_settings_company_authz(client, settings_store):
+    _admin(client, codes=["RU06"])
+    assert client.get("/api/settings/RU47").status_code == 403      # unknown + unassigned
+
+
+def test_settings_reachable_for_company_created_in_registry(client, settings_store):
+    """An admin who creates a company must be able to configure it, even though the new
+    code is in nobody's users.yaml company_codes yet."""
+    _admin(client, codes=["RU06"])
+    assert client.post("/api/registry/companies",
+                       json={"code": "RU99", "display_name": "New Co"}).status_code == 200
+    assert client.get("/api/settings/RU99").status_code == 200
+    r = client.put("/api/settings/RU99", json={"version": 0, "override": {"KO8G": {"test_run": False}},
+                                               "run_context": {"currency": "RUB"}})
+    assert r.status_code == 200
+    assert r.json()["override"] == {"KO8G": {"test_run": False}}
+
+
+def test_settings_operator_still_blocked_for_registered_company(client, settings_store):
+    """Registry membership relaxes the company check for admins only — not the role check."""
+    settings_store.create_company("RU99", "New Co", user="admin")
+    _session_cookie(client, role="operator", company_codes=["RU99"])
+    assert client.get("/api/settings/RU99").status_code == 403
+
+
+def test_settings_get_put_reset_roundtrip(client, settings_store):
+    _admin(client, codes=["RU06"])
+    data = client.get("/api/settings/RU06").json()
+    assert data["version"] == 0
+    assert _ko8g_field(data, "test_run")["overridden"] is False
+
+    r = client.put("/api/settings/RU06", json={
+        "version": 0,
+        "override": {"KO8G": {"test_run": False}},
+        "run_context": {"currency": "RUB"},
+    })
+    assert r.status_code == 200
+    data = r.json()
+    assert data["version"] == 1
+    assert _ko8g_field(data, "test_run")["overridden"] is True
+
+    # stale version → 409
+    assert client.put("/api/settings/RU06",
+                      json={"version": 0, "override": {}}).status_code == 409
+
+    # reset that step → back to inherited
+    r = client.post("/api/settings/RU06/reset", json={"version": 1, "step_id": "KO8G"})
+    assert r.status_code == 200
+    assert _ko8g_field(r.json(), "test_run")["overridden"] is False
+
+
+def test_settings_put_rejects_invalid(client, settings_store):
+    _admin(client, codes=["RU06"])
+    r = client.put("/api/settings/RU06", json={
+        "version": 0,
+        "override": {"KO8G": {"validate": {"keyword": {"source": "BOGUS"}}}},
+    })
+    assert r.status_code == 400
+
+
+# ===========================================================================
+# REST: base tier + form-schema + registry
+# ===========================================================================
+
+def test_form_schema_requires_admin(client, settings_store):
+    _session_cookie(client, role="operator", company_codes=["RU06"])
+    assert client.get("/api/settings/form-schema").status_code == 403
+
+
+def test_form_schema_returns_sections(client, settings_store):
+    _admin(client)
+    d = client.get("/api/settings/form-schema").json()
+    assert [s["key"] for s in d["sections"]][0] == "step"
+
+
+def test_base_get_put_history_roundtrip(client, settings_store):
+    _admin(client)
+    data = client.get("/api/settings/base").json()
+    assert data["version"] == 1          # settings_store seeds the base tier once
+    n = len(data["steps"])
+    assert n > 0 and "defaults" in data["globals"]
+
+    # drop a step + edit a global, save
+    steps = [s for s in data["steps"] if s["step_id"] != "CO88"]
+    globals_ = {**data["globals"], "defaults": {**data["globals"].get("defaults", {}), "max_retries": 9}}
+    r = client.put("/api/settings/base", json={"version": 1, "globals": globals_, "steps": steps})
+    assert r.status_code == 200
+    saved = r.json()
+    assert saved["version"] == 2
+    assert len(saved["steps"]) == n - 1
+    assert saved["globals"]["defaults"]["max_retries"] == 9
+
+    # stale version → 409
+    assert client.put("/api/settings/base",
+                      json={"version": 1, "globals": {}, "steps": []}).status_code == 409
+
+    hist = client.get("/api/settings/base/history").json()
+    assert [h["version"] for h in hist] == [2, 1]   # fixture seed (v1) + this test's save (v2)
+
+
+def test_base_put_rejects_invalid_step(client, settings_store):
+    _admin(client)
+    r = client.put("/api/settings/base",
+                   json={"version": 0, "globals": {}, "steps": [{"step_id": "X", "action_type": "NOPE"}]})
+    assert r.status_code == 400
+
+
+def test_registry_crud(client, settings_store):
+    _admin(client)
+    assert client.get("/api/registry/companies").json() == []
+    r = client.post("/api/registry/companies", json={"code": "RU99", "display_name": "New Co"})
+    assert r.status_code == 200
+    assert {c["code"] for c in r.json()} == {"RU99"}
+    # duplicate → 400
+    assert client.post("/api/registry/companies", json={"code": "RU99"}).status_code == 400
+    # rename
+    r = client.put("/api/registry/companies/RU99", json={"display_name": "Renamed"})
+    assert next(c for c in r.json() if c["code"] == "RU99")["display_name"] == "Renamed"
+    # delete
+    r = client.request("DELETE", "/api/registry/companies/RU99")
+    assert r.json() == []
 
 
 # ===========================================================================
@@ -198,8 +376,8 @@ def test_ws_dashboard_start_streams_tagged_events(client, monkeypatch):
 # ===========================================================================
 
 def test_ws_rollback_and_restart_streams_rollback_then_rerun(client, monkeypatch):
-    from config import load_config
-    start_from = load_config("configs/period_close_RU06.yaml")["steps"][0]["step_id"]
+    from config_store import load_effective_config
+    start_from = load_effective_config("RU06")["steps"][0]["step_id"]
 
     async def fake_rollback(send, msg_queue, start_from_step, steps_to_rollback, **_kw):
         await send({"type": "rollback_start", "from_step": start_from_step})

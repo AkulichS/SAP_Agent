@@ -1,0 +1,770 @@
+{
+  "$defs": {
+    "ActionBlock": {
+      "additionalProperties": false,
+      "description": "A runnable action used by pre_check and validate.run.",
+      "properties": {
+        "action_type": {
+          "default": "TOOLS",
+          "enum": [
+            "SUBMIT",
+            "FM",
+            "BAPI",
+            "BDC",
+            "TOOLS"
+          ],
+          "title": "Action Type",
+          "type": "string"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Object Name"
+        },
+        "async": {
+          "default": false,
+          "title": "Async",
+          "type": "boolean"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Param"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Params"
+        }
+      },
+      "title": "ActionBlock",
+      "type": "object"
+    },
+    "Analysis": {
+      "additionalProperties": true,
+      "description": "Structured diagnose prompt; free-form (role/tools/goal/context_template/instructions/\u2026).",
+      "properties": {
+        "goal": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Goal",
+          "widget": "textarea"
+        },
+        "context_template": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context Template",
+          "widget": "textarea"
+        },
+        "instructions": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Instructions",
+          "widget": "textarea"
+        }
+      },
+      "title": "Analysis",
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Field"
+        },
+        "operator": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Operator"
+        },
+        "value": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "select": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Select"
+        },
+        "on_pass": {
+          "default": "execute",
+          "title": "On Pass",
+          "type": "string"
+        },
+        "on_fail": {
+          "default": "analyse",
+          "title": "On Fail",
+          "type": "string"
+        }
+      },
+      "title": "Comparison",
+      "type": "object"
+    },
+    "KeywordCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "ok_patterns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Ok Patterns",
+          "type": "array"
+        },
+        "error_patterns": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Error Patterns",
+          "type": "array"
+        },
+        "source": {
+          "default": "spool",
+          "enum": [
+            "spool",
+            "rows",
+            "messages"
+          ],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "title": "KeywordCheck",
+      "type": "object"
+    },
+    "LlmCheck": {
+      "additionalProperties": true,
+      "properties": {
+        "prompt": {
+          "default": "",
+          "title": "Prompt",
+          "type": "string",
+          "widget": "textarea"
+        },
+        "pass_values": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Pass Values"
+        },
+        "system_prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "System Prompt",
+          "widget": "textarea"
+        },
+        "max_spool_lines": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Spool Lines"
+        }
+      },
+      "title": "LlmCheck",
+      "type": "object"
+    },
+    "OnError": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mode"
+        },
+        "explain_prompt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Explain Prompt",
+          "widget": "textarea"
+        },
+        "analysis": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Analysis"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "analysis_guidance": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Analysis Guidance",
+          "widget": "textarea"
+        }
+      },
+      "title": "OnError",
+      "type": "object"
+    },
+    "Param": {
+      "additionalProperties": false,
+      "properties": {
+        "selname": {
+          "label": "Select name",
+          "title": "Selname",
+          "type": "string",
+          "widget": "text"
+        },
+        "kind": {
+          "default": "P",
+          "label": "Kind",
+          "title": "Kind",
+          "type": "string",
+          "widget": "text"
+        },
+        "low": {
+          "default": "",
+          "label": "Low",
+          "title": "Low",
+          "type": "string",
+          "widget": "text"
+        },
+        "high": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "label": "High",
+          "title": "High",
+          "widget": "text"
+        }
+      },
+      "required": [
+        "selname"
+      ],
+      "title": "Param",
+      "type": "object"
+    },
+    "PreCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "group": "pre_check",
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "mode": {
+          "default": "skip",
+          "enum": [
+            "skip",
+            "comparison",
+            "llm"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "action_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "SUBMIT",
+                "FM",
+                "BAPI",
+                "BDC",
+                "TOOLS"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Type"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Object Name"
+        },
+        "async": {
+          "default": false,
+          "title": "Async",
+          "type": "boolean"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Param"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Params"
+        },
+        "comparison": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Comparison"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "llm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LlmCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "PreCheck",
+      "type": "object"
+    },
+    "Rollback": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "action_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "SUBMIT",
+                "FM",
+                "BAPI",
+                "BDC",
+                "TOOLS"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Type"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Object Name"
+        },
+        "async": {
+          "default": false,
+          "title": "Async",
+          "type": "boolean"
+        },
+        "test_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Run"
+        },
+        "poll_timeout_sec": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Poll Timeout Sec"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Param"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Params"
+        }
+      },
+      "title": "Rollback",
+      "type": "object"
+    },
+    "Validate": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "keyword",
+          "enum": [
+            "keyword",
+            "llm"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "run": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActionBlock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "keyword": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeywordCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "llm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LlmCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Validate",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "step_id": {
+      "title": "Step Id",
+      "type": "string"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "step",
+      "title": "Description"
+    },
+    "group": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "step",
+      "title": "Group"
+    },
+    "action_type": {
+      "default": "SUBMIT",
+      "enum": [
+        "SUBMIT",
+        "FM",
+        "BAPI",
+        "BDC",
+        "TOOLS"
+      ],
+      "group": "step",
+      "title": "Action Type",
+      "type": "string"
+    },
+    "object_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "step",
+      "title": "Object Name"
+    },
+    "async": {
+      "default": true,
+      "group": "step",
+      "title": "Async",
+      "type": "boolean"
+    },
+    "test_run": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "step",
+      "title": "Test Run"
+    },
+    "poll_timeout_sec": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "step",
+      "title": "Poll Timeout Sec"
+    },
+    "enabled": {
+      "default": true,
+      "group": "step",
+      "title": "Enabled",
+      "type": "boolean"
+    },
+    "params": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/Param"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "params",
+      "title": "Params"
+    },
+    "pre_check": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PreCheck"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "pre_check"
+    },
+    "validate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Validate"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "validate"
+    },
+    "rollback": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Rollback"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "rollback"
+    },
+    "on_error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OnError"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "group": "on_error"
+    }
+  },
+  "required": [
+    "step_id"
+  ],
+  "title": "Step",
+  "type": "object"
+}

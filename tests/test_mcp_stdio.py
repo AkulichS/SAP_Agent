@@ -25,7 +25,7 @@ async def test_mcp_server_launches_and_lists_tools(monkeypatch, tmp_path):
     # Run from an unrelated CWD to prove the launch doesn't depend on it.
     monkeypatch.chdir(tmp_path)
     cfg = yaml.safe_load(
-        (Path(graph_builder.__file__).parent / "mcp_config.yaml").read_text())
+        (Path(graph_builder.__file__).parent / "configs" / "mcp_config.yaml").read_text())
 
     async def _connect():
         async with graph_builder._build_cm(cfg) as (read, write):

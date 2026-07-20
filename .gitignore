@@ -26,3 +26,7 @@ __pycache__/
 .coverage.*
 htmlcov/
 .pytest_cache/
+
+# Config delta store (per-deployment tenant data)
+config_store.db
+config_store.db-*

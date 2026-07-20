@@ -1,5 +1,5 @@
 # SAP Period Close — user registry
-# Passwords: Ivanov123 / Petrova123 / Sidorov123 / Admin123
+# Passwords: Ivanov123 / Petrova123 / Sidorov123 / admin: 123
 # Re-hash with: python auth.py <plain_password>
 
 users:
@@ -10,7 +10,7 @@ users:
     company_codes: ["RU72", "RU06"]
 
   - username: admin
-    password_hash: "$2b$12$UIwBmhW7MDWPo9NC9l8fPOr8ZtfyXfHozjw6SFwKRFuBdIBoHszfq"
+    password_hash: "$2b$12$b.lh/IBxs9e9fN.pjpcARetEDy46JyIVKSgwNyY/kMV5KN05M2oqa"
     display_name: "Administrator"
     role: admin
-    company_codes: ["RU06", "RU07", "RU08", "RU09", "RU10"]
+    company_codes: ["RU06", "RU72", "RU47"]

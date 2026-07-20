@@ -6,11 +6,11 @@
             "type": "debugpy",
             "request": "launch",
             "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
-            "program": "${workspaceFolder}/config.py",
+            "program": "${workspaceFolder}/src/config.py",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env"
+            "cwd": "${workspaceFolder}/src",
+            "envFile": "${workspaceFolder}/src/.env"
         },
         {
             "name": "Debug: web_app (uvicorn)",
@@ -18,22 +18,22 @@
             "request": "launch",
             "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
             "module": "uvicorn",
-            "args": ["web_app:app", "--host", "0.0.0.0", "--port", "8080"],
+            "args": ["web_app:app", "--host", "0.0.0.0", "--port", "8000"],
             "console": "integratedTerminal",
             "justMyCode": false,
-            "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env"
+            "cwd": "${workspaceFolder}/src",
+            "envFile": "${workspaceFolder}/src/.env"
         },
         {
             "name": "Debug: graph_builder (CLI)",
             "type": "debugpy",
             "request": "launch",
             "python": "C:\\Users\\Akulich_SA\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
-            "program": "${workspaceFolder}/graph_builder.py",
+            "program": "${workspaceFolder}/src/graph_builder.py",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "cwd": "${workspaceFolder}",
-            "envFile": "${workspaceFolder}/.env"
+            "cwd": "${workspaceFolder}/src",
+            "envFile": "${workspaceFolder}/src/.env"
         }
     ]
 }

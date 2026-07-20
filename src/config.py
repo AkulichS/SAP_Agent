@@ -13,6 +13,9 @@ import yaml
 from langchain_openai import ChatOpenAI
 
 SERVERS_DIR = Path(__file__).parent / "tools"
+CONFIGS_DIR = Path(__file__).parent / "configs"
+DB_DIR = Path(__file__).parent / "db"
+DEFAULT_CHECKPOINT_DB = DB_DIR / "period_close_checkpoints.db"
 
 # ---------------------------------------------------------------------------
 # Provider registry
@@ -139,6 +142,89 @@ def _build_steps(base_steps: list[dict], company_steps: list[dict] | None) -> li
 
 
 # ---------------------------------------------------------------------------
+# Base layer: base.yaml globals + steps/*.yaml + externalized prompts/*.md
+# ---------------------------------------------------------------------------
+
+def _inline_prompt_files(node, base_dir: Path) -> None:
+    """Recursively replace any '<name>_file' string value with the referenced file's
+    text under '<name>', dropping the '_file' pointer. Paths are resolved relative to
+    the configs dir, so a step's `instructions_file: prompts/KO8G/diagnose.md` becomes
+    `instructions: <file contents>` — downstream code sees a plain string prompt."""
+    if isinstance(node, dict):
+        for key in list(node.keys()):
+            val = node[key]
+            if key.endswith("_file") and isinstance(val, str):
+                node[key[: -len("_file")]] = (base_dir / val).read_text(encoding="utf-8")
+                del node[key]
+            else:
+                _inline_prompt_files(val, base_dir)
+    elif isinstance(node, list):
+        for item in node:
+            _inline_prompt_files(item, base_dir)
+
+
+def _assemble_steps_from_dir(steps_dir: Path, step_order, base_dir: Path) -> list[dict]:
+    """Load steps/*.yaml, ordered by step_order (alphabetical fallback). A step_id in
+    step_order with no matching file is skipped; files not listed in step_order are
+    appended after the ordered ones so nothing is silently lost."""
+    files = {p.stem: p for p in steps_dir.glob("*.yaml")}
+    order = list(step_order) if step_order else sorted(files)
+    order += [sid for sid in sorted(files) if sid not in order]
+    steps: list[dict] = []
+    for sid in order:
+        path = files.get(sid)
+        if path is None:
+            continue
+        step = yaml.safe_load(path.read_text(encoding="utf-8"))
+        _inline_prompt_files(step, base_dir)
+        steps.append(step)
+    return steps
+
+
+def _config_signature(base_path: Path) -> tuple:
+    """mtime fingerprint of base.yaml + steps/*.yaml + prompts/**/*.md for cache invalidation."""
+    base_dir = base_path.parent
+    paths = [base_path]
+    steps_dir, prompts_dir = base_dir / "steps", base_dir / "prompts"
+    if steps_dir.is_dir():
+        paths += steps_dir.glob("*.yaml")
+    if prompts_dir.is_dir():
+        paths += prompts_dir.rglob("*.md")
+    return tuple(sorted((str(p), p.stat().st_mtime_ns) for p in paths))
+
+
+_base_cache: dict = {"sig": None, "data": None}
+
+
+def load_base_config(base_path: str | Path | None = None) -> dict:
+    """Assemble the base (product) config: base.yaml globals (defaults, llm_profiles,
+    analysis_defaults, step_order) plus the step library.
+
+    Steps come from `steps/*.yaml` (ordered by `step_order`) when that directory exists;
+    otherwise from an inline `steps:` list in base.yaml (legacy / test fixtures). Any
+    `*_file` prompt references are inlined to text. Result is cached by file mtimes."""
+    base_path = Path(base_path) if base_path else CONFIGS_DIR / "base.yaml"
+    sig = _config_signature(base_path)
+    if _base_cache["sig"] == sig and _base_cache["data"] is not None:
+        return copy.deepcopy(_base_cache["data"])
+
+    base = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
+    base_dir = base_path.parent
+    steps = base.get("steps")
+    if steps:
+        _inline_prompt_files(steps, base_dir)
+    else:
+        steps_dir = base_dir / "steps"
+        steps = _assemble_steps_from_dir(steps_dir, base.get("step_order"), base_dir) \
+            if steps_dir.is_dir() else []
+    base["steps"] = steps
+
+    _base_cache["sig"] = sig
+    _base_cache["data"] = base
+    return copy.deepcopy(base)
+
+
+# ---------------------------------------------------------------------------
 # Config loader: base.yaml + company override + runtime period/fiscal_year
 # ---------------------------------------------------------------------------
 
@@ -159,8 +245,7 @@ def load_config(
     base_path = company_path.parent / "base.yaml"
 
     if base_path.exists() and company_path.name != "base.yaml":
-        with open(base_path, encoding="utf-8") as f:
-            result: dict = yaml.safe_load(f)
+        result: dict = load_base_config(base_path)
         with open(company_path, encoding="utf-8") as f:
             company_cfg: dict = yaml.safe_load(f)
 
@@ -170,8 +255,8 @@ def load_config(
             **company_cfg.get("company_config", {}),
         }
 
-        # Allow company to partially override defaults or llm_profiles
-        for key in ("defaults", "llm_profiles"):
+        # Allow company to partially override defaults, llm_profiles or analysis_defaults
+        for key in ("defaults", "llm_profiles", "analysis_defaults"):
             if key in company_cfg:
                 result[key] = {**result.get(key, {}), **company_cfg[key]}
 
@@ -226,10 +311,11 @@ def build_llms_from_config(period_cfg: dict) -> dict[str, ChatOpenAI]:
 def build_checkpointer(db_path: str | None = None):
     """Sync checkpointer for CLI use. Falls back to InMemorySaver."""
     import logging as _log
-    path = db_path or os.getenv("CHECKPOINT_DB", "period_close_checkpoints.db")
+    path = db_path or os.getenv("CHECKPOINT_DB", str(DEFAULT_CHECKPOINT_DB))
     try:
         import sqlite3
         from langgraph.checkpoint.sqlite import SqliteSaver
+        DB_DIR.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, check_same_thread=False)
         saver = SqliteSaver(conn)
         _log.getLogger(__name__).info("Using SqliteSaver at %s", path)
@@ -249,10 +335,11 @@ async def build_async_checkpointer(db_path: str | None = None):
     Falls back to InMemorySaver when aiosqlite is absent.
     """
     import logging as _log
-    path = db_path or os.getenv("CHECKPOINT_DB", "period_close_checkpoints.db")
+    path = db_path or os.getenv("CHECKPOINT_DB", str(DEFAULT_CHECKPOINT_DB))
     try:
         import aiosqlite
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        DB_DIR.mkdir(parents=True, exist_ok=True)
         conn = await aiosqlite.connect(path)
         saver = AsyncSqliteSaver(conn)
         await saver.setup()

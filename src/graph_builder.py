@@ -3,7 +3,7 @@ SAP Period Close Agent — LangGraph orchestration layer.
 
 Architecture (DOE principle)
 -----------------------------
-  Directive    : configs/base.yaml         — what to do
+  Directive    : config_store.db (base ⊕ company delta) — what to do
   Orchestration: graph_builder.py          — how to coordinate
   Execution    : mcp_server.py             — actual SAP operations via RFC
 
@@ -83,6 +83,78 @@ def _resolve(obj: Any, ctx: dict) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Structured analysis result helpers (diagnose depth)
+# ---------------------------------------------------------------------------
+
+def _flatten_result(result: dict) -> tuple[str, str]:
+    """Derive back-compat (diagnosis, user_instructions) text from a structured
+    {status, errors[], resolutions[]} result, for the CLI and legacy UI fallback."""
+    errors      = result.get("errors") or []
+    resolutions = result.get("resolutions") or []
+    if errors:
+        lines = []
+        for e in errors:
+            line = f"- {e.get('object_id', '?')}: {e.get('error', '')}"
+            if e.get("cause"):
+                line += f" — {e['cause']}"
+            lines.append(line)
+        diagnosis = "\n".join(lines)
+    else:
+        diagnosis = "No specific errors identified."
+    instr = "\n".join(r.get("recommendation", "")
+                      for r in resolutions if r.get("recommendation"))
+    return diagnosis or "No diagnosis.", instr or "No specific resolution provided."
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Best-effort recovery of a single JSON object embedded in otherwise
+    free-form text (e.g. a model that narrates its plan before/around the
+    JSON it was told to emit exclusively). Returns None if no balanced
+    ``{...}`` span parses cleanly."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+def _synthesize_result(diagnosis: str, status: str = "completed",
+                       recommendation: str | None = None) -> dict:
+    """Wrap a flat diagnosis string into the structured result shape so the UI can
+    always render the two-table view, even for legacy / fallback answers."""
+    return {
+        "status": status,
+        "errors": [{"object_id": "", "error": diagnosis, "cause": "",
+                    "resolution_id": "R1"}],
+        "resolutions": [{"id": "R1", "recommendation": recommendation or diagnosis,
+                         "affected_objects": []}],
+    }
+
+
+# ---------------------------------------------------------------------------
 # State TypedDicts
 # ---------------------------------------------------------------------------
 
@@ -127,10 +199,12 @@ class ValidateResult(TypedDict):
     spool_text: str; messages: list[dict]; error_count: int; reasoning: str
 
 
-class AnalysisResult(TypedDict):
+class AnalysisResult(TypedDict, total=False):
     step_id: str; action: str       # retry | user_input | skip
-    corrected_params: list[dict] | None
+    corrected_params: list[dict] | None   # operator param overrides (not LLM-set)
     diagnosis: str; user_instructions: str | None; tools_used: list[str]
+    status: str                     # completed | partial | undetermined (diagnose only)
+    result: dict | None             # structured {status, errors[], resolutions[]}
 
 
 class StepRecord(TypedDict):
@@ -146,6 +220,7 @@ def _merge_parallel(a: dict, b: dict) -> dict:
 
 class PeriodCloseState(TypedDict):
     company_config: dict; steps: list[dict]; global_defaults: dict
+    analysis_defaults: dict
     step_index: int; current_group: str | None; parallel_step_ids: list[str]
     current_step_id: str
     current_pre_check: PreCheckResult | None
@@ -248,12 +323,19 @@ async def _run_action(session: ClientSession, action_type: str, object_name: str
     
     at = (action_type or "").upper()
     if at == "TOOLS":
-        p = params if isinstance(params, dict) else {}
-        r = await session.call_tool("sap_read_table", arguments={
-            "table":    p.get("table", object_name),
-            "where":    p.get("where", ""),
-            "fields":   p.get("fields", ""),
-            "max_rows": p.get("max_rows", 100),
+        # Generic tool call: object_name selects the ABAP handler, params travel
+        # verbatim as iv_params_json. Legacy TOOLS steps set object_name to a *table*
+        # (the tool was always TOOL_READ_TABLE, hardcoded in sap_read_table) — keep
+        # them working by defaulting non-TOOL_* names to a TOOL_READ_TABLE read.
+        p = dict(params) if isinstance(params, dict) else {}
+        tool = (object_name or "").strip().upper()
+        if not tool.startswith("TOOL_"):
+            p.setdefault("table", object_name)
+            tool = "TOOL_READ_TABLE"
+        r = await session.call_tool("sap_run_tool", arguments={
+            "object_name": tool,
+            "params_json": json.dumps(p),
+            "test_run":    test_run,
         })
     else:
         r = await session.call_tool("sap_execute_step", arguments={
@@ -283,6 +365,25 @@ def _analysis_depth(step: dict, ec: dict) -> str:
 # Shared LLM job: the verdict / judge gate
 # ---------------------------------------------------------------------------
 
+# Reasoning models wrap their out-loud deliberation in one of these tags. We
+# match the whole family rather than just <think>.
+_REASONING_TAGS = "think|thinking|reason|reasoning"
+_THINK_RE = re.compile(
+    rf"<({_REASONING_TAGS})\b[^>]*>.*?</\1\s*>", re.DOTALL | re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(rf"</(?:{_REASONING_TAGS})\s*>", re.IGNORECASE)
+
+
+def _strip_reasoning(text: str) -> str:
+    """Drop a reasoning model's ``<think>…</think>`` deliberation, keeping only
+    its final answer.
+    """
+    text = _THINK_RE.sub("", text)
+    closes = list(_THINK_CLOSE_RE.finditer(text))
+    if closes:
+        text = text[closes[-1].end():]
+    return text.strip()
+
+
 async def _llm_verdict(
     llm,
     *,
@@ -298,18 +399,6 @@ async def _llm_verdict(
 
     Returns ``{"verdict","error_count","errors","reasoning"}`` where verdict is
     ``ok`` | ``retry`` | ``escalate``.
-
-    * ``pass_values`` set  → boolean mode (pre_check parity): the model answers in
-      prose; verdict is ``ok`` when any pass word appears, else ``retry``.
-    * ``pass_values`` None → JSON mode (validate parity): parse
-      ``{error_count, errors?, verdict?, reasoning?}``; verdict is derived from
-      ``error_count`` when omitted; non-JSON → ``escalate``.
-
-    ``llm_fail_verdict`` controls what verdict is returned when the LLM call itself
-    fails (network / auth error).  Default ``"ok"`` preserves legacy fail-open for
-    validate nodes so a provider outage never wedges a period close.  Pass
-    ``"escalate"`` from pre_check so an unavailable LLM routes to the operator
-    instead of silently marking the pre-check as passed.
     """
     rows     = rows or []
     messages = messages or []
@@ -330,7 +419,14 @@ async def _llm_verdict(
         human   = f"Task: {resolved_prompt}\n\nOutput:\n{content}"
 
     if pass_values is not None:
-        default_system = "Analyse this SAP data and answer the question concisely."
+        # Push the model toward a clean, single-word final line so the last-line
+        # verdict parse below is trivial. This only shrinks the failure surface —
+        # correctness does not depend on the model obeying it (reasoning is
+        # stripped and only the final line is judged regardless).
+        default_system = (
+            "Analyse this SAP data and answer the question. "
+            "Your reply MUST end with a final line containing exactly one word: "
+            "the verdict and nothing else.")
     else:
         default_system = (
             "You are an SAP job result analyser. Respond ONLY with JSON: "
@@ -349,15 +445,30 @@ async def _llm_verdict(
         return {"verdict": llm_fail_verdict, "error_count": 0, "errors": [],
                 "reasoning": f"LLM not available — skipping LLM check ({str(exc)[:120]})"}
 
+    # Reasoning models emit a <think>…</think> block before the answer; its
+    # deliberation is full of pass words even when the verdict is NO, and it also
+    # breaks json.loads below. Strip it so only the final answer is evaluated.
+    raw = _strip_reasoning(raw)
+
     if pass_values is not None:
-        answer = raw.lower()
-        passed = any(v in answer for v in pass_values)
+        # Judge the *final answer*, not the whole reply: take the last non-empty line
+        # (the prompt asks for a single-word verdict) and match pass words on
+        # word boundaries so "no" never matches inside "cannot", etc.
+        answer = next((ln for ln in reversed(raw.splitlines()) if ln.strip()), raw).lower()
+        passed = any(re.search(rf"\b{re.escape(v.lower())}\b", answer) for v in pass_values)
         return {"verdict": "ok" if passed else "retry",
                 "error_count": 0 if passed else 1, "errors": [],
                 "reasoning": raw[:300]}
 
     try:
-        parsed      = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # Model wrapped the JSON in prose — grab the outermost {…} object.
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if not m:
+                raise
+            parsed = json.loads(m.group(0))
         error_count = int(parsed.get("error_count", 0))
         errors      = parsed.get("errors") or []
         verdict     = parsed.get("verdict") or ("ok" if error_count == 0 else "retry")
@@ -770,8 +881,16 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
                          "message": f"Running verification "
                                     f"{run_cfg['action_type']}/{run_cfg['object_name']}…"})
+            # Runtime-only placeholders: this step's job identifiers, resolved the same
+            # way whether it ran async (job in `poll`) or inline (job in `execute` meta).
+            # Load-time tokens ({{period}}, {{company_code}}, …) are already substituted.
+            job_ctx = {
+                "job_name": (poll or {}).get("job_name") or _meta(execute or {}, "job_name", ""),
+                "job_id":   (poll or {}).get("job_id")   or _meta(execute or {}, "job_id", ""),
+            }
+            run_params = _resolve(run_cfg.get("params", {}) or {}, job_ctx)
             run = await _run_action(
-                session, run_cfg["action_type"], run_cfg["object_name"], run_cfg.get("params", {}),
+                session, run_cfg["action_type"], run_cfg["object_name"], run_params,
                 async_mode=run_cfg.get("async", False), test_run=run_cfg.get("test_run", True),
             )
             spool_text = _spool(run).get("text", "")
@@ -908,16 +1027,17 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         emit: Callable,
         step_id: str,
         max_steps: int = 8,
-    ) -> tuple[list, list[str]]:
+    ) -> tuple[list, list[str], bool]:
         """Text-based ReAct loop: plain JSON I/O, no native API tool-calling.
 
         The LLM must output one of two JSON objects per turn:
           {"type":"tool_call",   "tool":"<name>","args":{...}}
           {"type":"final_answer","action":"retry|user_input|skip",
-           "diagnosis":"...","corrected_params":null,"user_instructions":null}
+           "result":{"status":...,"errors":[...],"resolutions":[...]}}
 
         Tool errors are fed back as HumanMessages so the model can self-correct.
-        Returns (new_messages_added, tool_names_used).
+        Returns (new_messages_added, tool_names_used, budget_exhausted) where
+        budget_exhausted is True when ``max_steps`` ran out before a final_answer.
         """
         tools_block = json.dumps(tool_schema, ensure_ascii=False, indent=2)
         full_system = (
@@ -930,14 +1050,26 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             '  {"type":"tool_call","tool":"<name>","args":{<args>}}\n'
             "To give your final answer:\n"
             '  {"type":"final_answer","action":"retry|user_input|skip",'
-            '"diagnosis":"root cause","corrected_params":null,'
-            '"user_instructions":"operator steps or null"}\n'
+            '"result":{"status":"completed|partial|undetermined",'
+            '"errors":[{"object_id":"...","error":"...","cause":"...",'
+            '"resolution_id":"R1"}],'
+            '"resolutions":[{"id":"R1","recommendation":"...",'
+            '"affected_objects":["..."]}]}}\n'
+            "- action: retry (re-run the step), skip (skip it), or user_input "
+            "(operator must intervene).\n"
+            "- Every error must reference a resolution via resolution_id; group "
+            "identical fixes under one resolution to avoid duplicates.\n"
+            "- status: completed (all diagnosed), partial (some unresolved), "
+            "undetermined (no root cause found).\n"
+            f"- You may make at most {max_steps} tool calls. When every reported "
+            "object is covered, output the final_answer immediately.\n"
             "If a tool returns status=error, correct the arguments and call it again."
         )
 
         conv: list = [SystemMessage(content=full_system)] + list(prior_messages)
         new_msgs: list = []
         tools_used: list[str] = []
+        budget_exhausted = True
 
         for _ in range(max_steps):
             response = await llm.ainvoke(conv)
@@ -948,9 +1080,13 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
-                break  # model deviated from format — treat as terminal
+                parsed = _extract_json_object(raw)
+                if parsed is None:
+                    budget_exhausted = False
+                    break  # model deviated from format — treat as terminal
 
             if parsed.get("type") != "tool_call":
+                budget_exhausted = False
                 break  # final_answer or unrecognised — exit loop
 
             tool_name = parsed.get("tool", "")
@@ -977,7 +1113,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             new_msgs.append(fb_msg)
             conv.append(fb_msg)
 
-        return new_msgs, tools_used
+        return new_msgs, tools_used, budget_exhausted
 
     def _ctx_text(ec: dict) -> str:
         """Render the uniform ErrorContext into a prompt-ready block for either depth."""
@@ -1011,15 +1147,20 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         prompt = (oe.get("explain_prompt")
                   or (step.get("pre_check", {}) or {}).get("llm", {}).get("prompt")
                   or "Explain this SAP finding to the operator and suggest how to correct it.")
-        system = ("You are an SAP period-close pre-check analyst. Explain the finding to the "
-                  "operator in plain language and suggest how to correct it. Be concise."
+        system = ("You are an SAP period-close pre-check analyst. In 2-4 short sentences, "
+                  "state the cause(s) of the finding and how to correct it, in plain language. "
+                  "Do not include your reasoning or restate the raw data — give only the "
+                  "conclusion. Be concise."
                   + (f"\n\nDomain guidance:\n{guidance}" if guidance else ""))
         try:
             resp = await llms["validation"].ainvoke([
                 SystemMessage(content=system),
                 HumanMessage(content=f"Data:\n{_ctx_text(ec)}\n\n{prompt}"),
             ])
-            diagnosis = (resp.content or "").strip() or ec.get("summary", "Pre-check failed.")
+            # Reasoning models (e.g. qwen3-32b) prepend a verbose <think>…</think>
+            # deliberation; keep only the final operator-facing explanation.
+            diagnosis = _strip_reasoning((resp.content or "").strip()) \
+                or ec.get("summary", "Pre-check failed.")
         except Exception as exc:
             logger.warning("analysis explain LLM error step=%s: %s", step_id, exc)
             diagnosis = ec.get("summary", "Pre-check failed; manual review required.")
@@ -1032,67 +1173,139 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             "diagnosis": diagnosis, "user_instructions": instructions, "tools_used": [],
         }}
 
+    def _build_diagnose_system_prompt(
+        state: PeriodCloseState, step: dict, ec: dict,
+    ) -> tuple[str, int]:
+        """Build the diagnose system prompt + tool-call budget.
+
+        Preferred: section-based prompt assembled from ``on_error.analysis`` with
+        per-section fallback to top-level ``analysis_defaults``. Legacy fallback:
+        the single ``on_error.analysis_guidance`` blob (so un-migrated steps keep
+        working). Returns (system_prompt, max_tool_calls).
+        """
+        oe   = step.get("on_error", {}) or {}
+        ad   = state.get("analysis_defaults", {}) or {}
+        ctx  = dict(state.get("company_config", {}))
+        defs = _defaults(state)
+        default_budget = int(ad.get("max_tool_calls", 8) or 8)
+        an   = oe.get("analysis")
+
+        if isinstance(an, dict) and an:
+            def sec(key: str) -> str:
+                return an.get(key) or ad.get(key) or ""
+
+            parts: list[str] = []
+            role = sec("role")
+            if role:
+                parts.append(_resolve(role, ctx))
+            ctmpl = sec("context_template")
+            context = (_resolve(ctmpl, {**ctx, "errors": _ctx_text(ec)})
+                       if ctmpl else _ctx_text(ec))
+            parts.append("## Context\n" + context)
+            for label, key in (("Goal", "goal"), ("Tools", "tools"),
+                               ("Instructions", "instructions"),
+                               ("Output Format", "output_format"), ("Rules", "rules")):
+                val = sec(key)
+                if val:
+                    parts.append(f"## {label}\n" + _resolve(val, ctx))
+            system_prompt  = "\n\n".join(parts)
+            max_tool_calls = int(an.get("max_tool_calls", default_budget) or default_budget)
+            return system_prompt, max_tool_calls
+
+        # Legacy path — single guidance blob
+        guidance = oe.get("analysis_guidance", "")
+        retry    = state.get("retry_count", 0)
+        max_ret  = step.get("max_retries", defs.get("max_retries", 3))
+        system_prompt = (
+            f"You are an SAP period-close error analyst.\n"
+            f"Step: {step['step_id']} | {step.get('action_type')}/{step.get('object_name')}\n"
+            f"Company config: {json.dumps(state.get('company_config', {}))}\n"
+            f"Retry: {retry}/{max_ret}\n\nDomain guidance:\n{guidance}"
+        )
+        return system_prompt, default_budget
+
     async def _analyse_diagnose(state: PeriodCloseState, ec: dict, step: dict) -> dict:
         step_id = step["step_id"]
         defs    = _defaults(state)
         max_ret = step.get("max_retries", defs.get("max_retries", 3))
-        guidance = step.get("on_error", {}).get("analysis_guidance", "")
         retry   = state.get("retry_count", 0)
 
         await _emit({"type": "action_start", "step_id": step_id, "action": "analysis",
                      "message": f"Analysing error (attempt {retry + 1}/{max_ret})…"})
 
         error_ctx = _ctx_text(ec)
-
-        system_prompt = (
-            f"You are an SAP period-close error analyst.\n"
-            f"Step: {step_id} | {step.get('action_type')}/{step.get('object_name')}\n"
-            f"Company config: {json.dumps(state.get('company_config', {}))}\n"
-            f"Retry: {retry}/{max_ret}\n\nDomain guidance:\n{guidance}"
-        )
+        system_prompt, max_tool_calls = _build_diagnose_system_prompt(state, step, ec)
 
         llm   = llms["analysis"]
         prior = list(state.get("analysis_messages", []))
         new_messages: list = []
+        tools_used: list[str] = []
         try:
             input_msgs   = prior + [HumanMessage(content=f"Error context:\n{error_ctx}")]
             tool_schema  = await _get_tool_schema()
             await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
                          "message": "Sending request to LLM…"})
-            new_messages, tools_used = await _run_text_react(
+            new_messages, tools_used, budget_exhausted = await _run_text_react(
                 llm, _call_tool, tool_schema, system_prompt,
-                input_msgs, _emit, step_id,
+                input_msgs, _emit, step_id, max_tool_calls,
             )
-            last_msg = new_messages[-1] if new_messages else HumanMessage(content="")
-            raw      = re.sub(r"```\w*\n?", "", last_msg.content.strip()).strip()
+            last_msg = new_messages[-1] if new_messages else None
+            raw      = re.sub(r"```\w*\n?", "",
+                              (last_msg.content if last_msg else "").strip()).strip()
             try:
-                parsed       = json.loads(raw)
-                action       = parsed.get("action", "user_input")
-                corrected    = parsed.get("corrected_params")
-                diagnosis    = parsed.get("diagnosis", raw)
-                instructions = parsed.get("user_instructions")
+                parsed = json.loads(raw)
             except json.JSONDecodeError:
-                action       = "user_input"
-                corrected    = None
-                diagnosis    = raw[:400] or "Analysis LLM returned empty response."
-                instructions = "Analysis LLM returned non-JSON. Manual review required."
+                # Only trust a recovered fragment if it looks like a genuine
+                # final_answer (has "action") — otherwise it may be trailing
+                # tool-feedback text, which must fall through to the
+                # unparsable-response branch below.
+                candidate = _extract_json_object(raw)
+                parsed = candidate if isinstance(candidate, dict) and "action" in candidate else None
+
+            if isinstance(parsed, dict) and parsed.get("type") != "tool_call":
+                action       = parsed.get("action", "user_input")
+                result_block = parsed.get("result")
+                if isinstance(result_block, dict):
+                    status                  = result_block.get("status") or "completed"
+                    diagnosis, instructions = _flatten_result(result_block)
+                else:
+                    # legacy flat shape — synthesize a structured result for the UI
+                    diagnosis    = parsed.get("diagnosis") or raw
+                    instructions = parsed.get("user_instructions")
+                    status       = "completed"
+                    result_block = _synthesize_result(diagnosis, status, instructions)
+            else:
+                # No clean final answer: budget ran out, deviated, or empty response
+                action = "user_input"
+                if budget_exhausted:
+                    status    = "partial"
+                    diagnosis = ("Analysis stopped after reaching the tool-call limit "
+                                 "without a complete diagnosis.")
+                else:
+                    status = "undetermined"
+                    logger.warning("analysis step=%s: unparsable model response: %.500s",
+                                    step_id, raw)
+                    diagnosis = "Analysis could not produce a structured diagnosis; manual review required."
+                instructions = "Manual review required."
+                result_block = _synthesize_result(diagnosis, status, instructions)
         except Exception as exc:
             logger.warning("analysis LLM not available step=%s: %s", step_id, exc)
             action       = "skip"
-            corrected    = None
+            status       = "undetermined"
             diagnosis    = f"Analysis LLM not available ({str(exc)[:150]}) — skipping step"
             instructions = None
+            result_block = None
             tools_used   = []
 
-        logger.info("analysis step=%s action=%s", step_id, action)
+        logger.info("analysis step=%s action=%s status=%s", step_id, action, status)
         await _emit({"type": "action_end", "step_id": step_id, "action": "analysis",
                      "status": action, "message": diagnosis[:200]})
 
         return {
             "current_analysis": {
-                "step_id": step_id, "action": action, "corrected_params": corrected,
+                "step_id": step_id, "action": action, "corrected_params": None,
                 "diagnosis": diagnosis, "user_instructions": instructions,
-                "tools_used": tools_used,
+                "tools_used": tools_used, "status": status, "result": result_block,
             },
             "analysis_messages": new_messages,
             "retry_count": retry + 1,
@@ -1130,6 +1343,8 @@ def make_user_node():
             "step_id":          step_id,
             "diagnosis":        an.get("diagnosis", "N/A"),
             "user_instructions": an.get("user_instructions", "N/A"),
+            "status":           an.get("status"),
+            "result":           an.get("result"),
         }
 
         # CLI fallback summary (shown when interrupt() prints to stdout)
@@ -1452,9 +1667,9 @@ def _make_thread_id(company_config: dict, defaults: dict) -> str:
     run can be resumed by re-running with the same id, and a finished close cannot be
     re-run by accident.
 
-    Dev/testing: set `reset_each_run: true` in defaults (base.yaml or a company file,
-    or env RESET_EACH_RUN=1) to append a random suffix, giving every run a clean
-    checkpoint so the same period can be re-run as many times as needed.
+    Dev/testing: set `reset_each_run: true` in defaults (base config or a company
+    delta, or env RESET_EACH_RUN=1) to append a random suffix, giving every run a
+    clean checkpoint so the same period can be re-run as many times as needed.
     """
     base = (f"period_close_"
             f"{company_config.get('fiscal_year', 'X')}_"
@@ -1469,6 +1684,7 @@ def _build_initial_state(period_cfg: dict, steps: list[dict],
         "company_config":    company_config,
         "steps":             steps,
         "global_defaults":   period_cfg.get("defaults", {}),
+        "analysis_defaults": period_cfg.get("analysis_defaults", {}),
         "step_index":        max(0, start_step_index),
         "current_group":     None,
         "parallel_step_ids": [],
@@ -1532,7 +1748,9 @@ async def _run_with_interrupts(
                     await _emit({"type": "interrupt",
                                  "step_id":          iv.get("step_id", ""),
                                  "diagnosis":         iv.get("diagnosis", ""),
-                                 "user_instructions": iv.get("user_instructions", "")})
+                                 "user_instructions": iv.get("user_instructions", ""),
+                                 "status":            iv.get("status"),
+                                 "result":            iv.get("result")})
                 else:
                     await _emit({"type": "interrupt", "message": str(iv)})
         decision = await get_decision()
@@ -1609,16 +1827,29 @@ async def execute_rollback_step(
         return {"status": "error"}
 
 
+def _resolve_period_cfg(period_config_path, company_code, period, fiscal_year):
+    """Effective config keyed by company code (base ⊕ SQLite delta) when a code is given;
+    legacy file-based load_config otherwise (only for callers that still pass a real
+    base+company YAML pair, e.g. tests with tmp_path fixtures)."""
+    if company_code:
+        from config_store import load_effective_config
+        return load_effective_config(company_code, period=period, fiscal_year=fiscal_year)
+    if not period_config_path:
+        raise ValueError("run requires either company_code (DB-backed) or an explicit period_config_path")
+    return load_config(period_config_path, period=period, fiscal_year=fiscal_year)
+
+
 async def run_rollback_and_restart_web(
     send,
     msg_queue:          asyncio.Queue,
-    period_config_path: str = "configs/base.yaml",
-    mcp_config_path:    str = "mcp_config.yaml",
+    period_config_path: str | None = None,
+    mcp_config_path:    str = "configs/mcp_config.yaml",
     start_from_step:    str = "",
     steps_to_rollback:  list[str] | None = None,
     thread_id:          str | None = None,
     period:             str | None = None,
     fiscal_year:        str | None = None,
+    company_code:       str | None = None,
 ) -> None:
     """Roll back listed steps (in reverse order) then restart the graph from start_from_step."""
     global _event_queue
@@ -1634,7 +1865,7 @@ async def run_rollback_and_restart_web(
     relay_task = asyncio.create_task(_relay())
 
     try:
-        period_cfg  = load_config(period_config_path, period=period, fiscal_year=fiscal_year)
+        period_cfg  = _resolve_period_cfg(period_config_path, company_code, period, fiscal_year)
         mcp_cfg     = _load_yaml(mcp_config_path)
         company_config = period_cfg["company_config"]
         steps_raw      = period_cfg["steps"]
@@ -1711,13 +1942,17 @@ async def run_rollback_and_restart_web(
 # ---------------------------------------------------------------------------
 
 async def run_period_close(
-    period_config_path: str = "configs/base.yaml",
-    mcp_config_path:    str = "mcp_config.yaml",
+    company_code:       str | None = None,
+    period_config_path: str | None = None,
+    mcp_config_path:    str = "configs/mcp_config.yaml",
     thread_id:          str | None = None,
     period:             str | None = None,
     fiscal_year:        str | None = None,
 ) -> dict:
-    period_cfg  = load_config(period_config_path, period=period, fiscal_year=fiscal_year)
+    """CLI run. Pass `company_code` to load base ⊕ delta from config_store.db (the normal
+    case — companies are managed in the admin UI), or `period_config_path` to load a
+    standalone base+company YAML pair (tests / one-off files)."""
+    period_cfg  = _resolve_period_cfg(period_config_path, company_code, period, fiscal_year)
     mcp_cfg     = _load_yaml(mcp_config_path)
     company_config = period_cfg["company_config"]
     steps          = _resolve(period_cfg["steps"], company_config)
@@ -1760,11 +1995,12 @@ async def run_period_close(
 async def run_period_close_web(
     send,                        # async callable: send(event_dict) → WebSocket
     msg_queue:  asyncio.Queue,   # messages from browser: start / decision
-    period_config_path: str = "configs/base.yaml",
-    mcp_config_path:    str = "mcp_config.yaml",
+    period_config_path: str | None = None,
+    mcp_config_path:    str = "configs/mcp_config.yaml",
     thread_id:  str | None = None,
     period:     str | None = None,
     fiscal_year: str | None = None,
+    company_code: str | None = None,
 ) -> None:
     global _event_queue
     _event_queue = asyncio.Queue()
@@ -1779,8 +2015,8 @@ async def run_period_close_web(
     relay_task = asyncio.create_task(_relay())
 
     try:
-        period_cfg  = load_config(period_config_path, period=period, fiscal_year=fiscal_year)
-        logger.info("load_config('%s') keys: %s", period_config_path, list(period_cfg.keys()))
+        period_cfg  = _resolve_period_cfg(period_config_path, company_code, period, fiscal_year)
+        logger.info("effective config for %s keys: %s", company_code or period_config_path, list(period_cfg.keys()))
         mcp_cfg     = _load_yaml(mcp_config_path)
         company_config = period_cfg["company_config"]
         steps_raw      = period_cfg["steps"]
@@ -1890,6 +2126,10 @@ def _load_yaml(path: str) -> dict:
 
 if __name__ == "__main__":
     import asyncio
+    import sys
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    asyncio.run(run_period_close())
+    if len(sys.argv) < 2:
+        sys.exit("Usage: python graph_builder.py <COMPANY_CODE>  "
+                  "(companies are managed in the admin UI → Settings → Manage companies)")
+    asyncio.run(run_period_close(company_code=sys.argv[1]))

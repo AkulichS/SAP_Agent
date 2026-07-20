@@ -13,8 +13,19 @@ from config import (_build_steps, _merge_params, build_async_checkpointer,
 # load_config — base + company merge, runtime period/fiscal_year
 # ---------------------------------------------------------------------------
 
-def test_load_config_merges_base_and_company():
-    cfg = load_config("configs/period_close_RU06.yaml", period="11", fiscal_year="2025")
+def test_load_config_merges_base_and_company(tmp_path):
+    (tmp_path / "base.yaml").write_text(textwrap.dedent("""
+        llm_profiles:
+          analysis: {provider: groq, model: llama-3.3-70b}
+        steps:
+          - step_id: KO8G
+            action_type: SUBMIT
+    """), encoding="utf-8")
+    (tmp_path / "period_close_RU06.yaml").write_text(textwrap.dedent("""
+        company_config:
+          company_code: "RU06"
+    """), encoding="utf-8")
+    cfg = load_config(str(tmp_path / "period_close_RU06.yaml"), period="11", fiscal_year="2025")
     rc = cfg["company_config"]
     assert rc["company_code"] == "RU06"
     assert rc["period"] == "11"
@@ -37,6 +48,41 @@ def test_load_config_legacy_single_file(tmp_path):
     assert cfg["company_config"]["company_code"] == "TST"
     assert cfg["company_config"]["period"] == "01"
     assert cfg["steps"][0]["step_id"] == "ONLY"
+
+
+def test_analysis_defaults_and_section_merge(tmp_path):
+    (tmp_path / "base.yaml").write_text(textwrap.dedent("""
+        analysis_defaults:
+          role: "base role"
+          max_tool_calls: 8
+        steps:
+          - step_id: KO8G
+            action_type: SUBMIT
+            on_error:
+              analysis:
+                goal: "base goal"
+                instructions: "base instr"
+    """), encoding="utf-8")
+    (tmp_path / "company.yaml").write_text(textwrap.dedent("""
+        company_config:
+          company_code: "RU06"
+        analysis_defaults:
+          role: "company role"
+        steps:
+          - step_id: KO8G
+            on_error:
+              analysis:
+                goal: "company goal"
+    """), encoding="utf-8")
+    cfg = load_config(str(tmp_path / "company.yaml"), period="11", fiscal_year="2025")
+    # Shared analysis_defaults: company wins per key, base-only keys preserved.
+    assert cfg["analysis_defaults"]["role"] == "company role"
+    assert cfg["analysis_defaults"]["max_tool_calls"] == 8
+    # on_error.analysis deep-merges: company goal overrides, base instructions kept.
+    ko8g = next(s for s in cfg["steps"] if s["step_id"] == "KO8G")
+    an = ko8g["on_error"]["analysis"]
+    assert an["goal"] == "company goal"
+    assert an["instructions"] == "base instr"
 
 
 # ---------------------------------------------------------------------------

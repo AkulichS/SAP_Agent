@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    p = Path(__file__).parent / "mcp_config.yaml"
+    p = Path(__file__).parent / "configs" / "mcp_config.yaml"
     if not p.exists():
         raise FileNotFoundError(f"MCP config not found: {p}")
     with open(p) as f:
@@ -273,6 +273,55 @@ def sap_execute_step(
         "error",
         messages=[{"TYPE": "E", "MESSAGE": f"Unknown action_type: {action_type}"}],
         meta=_meta())
+
+
+# ---------------------------------------------------------------------------
+# Tool: sap_run_tool
+# Generic passthrough for the config-driven action path (execute / pre_check /
+# validate.run). object_name selects the ABAP WHEN branch; params travel verbatim
+# as iv_params_json. Adding a new client tool needs only the ABAP handler — no
+# change here. (The typed sap_read_table / sap_read_spool / sap_job_status tools
+# stay: they are the diagnostic tools the analysis ReAct agent calls by name.)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def sap_run_tool(object_name: str, params_json: str, test_run: bool = False) -> dict:
+    """
+    Run any TOOLS-type SAP tool and normalise its result generically.
+
+    The raw RFC payload is normalised so downstream row/spool consumers work for
+    any tool without per-tool knowledge:
+        data.rows  — present when the tool returns {"data": [ ... ]}   (table-like)
+        data.spool — present when the tool returns {"status","text"}   (spool-like)
+        data.raw   — the verbatim RFC payload, always (custom tools stay reachable)
+
+    Returns the unified envelope {status, messages, meta, data} where
+        meta — {"object_name", "row_count"}
+    """
+    conn = conn_mgr.get_connection()
+    params = json.loads(params_json) if isinstance(params_json, str) else (params_json or {})
+    result = _rfc(conn, "TOOLS", object_name, params, test_run=test_run)
+    raw = result["result_json"]
+
+    data: dict = {"raw": raw}
+    if isinstance(raw, dict):
+        if isinstance(raw.get("data"), list):
+            data["rows"] = raw["data"]
+        if "text" in raw:
+            data["spool"] = _norm_spool(raw)
+
+    has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"]) \
+                 or result["status"] == "E"
+    logger.info("sap_run_tool object=%s status=%s rows=%d spool=%s",
+                object_name, result["status"],
+                len(data.get("rows", [])), "spool" in data)
+    return _envelope(
+        "error" if has_errors else "ok",
+        messages = result["messages"],
+        meta     = {"object_name": object_name,
+                    "row_count": len(data["rows"]) if "rows" in data else 0},
+        data     = data,
+    )
 
 
 # ---------------------------------------------------------------------------

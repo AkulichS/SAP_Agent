@@ -125,6 +125,15 @@ def test_analysis_user_input_goes_to_user():
     assert route_after_analysis(_analysis_state("user_input", retry_count=0)) == "user"
 
 
+def test_analysis_routes_on_action_ignoring_structured_result():
+    # A structured {status, errors[], resolutions[]} result does not change routing —
+    # only `action` drives it.
+    st = _analysis_state("skip", retry_count=1)
+    st["current_analysis"]["status"] = "completed"
+    st["current_analysis"]["result"] = {"status": "completed", "errors": [], "resolutions": []}
+    assert route_after_analysis(st) == "finalize_step"
+
+
 # ---------------------------------------------------------------------------
 # route_after_user
 # ---------------------------------------------------------------------------

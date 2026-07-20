@@ -30,7 +30,7 @@ _serializer = URLSafeTimedSerializer(_SECRET_KEY)
 # User registry
 # ---------------------------------------------------------------------------
 
-_USERS_PATH = Path(__file__).parent / "users.yaml"
+_USERS_PATH = Path(__file__).parent / "configs" / "users.yaml"
 _users_cache: list[dict] | None = None
 
 

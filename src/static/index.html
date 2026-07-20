@@ -4,6 +4,9 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>SAP Period Close Agent</title>
+  <!-- Vendored (offline) Markdown editor for large prompt fields -->
+  <link rel="stylesheet" href="/static/vendor/codemirror.css"/>
+  <script src="/static/vendor/codemirror-bundle.js"></script>
   <style>
     /* ── Base ── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -258,6 +261,11 @@
     .modal-section { margin-bottom: 14px; }
     .modal-section label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-dim); margin-bottom: 5px; }
     .modal-section .value { font-size: 12px; color: var(--text-bright); background: #1e1e1e; border-radius: 4px; padding: 8px 10px; white-space: pre-wrap; }
+    .status-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .status-badge.completed   { background: #1e3a2a; color: var(--ok); }
+    .status-badge.partial     { background: #3c2a00; color: var(--warn); }
+    .status-badge.undetermined{ background: #3a1e1e; color: var(--failed); }
+    #modal-errors .det-table, #modal-resolutions .det-table { width: 100%; }
     #modal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
     .modal-btn { padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; font-weight: 500; transition: opacity .15s; }
     .modal-btn:hover { opacity: .8; }
@@ -456,8 +464,13 @@
     }
     #dashboard-header h2 { font-size: 15px; font-weight: 600; color: var(--text-bright); }
     #dashboard-header .user-info { font-size: 12px; color: var(--text-dim); }
+    #settings-btn {
+      background: none; border: none; cursor: pointer;
+      padding: 3px 6px; color: var(--text-dim); line-height: 1;
+    }
+    #settings-btn:hover { color: var(--text); }
     #logout-btn {
-      margin-left: 12px; font-size: 11px; padding: 3px 10px;
+      margin-left: 4px; font-size: 11px; padding: 3px 10px;
       border: 1px solid var(--border); border-radius: 3px;
       background: transparent; color: var(--text-dim); cursor: pointer;
     }
@@ -532,6 +545,7 @@
         <h2>Period Close — Company Selection</h2>
         <div style="display:flex;align-items:center;gap:0">
           <span id="user-display" class="user-info"></span>
+          <button id="settings-btn" onclick="openSettings()" style="display:none" title="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M11.078 2.25c-.917 0-1.699.663-1.85 1.567L9.05 4.889c-.02.12-.115.26-.297.348a7.493 7.493 0 0 0-.986.57c-.166.115-.334.126-.45.083L6.3 5.508a1.875 1.875 0 0 0-2.282.819l-.922 1.597a1.875 1.875 0 0 0 .432 2.385l.84.692c.095.078.17.229.154.43a7.598 7.598 0 0 0 0 1.139c.015.2-.059.352-.153.43l-.841.692a1.875 1.875 0 0 0-.432 2.385l.922 1.597a1.875 1.875 0 0 0 2.282.818l1.019-.382c.115-.043.283-.031.45.082.312.214.641.405.985.57.182.088.277.228.297.35l.178 1.071c.151.904.933 1.567 1.85 1.567h1.844c.916 0 1.699-.663 1.85-1.567l.178-1.072c.02-.12.114-.26.297-.349.344-.165.673-.356.985-.57.167-.114.335-.125.45-.082l1.02.382a1.875 1.875 0 0 0 2.28-.819l.923-1.597a1.875 1.875 0 0 0-.432-2.385l-.84-.692c-.095-.078-.17-.229-.154-.43a7.614 7.614 0 0 0 0-1.139c-.016-.2.059-.352.153-.43l.84-.692c.708-.582.891-1.59.433-2.385l-.922-1.597a1.875 1.875 0 0 0-2.282-.818l-1.02.382c-.114.043-.282.031-.449-.083a7.49 7.49 0 0 0-.985-.57c-.183-.087-.277-.227-.297-.348l-.179-1.072a1.875 1.875 0 0 0-1.85-1.567h-1.843ZM12 15.75a3.75 3.75 0 1 0 0-7.5 3.75 3.75 0 0 0 0 7.5Z" clip-rule="evenodd"/></svg></button>
           <button id="logout-btn" onclick="logout()">Logout</button>
         </div>
       </div>
@@ -581,9 +595,13 @@
 <div id="modal-overlay">
   <div id="modal">
     <h2>⚠ Operator Intervention Required</h2>
-    <div class="modal-section"><label>Step</label><div id="modal-step" class="value"></div></div>
-    <div class="modal-section"><label>Diagnosis</label><div id="modal-diagnosis" class="value"></div></div>
-    <div class="modal-section"><label>Instructions</label><div id="modal-instructions" class="value"></div></div>
+    <div class="modal-section"><label>Step</label>
+      <div class="value"><span id="modal-step"></span> <span id="modal-status-badge" class="status-badge" style="display:none"></span></div>
+    </div>
+    <div class="modal-section" id="modal-errors-wrap" style="display:none"><label>Errors</label><div id="modal-errors"></div></div>
+    <div class="modal-section" id="modal-resolutions-wrap" style="display:none"><label>Recommendations</label><div id="modal-resolutions"></div></div>
+    <div class="modal-section" id="modal-diagnosis-wrap"><label>Diagnosis</label><div id="modal-diagnosis" class="value"></div></div>
+    <div class="modal-section" id="modal-instructions-wrap"><label>Instructions</label><div id="modal-instructions" class="value"></div></div>
     <div id="param-override-wrap">
       <label>Parameter overrides (JSON array, optional)</label>
       <textarea id="param-override" placeholder='[{"name":"BUKRS","value":"RU06"}]'></textarea>
@@ -651,6 +669,483 @@
       <button id="pm-btn-start">✓ Apply</button>
       <button id="pm-btn-cancel">Cancel</button>
     </div>
+  </div>
+</div>
+
+<!-- Settings overlay (admin only) -->
+<style>
+  #settings-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    display: none; align-items: center; justify-content: center; z-index: 50;
+  }
+  #settings-overlay.visible { display: flex; }
+  #settings-modal {
+    background: var(--panel, #1b1f27); border: 1px solid var(--border, #2c313c);
+    border-radius: 10px; width: min(1100px, 94vw); height: min(760px, 92vh);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #settings-head {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border, #2c313c);
+  }
+  #settings-head h3 { font-size: 15px; font-weight: 600; color: var(--text-bright, #e8edf5); flex: 1; }
+  #settings-head select { background:#11141a; color:#e8edf5; border:1px solid #2c313c; border-radius:6px; padding:5px 8px; }
+  #settings-body { flex: 1; display: flex; min-height: 0; }
+  #settings-steps {
+    width: 240px; border-right: 1px solid var(--border,#2c313c); overflow-y: auto; padding: 6px;
+  }
+  .rail-section-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing:.4px; color: #6b7488;
+    padding: 10px 9px 4px;
+  }
+  .set-step {
+    padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+    color: var(--text, #c3cad6); display:flex; align-items:center; gap:6px;
+  }
+  .set-step:hover { background:#222732; }
+  .set-step.active { background:#283042; color:#fff; }
+  .set-step.dim { opacity:.5; }
+  .set-step .dot { width:7px; height:7px; border-radius:50%; background:#f0a73a; visibility:hidden; }
+  .set-step.has-override .dot { visibility:visible; }
+  #settings-fields { flex: 1; overflow-y: auto; padding: 14px 18px; background: var(--panel, #1b1f27); }
+  .set-group-title { font-size: 11px; text-transform: uppercase; letter-spacing:.5px;
+    color: var(--text-dim,#7b8494); margin: 14px 0 6px; }
+  .set-field { display: grid; grid-template-columns: 220px 1fr auto; gap: 10px;
+    align-items: start; padding: 6px 8px; border-radius: 6px; }
+  .set-field.overridden { background: rgba(240,167,58,.08); }
+  .set-field label { font-size: 12px; color: var(--text,#c3cad6); padding-top:6px; word-break:break-word; }
+  .set-field:has(> .ctl > input[type=checkbox]) label { padding-top:2px; }
+  .set-field .ctl input[type=text], .set-field .ctl select, .set-field .ctl textarea {
+    width: 100%; background:#11141a; color:#e8edf5; border:1px solid #2c313c;
+    border-radius:6px; padding:6px 8px; font-size:12.5px; font-family:inherit; box-sizing:border-box;
+  }
+  .set-field .ctl textarea { min-height: 60px; resize: none; overflow: hidden; }
+  .set-field.inherited .ctl input, .set-field.inherited .ctl select, .set-field.inherited .ctl textarea {
+    opacity:.55;
+  }
+  .mode-map { display:flex; flex-direction:column; gap:6px; }
+  .mode-map-row { display:grid; grid-template-columns: 1fr 1fr; gap:8px; align-items:center; }
+  .mode-map-row label { font-size:11.5px; color:#9aa4b4; }
+  .mode-map-simplify {
+    align-self:flex-start; background:none; border:none; color:#7b96b8; cursor:pointer;
+    font-size:11.5px; padding:2px 0; text-decoration:underline;
+  }
+  .mode-map-simplify:hover { color:#9dc0ef; }
+  .set-field .reset-btn { background:none; border:none; color:#7b8494; cursor:pointer; font-size:11px; padding:6px 4px; }
+  .set-field .reset-btn:hover { color:#f0a73a; }
+  .set-field .reset-btn:disabled { visibility:hidden; }
+  .tip-icon { position:relative; display:inline-block; color:#7b8494; font-size:10px; cursor:help; margin-left:4px; vertical-align:middle; }
+  .tip-icon .tip-text { display:none; position:absolute; bottom:calc(100% + 4px); left:0; transform:none;
+    background:#1e2330; color:#c3cad6; border:1px solid #3c4252; border-radius:6px;
+    padding:6px 9px; font-size:11px; line-height:1.5; white-space:pre-line;
+    width:240px; z-index:200; pointer-events:none; box-shadow:0 4px 12px rgba(0,0,0,.4); }
+  .tip-icon:hover .tip-text { display:block; }
+  #settings-foot { display:flex; align-items:center; gap:10px; padding: 12px 16px;
+    border-top: 1px solid var(--border,#2c313c); }
+  #settings-foot .msg {
+    flex:1; font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:#6b7488;
+  }
+  #settings-foot button { padding:7px 14px; border-radius:6px; border:1px solid #2c313c;
+    background:#222732; color:#e8edf5; cursor:pointer; font-size:12.5px; }
+  #settings-foot button.primary { background:#2563a8; border-color:#2563a8; }
+  #settings-foot button.danger  { color:#f0a73a; }
+  #settings-foot .version-link {
+    font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:#6b7488;
+    text-decoration:none; cursor:pointer; border-bottom: 1px dashed #6b7488;
+  }
+  #settings-foot .version-link:hover { color:var(--text,#c3cad6); border-bottom-color:var(--text,#c3cad6); }
+
+  /* Confirm dialog */
+  #settings-confirm-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:none; align-items:center; justify-content:center; z-index:700;
+  }
+  #settings-confirm-overlay.visible { display:flex; }
+
+  /* Text-input dialog (styled replacement for window.prompt) */
+  #settings-input-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:none; align-items:center; justify-content:center; z-index:700;
+  }
+  #settings-input-overlay.visible { display:flex; }
+  #settings-input-box {
+    background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c);
+    border-radius:10px; padding:24px 26px 18px; width:400px;
+    box-shadow:0 8px 32px rgba(0,0,0,.55);
+  }
+  #settings-input-box h4 { margin:0 0 4px; font-size:14px; color:var(--text-bright,#e8edf5); }
+  #settings-input-box .sub { margin:0 0 14px; font-size:12px; color:var(--text-dim,#7b8494); }
+  #settings-input-box input {
+    width:100%; box-sizing:border-box; background:#11141a; color:#e8edf5;
+    border:1px solid #2c313c; border-radius:6px; padding:8px 10px; font-size:13px; margin-bottom:18px;
+  }
+  #settings-input-box input:focus { outline:none; border-color:#3d6ea5; }
+  #settings-input-box .actions { display:flex; justify-content:flex-end; gap:8px; }
+  #settings-input-box .actions button { padding:7px 18px; border-radius:6px; font-size:13px; cursor:pointer; }
+  #settings-input-box .actions .btn-cancel { background:none; border:1px solid var(--border,#2c313c); color:var(--text,#c3cad6); }
+  #settings-input-box .actions .btn-ok { background:#2563a8; border:none; color:#fff; }
+  #settings-input-box .actions .btn-cancel:hover { border-color:#c3cad6; }
+  #settings-input-box .actions .btn-ok:hover { background:#2f74c0; }
+  #settings-confirm-box {
+    background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c);
+    border-radius:10px; padding:28px 28px 20px; width:340px;
+    box-shadow:0 8px 32px rgba(0,0,0,.55);
+  }
+  #settings-confirm-box h4 { margin:0 0 10px; font-size:14px; color:var(--text-bright,#e8edf5); }
+  #settings-confirm-box p  { margin:0 0 22px; font-size:13px; color:var(--text,#c3cad6); line-height:1.5; }
+  #settings-confirm-box .actions { display:flex; justify-content:flex-end; gap:8px; }
+  #settings-confirm-box .actions button { padding:7px 18px; border-radius:6px; font-size:13px; cursor:pointer; }
+  #settings-confirm-box .actions .btn-cancel { background:none; border:1px solid var(--border,#2c313c); color:var(--text,#c3cad6); }
+  #settings-confirm-box .actions .btn-confirm { background:#c0392b; border:none; color:#fff; }
+  #settings-confirm-box .actions .btn-cancel:hover  { border-color:#c3cad6; }
+  #settings-confirm-box .actions .btn-confirm:hover { background:#e74c3c; }
+
+  /* History panel */
+  #settings-history-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,.55);
+    display:none; align-items:center; justify-content:center; z-index:200;
+  }
+  #settings-history-overlay.visible { display:flex; }
+  #settings-history-box {
+    background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c);
+    border-radius:10px; width:min(960px,92vw); max-height:82vh;
+    min-width:420px; min-height:260px;
+    display:flex; flex-direction:column;
+    box-shadow:0 8px 32px rgba(0,0,0,.55);
+    resize:both; overflow:hidden;
+  }
+  #settings-history-box .hist-head {
+    display:flex; align-items:center; padding:14px 18px;
+    border-bottom:1px solid var(--border,#2c313c); flex-shrink:0;
+  }
+  #settings-history-box .hist-head h4 { flex:1; margin:0; font-size:14px; color:var(--text-bright,#e8edf5); }
+  #settings-history-box .hist-head button { background:none; border:none; color:#7b8494; font-size:20px; cursor:pointer; }
+  #settings-history-box .hist-body { overflow-y:auto; flex:1; padding:8px 0; }
+  .hist-row { display:grid; grid-template-columns:60px 1fr 110px 16px 18px; gap:10px;
+    padding:9px 18px; font-size:12.5px; color:var(--text,#c3cad6);
+    border-bottom:1px solid rgba(44,49,60,.5); cursor:pointer; user-select:none; }
+  .hist-row:hover { background:rgba(255,255,255,.03); }
+  .hist-row .ver { color:#7b8494; font-size:11px; }
+  .hist-row .user { color:var(--text-bright,#e8edf5); font-weight:500; }
+  .hist-row .ts { color:#7b8494; font-size:11px; text-align:right; }
+  .hist-row .expand-icon { color:#7b8494; font-size:10px; align-self:center; text-align:center; }
+  .hist-row .hist-del { background:none; border:none; color:#5b6474; cursor:pointer;
+    font-size:12px; line-height:1; padding:0; align-self:center; text-align:center; }
+  .hist-row .hist-del:hover { color:#e06c75; }
+  .hist-diff { display:none; background:#0d1017; border-bottom:1px solid rgba(44,49,60,.6); }
+  .diff-table { width:100%; border-collapse:collapse; font-size:11.5px; table-layout:fixed; }
+  .diff-table th { padding:5px 14px; text-align:left; color:#7b8494;
+    font-size:10px; text-transform:uppercase; letter-spacing:.4px;
+    border-bottom:1px solid rgba(44,49,60,.8); font-weight:500;
+    position:relative; overflow:hidden; white-space:nowrap; }
+  .diff-table td { padding:5px 14px; vertical-align:top; font-family:monospace; overflow-wrap:break-word; word-break:break-all; }
+  .diff-table tr:not(:last-child) td { border-bottom:1px solid rgba(44,49,60,.3); }
+  .diff-path { color:var(--text,#c3cad6); font-weight:500; }
+  .diff-old { color:#e06c75; }
+  .diff-new { color:#98c379; }
+  .diff-added td { background:rgba(152,195,121,.05); }
+  .diff-removed td { background:rgba(224,108,117,.05); }
+  .diff-changed td { background:rgba(240,167,58,.04); }
+  .diff-nil { color:#3c4455; font-style:italic; }
+  .diff-base { color:#7b8494; font-style:italic; }
+  mark.diff-del { background:rgba(224,108,117,.32); color:#e06c75; border-radius:2px; padding:0 1px; font-style:normal; }
+  mark.diff-add { background:rgba(152,195,121,.32); color:#98c379; border-radius:2px; padding:0 1px; font-style:normal; }
+  .col-resize-handle {
+    position:absolute; right:0; top:0; bottom:0; width:5px;
+    cursor:col-resize; user-select:none; z-index:1;
+  }
+  .col-resize-handle:hover, .col-resize-handle.dragging { background:rgba(100,110,130,.4); }
+  #settings-history-box .hist-empty,
+  .diff-empty { padding:14px 18px; color:#7b8494; font-size:12px; font-style:italic; }
+
+  /* ── Schema-driven form: highlighted sticky section headers ── */
+  .set-section { margin-top: 48px; }
+  .set-section:first-child { margin-top: 2px; }
+  .set-section-header {
+    position: sticky; top: 0; z-index: 5;
+    display:flex; align-items:center; gap:8px;
+    margin: 0 0 8px; padding: 6px 10px;
+    background: #23293a; border-left: 3px solid #3d6ea5; border-radius: 4px;
+    font-size: 11px; text-transform: uppercase; letter-spacing:.6px;
+    color: #a9b7cc; font-weight: 600;
+  }
+  .set-section-header .add-field-wrap { margin-left:auto; position:relative; }
+  .set-section-header .add-field-btn {
+    background:#2b3346; border:1px solid #3a4256; color:#c3cad6;
+    border-radius:5px; padding:2px 8px; font-size:11px; cursor:pointer; text-transform:none; letter-spacing:0;
+  }
+  .set-section-header .add-field-btn:hover { background:#333c52; color:#fff; }
+  .add-field-menu {
+    display:none; position:absolute; right:0; top:calc(100% + 4px); z-index:30;
+    background:#1e2330; border:1px solid #3c4252; border-radius:6px; padding:4px;
+    max-height:240px; overflow-y:auto; min-width:200px; box-shadow:0 6px 20px rgba(0,0,0,.5);
+  }
+  .add-field-menu.open { display:block; }
+  .add-field-menu button {
+    display:block; width:100%; text-align:left; background:none; border:none; color:#c3cad6;
+    padding:5px 9px; font-size:12px; cursor:pointer; border-radius:4px;
+  }
+  .add-field-menu button:hover { background:#2b3346; color:#fff; }
+  .add-field-menu .empty { color:#6b7488; font-size:11.5px; padding:6px 9px; font-style:italic; }
+  .set-field .del-field-btn { background:none;border:none;color:#7b8494;cursor:pointer;font-size:13px;padding:6px 4px; }
+  .set-field .del-field-btn:hover { color:#e06c75; }
+  /* Writable combobox (object_name under a TOOLS action) */
+  .combo { position:relative; }
+  .combo .combo-input { padding-right:26px !important; }
+  .combo .combo-caret {
+    position:absolute; right:6px; top:50%; transform:translateY(-50%);
+    background:none; border:none; color:#7b8494; cursor:pointer; font-size:11px; padding:2px 4px; line-height:1;
+  }
+  .combo .combo-caret:hover { color:#c3cad6; }
+  .combo .combo-menu {
+    display:none; position:absolute; left:0; right:0; top:calc(100% + 4px); z-index:30;
+    background:#1e2330; border:1px solid #3c4252; border-radius:6px; padding:4px;
+    max-height:240px; overflow-y:auto; box-shadow:0 6px 20px rgba(0,0,0,.5);
+  }
+  .combo .combo-opt {
+    padding:6px 9px; font-size:12px; color:#c3cad6; cursor:pointer; border-radius:4px; white-space:nowrap;
+  }
+  .combo .combo-opt:hover { background:#2b3346; color:#fff; }
+  .set-subheader {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 11px; text-transform: uppercase; letter-spacing:.5px;
+    color: #6b7488; margin: 14px 0 8px; padding: 0;
+  }
+  .set-subheader::before, .set-subheader::after {
+    content: ""; flex: 1 1 auto; border-top: 1px solid #3a4152;
+  }
+  .set-divider { border-top: 1px solid #6b7488; margin: 10px 8px 14px; }
+
+  /* ── Param rows editor ── */
+  .param-rows { display:flex; flex-direction:column; gap:6px; }
+  .param-row { display:grid; grid-template-columns: 1.4fr .7fr 1.6fr 1.6fr 22px; gap:6px; align-items:center; }
+  .param-row.param-kv { grid-template-columns: 1fr 1.6fr 22px; }
+  .param-empty { font-size:12px; color:#6b7488; padding:4px 0; }
+  .param-row input, .param-row select {
+    width:100%; background:#11141a; color:#e8edf5; border:1px solid #2c313c;
+    border-radius:5px; padding:5px 7px; font-size:12px; font-family:inherit; box-sizing:border-box;
+  }
+  .param-row .rm { background:none;border:none;color:#7b8494;cursor:pointer;font-size:14px;padding:0; }
+  .param-row .rm:hover { color:#e06c75; }
+  .param-row .rm:disabled { visibility:hidden; }
+  /* company mode: same rows as base, plus the inherited/overridden state */
+  .param-row.overridden input, .param-row.overridden select { border-color:#5a4a2a; background:rgba(240,167,58,.06); }
+  .param-row.inherited input, .param-row.inherited select { color:#9aa4b4; }
+  .param-row input[readonly] { opacity:.75; cursor:not-allowed; }
+  .param-head { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:#6b7488; }
+  .param-add-btn, .step-add-btn {
+    align-self:flex-start; margin-top:4px; background:#22314a; border:1px solid #34507a; color:#9dc0ef;
+    border-radius:6px; padding:5px 12px; font-size:12px; cursor:pointer;
+  }
+  .param-add-btn:hover, .step-add-btn:hover { background:#294067; color:#fff; }
+  .params-dict textarea {
+    width:100%; background:#11141a; color:#e8edf5; border:1px solid #2c313c;
+    border-radius:6px; padding:6px 8px; font-size:12.5px; font-family:monospace; box-sizing:border-box; min-height:52px;
+  }
+
+  /* ── Base-mode step list controls ── */
+  .set-step .step-tools { margin-left:auto; display:none; gap:2px; }
+  .set-step:hover .step-tools { display:flex; }
+  .set-step .step-tools button {
+    background:none; border:none; color:#8891a3; cursor:pointer; font-size:12px; padding:0 3px; line-height:1;
+  }
+  .set-step .step-tools button:hover { color:#fff; }
+  .set-step .step-tools button.del:hover { color:#e06c75; }
+  #settings-steps .rail-action {
+    display:flex; gap:8px; padding:8px 6px 4px; border-top:1px solid rgba(44,49,60,.6); margin-top:6px;
+  }
+
+  /* ── Prompt field (large textarea) preview + expand ── */
+  .prompt-field .ctl { display:flex; flex-direction:column; gap:4px; }
+  .prompt-preview {
+    background:#11141a; border:1px solid #2c313c; border-radius:6px; padding:6px 8px;
+    font-size:12px; color:#aeb7c6; white-space:pre-wrap;
+    font-family:monospace; line-height:1.4;
+    display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:4; overflow:hidden;
+  }
+  .prompt-preview.empty { color:#5c6474; font-style:italic; }
+  .prompt-expand-btn {
+    align-self:flex-start; background:#22314a; border:1px solid #34507a; color:#9dc0ef;
+    border-radius:5px; padding:3px 10px; font-size:11.5px; cursor:pointer;
+  }
+  .prompt-expand-btn:hover { background:#294067; color:#fff; }
+
+  /* ── Prompt editor modal (CodeMirror + preview) ── */
+  #prompt-editor-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,.6);
+    display:none; align-items:center; justify-content:center; z-index:300;
+  }
+  #prompt-editor-overlay.visible { display:flex; }
+  #prompt-editor-box {
+    background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c); border-radius:10px;
+    width:min(1180px,95vw); height:min(820px,92vh); display:flex; flex-direction:column;
+    box-shadow:0 10px 40px rgba(0,0,0,.6);
+  }
+  #prompt-editor-box .pe-head {
+    display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--border,#2c313c);
+  }
+  #prompt-editor-box .pe-head h4 { flex:1; margin:0; font-size:14px; color:var(--text-bright,#e8edf5); }
+  .pe-toggle { display:flex; border:1px solid #2c313c; border-radius:6px; overflow:hidden; }
+  .pe-toggle button { background:#1a1e27; border:none; color:#9aa4b5; padding:5px 12px; font-size:12px; cursor:pointer; }
+  .pe-toggle button.active { background:#2563a8; color:#fff; }
+  #prompt-editor-box .pe-close { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
+  #prompt-editor-box .pe-body { flex:1; display:flex; min-height:0; }
+  .pe-pane { flex:1; min-width:0; display:flex; }
+  .pe-pane.hidden { display:none; }
+  .pe-editor-pane { border-right:1px solid var(--border,#2c313c); }
+  .pe-editor-pane .CodeMirror { width:100%; height:100%; font-size:13px; background:#11141a; color:#dfe6f0; }
+  .pe-editor-pane .CodeMirror-cursor { border-left:1px solid #e8edf5; }
+  .pe-editor-pane .CodeMirror-selected { background:#2a3550 !important; }
+  .pe-editor-pane .CodeMirror-line::selection, .pe-editor-pane .CodeMirror-line ::selection { background:#2a3550; }
+  .pe-editor-pane .cm-s-default .cm-header { color:#7fb0e8; }
+  .pe-editor-pane .cm-s-default .cm-strong { color:#e8edf5; }
+  .pe-editor-pane .cm-s-default .cm-em { color:#c8d2e0; }
+  .pe-editor-pane .cm-s-default .cm-link { color:#6ca8f0; }
+  .pe-editor-pane .cm-s-default .cm-comment { color:#8aa06a; }
+  .pe-editor-pane .cm-s-default .cm-variable-2 { color:#9ac9a0; }
+  .pe-editor-pane .cm-placeholder-token { color:#f0c987; background:rgba(240,167,58,.14); border-radius:3px; }
+  .pe-preview {
+    flex:1; display:block; overflow-y:auto; padding:14px 20px; background:#0d1017; color:#c9d2df; font-size:14px; line-height:1.6;
+  }
+  .pe-preview > *:first-child { margin-top:0; }
+  .pe-preview p { margin:.6em 0; }
+  /* Plain prompt text: keep the author's line breaks and indentation (JSON skeletons,
+     nested braces) instead of reflowing it into one flat paragraph. */
+  .pe-preview p.md-block { white-space:pre-wrap; tab-size:2; }
+  .pe-preview ul ul, .pe-preview ol ol, .pe-preview ul ol, .pe-preview ol ul { margin:.15em 0 .15em 1.2em; }
+  .pe-preview h1,.pe-preview h2,.pe-preview h3 { color:#e8edf5; margin:.7em 0 .3em; line-height:1.3; }
+  .pe-preview h1 { font-size:1.5em; } .pe-preview h2 { font-size:1.3em; } .pe-preview h3 { font-size:1.12em; }
+  .pe-preview code { background:#1b2130; padding:1px 5px; border-radius:4px; font-size:.9em; }
+  .pe-preview pre { background:#161b28; padding:10px 12px; border-radius:6px; overflow-x:auto; margin:.5em 0; }
+  .pe-preview pre code { background:none; padding:0; }
+  .pe-preview ul,.pe-preview ol { margin:.4em 0 .4em 1.4em; }
+  .pe-preview a { color:#6ca8f0; }
+  .pe-preview .ph { background:rgba(240,167,58,.18); color:#f0c987; border-radius:3px; padding:0 2px; }
+  #prompt-editor-box .pe-foot {
+    display:flex; align-items:center; justify-content:flex-end; gap:8px;
+    padding:12px 16px; border-top:1px solid var(--border,#2c313c);
+  }
+  #prompt-editor-box .pe-foot button { padding:7px 16px; border-radius:6px; font-size:13px; cursor:pointer; border:1px solid #2c313c; background:#222732; color:#e8edf5; }
+  #prompt-editor-box .pe-foot button.primary { background:#2563a8; border-color:#2563a8; }
+  .cm-placeholder-token { color:#f0c987; background:rgba(240,167,58,.12); border-radius:3px; }
+
+  /* ── Company registry manager ── */
+  #registry-overlay {
+    position:fixed; inset:0; background:rgba(0,0,0,.6);
+    display:none; align-items:center; justify-content:center; z-index:210;
+  }
+  #registry-overlay.visible { display:flex; }
+  #registry-box {
+    background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c); border-radius:10px;
+    width:min(560px,92vw); max-height:82vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.55);
+  }
+  #registry-box .reg-head { display:flex; align-items:center; padding:14px 18px; border-bottom:1px solid var(--border,#2c313c); }
+  #registry-box .reg-head h4 { flex:1; margin:0; font-size:14px; color:var(--text-bright,#e8edf5); }
+  #registry-box .reg-head button { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
+  #registry-box .reg-body { overflow-y:auto; padding:10px 18px; }
+  .reg-row { display:flex; align-items:center; gap:8px; padding:7px 0; border-bottom:1px solid rgba(44,49,60,.5); font-size:13px; color:#c3cad6; }
+  .reg-row .code { font-family:monospace; color:#9dc0ef; width:80px; }
+  .reg-row .name { flex:1; }
+  .reg-row button { background:none;border:none;color:#7b8494;cursor:pointer;font-size:12px; }
+  .reg-row button:hover { color:#e06c75; }
+  .reg-new { display:grid; grid-template-columns:90px 1fr auto; gap:8px; padding:12px 0 4px; }
+  .reg-new input { background:#11141a;color:#e8edf5;border:1px solid #2c313c;border-radius:5px;padding:6px 8px;font-size:12.5px; }
+  .reg-new button { background:#22314a;border:1px solid #34507a;color:#9dc0ef;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12.5px; }
+</style>
+<div id="settings-overlay">
+  <div id="settings-modal">
+    <div id="settings-head">
+      <h3>Settings</h3>
+      <label style="font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:#6b7488">Company</label>
+      <select id="settings-company" onchange="loadSettings(this.value)"></select>
+      <button onclick="openRegistry()" title="Create / rename / delete companies"
+              style="background:#222732;border:1px solid #2c313c;color:#c3cad6;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">Manage companies</button>
+      <button onclick="closeSettings()" style="background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer">×</button>
+    </div>
+    <div id="settings-body">
+      <div id="settings-steps"></div>
+      <div id="settings-fields"></div>
+    </div>
+    <div id="settings-foot">
+      <span class="msg">
+        <a class="version-link" id="settings-version-link" onclick="openSettingsHistory()" style="display:none"></a>
+        <span class="foot-sep" style="margin-left:16px;color:#3c4252">|</span>
+        <span class="status-label" style="margin-left:16px;text-transform:none;font-size:12.5px">Status:</span>
+        <span id="settings-msg" style="margin-left:6px;text-transform:none;font-size:12.5px;color:#c3cad6"></span>
+      </span>
+      <button class="danger" id="settings-reset-btn" onclick="resetAllSettings()">Reset all to base</button>
+      <button class="primary" onclick="saveSettings()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Confirm dialog (replaces browser confirm()) -->
+<div id="settings-confirm-overlay">
+  <div id="settings-confirm-box">
+    <h4 id="settings-confirm-title">Confirm action</h4>
+    <p id="settings-confirm-text"></p>
+    <div class="actions">
+      <button class="btn-cancel" id="settings-confirm-cancel">Cancel</button>
+      <button class="btn-confirm" id="settings-confirm-ok">Reset</button>
+    </div>
+  </div>
+</div>
+
+<!-- Text-input dialog (replaces browser prompt()) -->
+<div id="settings-input-overlay">
+  <div id="settings-input-box">
+    <h4 id="settings-input-title">Enter value</h4>
+    <p class="sub" id="settings-input-sub"></p>
+    <input type="text" id="settings-input-field" autocomplete="off">
+    <div class="actions">
+      <button class="btn-cancel" id="settings-input-cancel">Cancel</button>
+      <button class="btn-ok" id="settings-input-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- History panel -->
+<div id="settings-history-overlay">
+  <div id="settings-history-box">
+    <div class="hist-head">
+      <h4 id="hist-title">Change history</h4>
+      <button onclick="closeSettingsHistory()">×</button>
+    </div>
+    <div class="hist-body" id="hist-body"></div>
+  </div>
+</div>
+
+<!-- Prompt (Markdown) editor -->
+<div id="prompt-editor-overlay">
+  <div id="prompt-editor-box">
+    <div class="pe-head">
+      <h4 id="pe-title">Edit prompt</h4>
+      <div class="pe-toggle">
+        <button id="pe-mode-edit"    onclick="setPromptView('edit')">Edit</button>
+        <button id="pe-mode-split"   onclick="setPromptView('split')" class="active">Split</button>
+        <button id="pe-mode-preview" onclick="setPromptView('preview')">Preview</button>
+      </div>
+      <button class="pe-close" onclick="closePromptEditor(false)">×</button>
+    </div>
+    <div class="pe-body">
+      <div class="pe-pane pe-editor-pane" id="pe-editor-pane"></div>
+      <div class="pe-pane pe-preview" id="pe-preview"></div>
+    </div>
+    <div class="pe-foot">
+      <button onclick="closePromptEditor(false)">Cancel</button>
+      <button class="primary" onclick="closePromptEditor(true)">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Company registry manager -->
+<div id="registry-overlay">
+  <div id="registry-box">
+    <div class="reg-head">
+      <h4>Manage companies</h4>
+      <button onclick="closeRegistry()">×</button>
+    </div>
+    <div class="reg-body" id="registry-body"></div>
   </div>
 </div>
 
@@ -935,6 +1430,8 @@ function renderDashboard() {
   const grid = document.getElementById('company-grid');
   const userDisplay = document.getElementById('user-display');
   userDisplay.textContent = appState.user.display_name || appState.user.username;
+  document.getElementById('settings-btn').style.display =
+    (appState.user.role === 'admin') ? '' : 'none';
   grid.innerHTML = '';
   appState.companies.forEach(c => {
     appState.dashboardStatus[c.code] = c.run_status || {status: 'idle'};
@@ -1293,12 +1790,62 @@ function onStepEnd(e) {
 
 function onInterrupt(e) {
   appState.interrupted = true;
-  document.getElementById('modal-step').textContent        = e.step_id || '';
-  document.getElementById('modal-diagnosis').textContent   = e.diagnosis || '';
-  document.getElementById('modal-instructions').textContent = e.user_instructions || '';
+  document.getElementById('modal-step').textContent = e.step_id || '';
+
+  const badge   = document.getElementById('modal-status-badge');
+  const errWrap = document.getElementById('modal-errors-wrap');
+  const resWrap = document.getElementById('modal-resolutions-wrap');
+  const diagWrap = document.getElementById('modal-diagnosis-wrap');
+  const instrWrap = document.getElementById('modal-instructions-wrap');
+  const result = e.result;
+
+  if (result && (Array.isArray(result.errors) || Array.isArray(result.resolutions))) {
+    // Structured view: status badge + errors table + deduplicated resolutions table
+    const status = result.status || 'completed';
+    badge.textContent = status;
+    badge.className = 'status-badge ' + status;
+    badge.style.display = '';
+
+    document.getElementById('modal-errors').innerHTML = renderErrorsTable(result.errors || []);
+    document.getElementById('modal-resolutions').innerHTML = renderResolutionsTable(result.resolutions || []);
+    errWrap.style.display = (result.errors || []).length ? '' : 'none';
+    resWrap.style.display = (result.resolutions || []).length ? '' : 'none';
+    diagWrap.style.display = 'none';
+    instrWrap.style.display = 'none';
+  } else {
+    // Legacy text view
+    badge.style.display = 'none';
+    errWrap.style.display = 'none';
+    resWrap.style.display = 'none';
+    diagWrap.style.display = '';
+    instrWrap.style.display = '';
+    document.getElementById('modal-diagnosis').textContent    = e.diagnosis || '';
+    document.getElementById('modal-instructions').textContent = e.user_instructions || '';
+  }
+
   document.getElementById('modal-overlay').classList.add('visible');
   document.getElementById('param-override').value = '';
   setStatus(`⚠ Waiting for decision on ${e.step_id}`);
+}
+
+function renderErrorsTable(errors) {
+  if (!errors.length) return '';
+  const rows = errors.map(x => `<tr>
+    <td>${esc(x.object_id)}</td><td>${esc(x.error)}</td>
+    <td>${esc(x.cause)}</td><td>${esc(x.resolution_id)}</td></tr>`).join('');
+  return `<table class="det-table"><thead><tr>
+    <th>Object</th><th>Error</th><th>Cause</th><th>Fix →</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderResolutionsTable(resolutions) {
+  if (!resolutions.length) return '';
+  const rows = resolutions.map(r => `<tr>
+    <td>${esc(r.id)}</td><td>${esc(r.recommendation)}</td>
+    <td>${esc((r.affected_objects || []).join(', '))}</td></tr>`).join('');
+  return `<table class="det-table"><thead><tr>
+    <th>#</th><th>Recommendation</th><th>Affected objects</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function onRunEnd(e) {
@@ -1841,6 +2388,1549 @@ document.getElementById('login-pass').addEventListener('keydown', e => {
 document.getElementById('login-user').addEventListener('keydown', e => {
   if (e.key === 'Enter') document.getElementById('login-pass').focus();
 });
+
+// ═══════════════════════════════════════════════════════════
+//  Admin Settings panel
+// ═══════════════════════════════════════════════════════════
+
+const settingsState = {
+  mode: 'company',       // 'base' | 'company'
+  descriptor: null,      // form descriptor (fetched once from /api/settings/form-schema)
+  code: null, version: 0, steps: [], runContext: {},
+  override: {},          // working delta the admin is editing (step-shaped)
+  runOverride: {},       // working run_context edits
+  globals: {}, baseSteps: [],   // base-mode: editable globals + full step objects
+  selectedStep: null,    // step_id | '__run_context__' | '__globals__'
+};
+
+const SECTION_TITLES = {
+  step: 'Step', pre_check: 'Pre-check',
+  validate: 'Validate', rollback: 'Rollback', on_error: 'On error',
+};
+
+// RSPARAMS-KIND: SAP selection-screen parameter kind (see RFC handler z_execute_submit).
+const PARAM_KINDS = [['P', 'P'], ['S', 'S']];
+
+async function ensureDescriptor() {
+  if (settingsState.descriptor) return;
+  const r = await fetch('/api/settings/form-schema', {credentials:'same-origin'});
+  if (r.ok) settingsState.descriptor = await r.json();
+}
+
+async function openSettings() {
+  await ensureDescriptor();
+  document.getElementById('settings-overlay').classList.add('visible');
+  await refreshSettingsCompanies('__base__');
+  loadSettings('__base__');
+}
+
+// Options come from the company registry (not the login-time company list), so a company
+// created in "Manage companies" is selectable straight away.
+async function refreshSettingsCompanies(select) {
+  const sel = document.getElementById('settings-company');
+  const keep = select || sel.value || '__base__';
+  let codes = [];
+  const r = await fetch('/api/registry/companies', {credentials:'same-origin'});
+  if (r.ok) codes = (await r.json()).map(c => c.code);
+  else codes = (appState.user.companies || []).map(c => c.code);   // fallback
+  sel.innerHTML = `<option value="__base__">⚙ Base</option>` +
+    codes.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  sel.value = codes.includes(keep) || keep === '__base__' ? keep : '__base__';
+  return sel.value;
+}
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('visible');
+}
+
+function loadSettings(code) {
+  return code === '__base__' ? loadBaseSettings() : loadCompanySettings(code);
+}
+
+async function loadCompanySettings(code) {
+  settingsState.mode = 'company';
+  setSettingsMsg('Loading…');
+  const r = await fetch(`/api/settings/${code}`, {credentials:'same-origin'});
+  if (!r.ok) { setSettingsMsg('Failed to load settings (' + r.status + ')'); return; }
+  const data = await r.json();
+  settingsState.code = code;
+  settingsState.version = data.version;
+  settingsState.steps = data.steps;
+  settingsState.runContext = data.run_context || {};
+  settingsState.runOverride = {...settingsState.runContext};
+  settingsState.override = data.override || {};   // the stored delta, edited in place
+  settingsState.savedOverride = JSON.parse(JSON.stringify(settingsState.override));
+  settingsState.savedRunOverride = JSON.parse(JSON.stringify(settingsState.runOverride));
+  settingsState.selectedStep = data.steps[0] ? data.steps[0].step_id : '__run_context__';
+  renderSettingsSteps();
+  renderSettingsFields();
+  updateVersionLink(data.version);
+  setSettingsMsg('');
+}
+
+async function loadBaseSettings() {
+  settingsState.mode = 'base';
+  setSettingsMsg('Loading…');
+  const r = await fetch('/api/settings/base', {credentials:'same-origin'});
+  if (!r.ok) { setSettingsMsg('Failed to load base (' + r.status + ')'); return; }
+  const data = await r.json();
+  settingsState.code = '__base__';
+  settingsState.version = data.version;
+  settingsState.globals = data.globals || {};
+  settingsState.baseSteps = data.steps || [];
+  settingsState.savedBase = JSON.stringify({globals: settingsState.globals, steps: settingsState.baseSteps});
+  if (!settingsState.baseSteps.some(s => s.step_id === settingsState.selectedStep))
+    settingsState.selectedStep = '__globals__';
+  renderSettingsSteps();
+  renderSettingsFields();
+  updateVersionLink(data.version);
+  setSettingsMsg('');
+}
+
+function stepDelta(sid) {
+  return (settingsState.override[sid] = settingsState.override[sid] || {});
+}
+
+// ── Left rail ────────────────────────────────────────────────
+function renderSettingsSteps() {
+  const box = document.getElementById('settings-steps');
+  const rb = document.getElementById('settings-reset-btn');
+  if (rb) rb.textContent = settingsState.mode === 'base' ? 'Discard changes' : 'Reset all to base';
+  return settingsState.mode === 'base' ? renderBaseRail(box) : renderCompanyRail(box);
+}
+
+function renderCompanyRail(box) {
+  let html = `<div class="set-step ${settingsState.selectedStep==='__run_context__'?'active':''}"
+                   onclick="selectSettingsStep('__run_context__')">
+                <span class="dot"></span>Company data</div>`;
+  html += settingsState.steps.map(s => {
+    const ov = Object.keys(settingsState.override[s.step_id] || {}).length > 0;
+    const disabled = (settingsState.override[s.step_id] || {}).enabled === false;
+    return `<div class="set-step ${s.step_id===settingsState.selectedStep?'active':''} ${ov?'has-override':''} ${disabled?'dim':''}"
+                 onclick="selectSettingsStep('${esc(s.step_id)}')">
+              <span class="dot"></span>${esc(s.step_id)}</div>`;
+  }).join('');
+  box.innerHTML = html;
+}
+
+function renderBaseRail(box) {
+  let html = `<div class="set-step ${settingsState.selectedStep==='__globals__'?'active':''}"
+                   onclick="selectSettingsStep('__globals__')">
+                <span class="dot"></span><b>Global settings</b></div>
+              <div class="rail-section-label">Steps</div>`;
+  html += settingsState.baseSteps.map((s, i) => {
+    const disabled = s.enabled === false;
+    return `<div class="set-step ${s.step_id===settingsState.selectedStep?'active':''} ${disabled?'dim':''}"
+                 onclick="selectSettingsStep('${esc(s.step_id)}')">
+              <span class="dot" style="visibility:hidden"></span>${esc(s.step_id)}
+              <span class="step-tools">
+                <button title="Move up"   onclick="event.stopPropagation();moveBaseStep(${i},-1)">▲</button>
+                <button title="Move down" onclick="event.stopPropagation();moveBaseStep(${i},1)">▼</button>
+                <button class="del" title="Delete step" onclick="event.stopPropagation();deleteBaseStep(${i})">✕</button>
+              </span></div>`;
+  }).join('');
+  html += `<div class="rail-action"><button class="step-add-btn" onclick="addBaseStep()">＋ Add step</button></div>`;
+  box.innerHTML = html;
+}
+
+function selectSettingsStep(sid) {
+  settingsState.selectedStep = sid;
+  renderSettingsSteps();
+  renderSettingsFields();
+}
+
+// ── Right pane ───────────────────────────────────────────────
+function renderSettingsFields() {
+  return settingsState.mode === 'base' ? renderBaseFields() : renderCompanyFields();
+}
+
+function renderCompanyFields() {
+  const box = document.getElementById('settings-fields');
+  if (settingsState.selectedStep === '__run_context__') {
+    box.innerHTML = '<div class="set-section-header">Company data</div>' +
+      Object.entries(settingsState.runOverride).map(([k,v]) =>
+        `<div class="set-field">
+           <label>${esc(k)}</label>
+           <div class="ctl"><input type="text" value="${esc(v==null?'':v)}"
+                oninput="settingsState.runOverride['${esc(k)}']=this.value"></div>
+           <span></span></div>`).join('');
+    return;
+  }
+  // Same descriptor-driven form as base mode — see renderStepForm.
+  renderStepForm(box);
+}
+
+const FIELD_HELP = {
+  'description':              'Human-readable step name shown in the UI timeline',
+  'action_type':              'SAP operation type:\n• SUBMIT — background ABAP report\n• FM — RFC function module\n• BAPI — business API call\n• BDC — batch input session\n• TOOLS — MCP tool call',
+  'object_name':              'SAP program / FM / BAPI name, or MCP tool name to execute',
+  'async':                    'true: submit as background SAP job and poll for completion\nfalse: wait inline; result (spool) returned in same RFC call',
+  'test_run':                 'Simulation mode — executes without posting real documents',
+  'group':                    'Parallel group name; steps sharing the same value run simultaneously',
+  'poll_timeout_sec':         'Max seconds to wait for a background job before timeout (overrides default)',
+  'enabled':                  'Include this step in the period-close run',
+  'pre_check.enabled':        'Run a precondition check before executing the main step',
+  'pre_check.mode':           'How to evaluate the pre-check result:\n• comparison — compare table row values\n• llm — AI analysis of output',
+  'pre_check.action_type':    'SAP operation type for the pre-check call',
+  'pre_check.object_name':    'SAP program / FM / tool name used for the pre-check',
+  'pre_check.async':          'true: pre-check runs as background job\nfalse (recommended): waits inline and returns spool immediately',
+  'pre_check.comparison.select':  'Row selection rule: empty / non_empty / first / last',
+  'pre_check.comparison.on_pass': 'What to do when the pre-check passes: execute / skip',
+  'pre_check.comparison.on_fail': 'What to do when the pre-check fails: execute / skip / analyse',
+  'validate.run':             'Run a dedicated verification action (e.g. read a table) and validate ITS output,\ninstead of validating the executed step\'s own spool/rows',
+  'validate.run.action_type': 'SAP operation type for the verification action',
+  'validate.run.object_name': 'SAP program / FM / tool name used for verification',
+  'validate.run.async':       'true: verification runs as background job\nfalse (recommended): waits inline and returns spool immediately',
+  'validate.mode':            'How to judge step success:\n• keyword — scan spool/rows for ok/error patterns\n• llm — AI analysis of output',
+  'validate.keyword.source':  'What to scan: spool text / table rows / RFC messages',
+  'validate.keyword.ok_patterns':    'Comma-separated substrings that indicate success',
+  'validate.keyword.error_patterns': 'Comma-separated substrings that indicate failure',
+  'on_error.mode':             'How deep the AI analysis goes after a failure:\n• explain — cheap, read-only summary\n• diagnose — full ReAct investigation with SAP tools\nLeave as default to diagnose everything, or pick "Custom per failure type" to set a different depth for pre-check / execute / poll / validate failures.',
+  'on_error.explain_prompt':   'Prompt used for the cheap "explain" depth — a short LLM summary of the finding shown to the operator (no SAP tool calls)',
+  'on_error.analysis.role':    'Persona/role the AI takes during full "diagnose" analysis, e.g. "You are an SAP FI consultant…"',
+  'on_error.analysis.context_template': 'Template describing the failure for the AI.\nSupports {{company_code}}, {{period}}, {{fiscal_year}} and {{errors}} placeholders — {{errors}} is replaced with the formatted error context',
+  'on_error.analysis.goal':    'What the AI should determine or achieve during the investigation',
+  'on_error.analysis.tools':   'Description of the diagnostic tools available to the AI (sap_read_table, sap_read_spool, sap_job_status, sap_check_period)',
+  'on_error.analysis.instructions': 'Step-by-step guidance for how the AI should investigate the failure',
+  'on_error.analysis.output_format': 'Required structure for the AI\'s final diagnosis, e.g. JSON with root_cause / action / params',
+  'on_error.analysis.rules':   'Constraints the AI must follow while diagnosing, e.g. "never post documents, only read data"',
+  'on_error.analysis.max_tool_calls': 'Maximum diagnostic tool calls the AI may make before it must conclude (overrides the global default)',
+  'rollback.enabled':         'Enable a rollback action if the operator chooses to undo this step',
+  'rollback.action_type':     'SAP operation type for the rollback call',
+  'rollback.object_name':     'SAP program / FM / tool name used for rollback',
+  'rollback.test_run':        'Simulation mode for the rollback action',
+};
+
+const GLOBAL_FIELD_HELP = {
+  'defaults.max_retries':       'How many times a failing step retries (execute → analysis → retry) before escalating to the operator',
+  'defaults.poll_interval_sec': 'Seconds between status checks while a background SAP job is running',
+  'defaults.poll_timeout_sec':  'Max seconds to wait for a background job before timing out (a step can override this)',
+  'defaults.test_run':          'Default simulation mode for steps that don\'t set their own test_run',
+  'defaults.reset_each_run':    'Start every run from step 1, ignoring any previously completed steps for the company',
+  'llm_profiles.analysis.provider':    'API provider for the "diagnose" analysis agent: groq or openrouter',
+  'llm_profiles.analysis.model':       'Model id used for the "diagnose" analysis agent',
+  'llm_profiles.analysis.temperature': 'Sampling temperature for the analysis model (leave empty for the provider default)',
+  'llm_profiles.validation.provider':    'API provider for validate/pre-check LLM checks: groq or openrouter',
+  'llm_profiles.validation.model':       'Model id used for validate/pre-check LLM checks',
+  'llm_profiles.validation.temperature': 'Sampling temperature for the validation model (leave empty for the provider default)',
+  'analysis_defaults.max_tool_calls':  'Default diagnostic tool-call budget for a step\'s on_error.analysis (a step can override this)',
+  'analysis_defaults.role':            'Default persona/role used when a step\'s on_error.analysis.role is not set',
+  'analysis_defaults.tools':           'Default description of diagnostic tools used when a step\'s on_error.analysis.tools is not set',
+  'analysis_defaults.output_format':   'Default diagnosis output format used when a step\'s on_error.analysis.output_format is not set',
+  'analysis_defaults.rules':           'Default diagnosis constraints used when a step\'s on_error.analysis.rules is not set',
+};
+
+function autoResizeTextareas(container) {
+  container.querySelectorAll('textarea').forEach(ta => {
+    ta.style.height = 'auto';
+    ta.style.height = ta.scrollHeight + 'px';
+  });
+}
+
+async function saveSettings() {
+  if (settingsState.mode === 'base') return saveBaseSettings();
+  pruneDelta();
+  if (deepEqual(settingsState.override, settingsState.savedOverride) &&
+      deepEqual(settingsState.runOverride, settingsState.savedRunOverride)) {
+    setSettingsMsg('No changes to save.');
+    return;
+  }
+  setSettingsMsg('Saving…');
+  const body = {
+    version: settingsState.version,
+    override: settingsState.override,
+    run_context: settingsState.runOverride,
+  };
+  const r = await fetch(`/api/settings/${settingsState.code}`, {
+    method:'PUT', credentials:'same-origin',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
+  });
+  if (r.status === 409) { setSettingsMsg('Changed elsewhere — reloading…'); return loadSettings(settingsState.code); }
+  if (!r.ok) { const e = await r.json().catch(()=>({})); setSettingsMsg('Error: ' + (e.error||r.status)); return; }
+  const data = await r.json();
+  applyLoaded(data);
+  setSettingsMsg('Saved.');
+}
+
+/** Remove any blank-key ('') entries left by unnamed inline TOOLS param rows. */
+function stripBlankParamKeys(node) {
+  if (Array.isArray(node)) { node.forEach(stripBlankParamKeys); return; }
+  if (node && typeof node === 'object') {
+    if ('' in node) delete node[''];
+    Object.values(node).forEach(stripBlankParamKeys);
+  }
+}
+
+async function saveBaseSettings() {
+  stripBlankParamKeys(settingsState.baseSteps);
+  stripBlankParamKeys(settingsState.globals);   // drop unnamed tool-template param rows
+  const snapshot = JSON.stringify({globals: settingsState.globals, steps: settingsState.baseSteps});
+  if (snapshot === settingsState.savedBase) { setSettingsMsg('No changes to save.'); return; }
+  setSettingsMsg('Saving…');
+  const body = {version: settingsState.version, globals: settingsState.globals, steps: settingsState.baseSteps};
+  const r = await fetch('/api/settings/base', {
+    method:'PUT', credentials:'same-origin',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
+  });
+  if (r.status === 409) { setSettingsMsg('Changed elsewhere — reloading…'); return loadBaseSettings(); }
+  if (!r.ok) { const e = await r.json().catch(()=>({})); setSettingsMsg('Error: ' + (e.error||r.status)); return; }
+  const data = await r.json();
+  settingsState.version = data.version;
+  settingsState.globals = data.globals || {};
+  settingsState.baseSteps = data.steps || [];
+  settingsState.savedBase = JSON.stringify({globals: settingsState.globals, steps: settingsState.baseSteps});
+  updateVersionLink(data.version);
+  renderSettingsSteps();
+  renderSettingsFields();
+  setSettingsMsg('Saved.');
+}
+
+function resetAllSettings() {
+  if (settingsState.mode === 'base') {
+    showConfirm('Reload base',
+      'Discard unsaved base changes and reload from the server?', 'Reload',
+      () => loadBaseSettings());
+    return;
+  }
+  showConfirm(
+    'Reset all settings',
+    'Reset ALL overrides for ' + settingsState.code + ' back to base?\nThis cannot be undone.',
+    'Reset',
+    async () => {
+      const r = await fetch(`/api/settings/${settingsState.code}/reset`, {
+        method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({version: settingsState.version, scope:'all'}),
+      });
+      if (!r.ok) { setSettingsMsg('Reset failed (' + r.status + ')'); return; }
+      applyLoaded(await r.json());
+      setSettingsMsg('Reset to base.');
+    }
+  );
+}
+
+function showConfirm(title, text, okLabel, onOk) {
+  document.getElementById('settings-confirm-title').textContent = title;
+  document.getElementById('settings-confirm-text').textContent = text;
+  document.getElementById('settings-confirm-ok').textContent = okLabel;
+  const overlay = document.getElementById('settings-confirm-overlay');
+  overlay.classList.add('visible');
+  const ok = document.getElementById('settings-confirm-ok');
+  const cancel = document.getElementById('settings-confirm-cancel');
+  const close = () => overlay.classList.remove('visible');
+  ok.onclick = () => { close(); onOk(); };
+  cancel.onclick = close;
+  overlay.onclick = e => { if (e.target === overlay) close(); };
+}
+
+// Styled replacement for window.prompt(). onOk receives the trimmed value.
+function showInputDialog(title, sub, defaultValue, okLabel, onOk) {
+  document.getElementById('settings-input-title').textContent = title;
+  const subEl = document.getElementById('settings-input-sub');
+  subEl.textContent = sub || '';
+  subEl.style.display = sub ? '' : 'none';
+  const field = document.getElementById('settings-input-field');
+  field.value = defaultValue || '';
+  const overlay = document.getElementById('settings-input-overlay');
+  const ok = document.getElementById('settings-input-ok');
+  const cancel = document.getElementById('settings-input-cancel');
+  ok.textContent = okLabel || 'OK';
+  overlay.classList.add('visible');
+  const close = () => { overlay.classList.remove('visible'); field.onkeydown = null; };
+  const submit = () => { const v = field.value.trim(); close(); onOk(v); };
+  ok.onclick = submit;
+  cancel.onclick = close;
+  overlay.onclick = e => { if (e.target === overlay) close(); };
+  field.onkeydown = e => {
+    if (e.key === 'Enter') { e.preventDefault(); submit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); close(); }
+  };
+  setTimeout(() => { field.focus(); field.select(); }, 0);
+}
+
+let histData = [];
+
+async function openSettingsHistory() {
+  const isBase = settingsState.mode === 'base';
+  const label = isBase ? 'Base' : settingsState.code;
+  histData = [];
+  document.getElementById('hist-title').textContent = 'Change history — ' + label;
+  document.getElementById('hist-body').innerHTML = '<div class="hist-empty">Loading…</div>';
+  document.getElementById('settings-history-overlay').classList.add('visible');
+  const url = isBase ? '/api/settings/base/history' : `/api/settings/${settingsState.code}/history`;
+  const r = await fetch(url, {credentials:'same-origin'});
+  const body = document.getElementById('hist-body');
+  if (!r.ok) {
+    const detail = await r.json().catch(() => ({}));
+    body.innerHTML = `<div class="hist-empty">Error ${r.status}: ${detail.error || r.statusText}</div>`;
+    return;
+  }
+  histData = await r.json();
+  if (!histData.length) { body.innerHTML = '<div class="hist-empty">No history yet.</div>'; return; }
+  body.innerHTML = histData.map((row, i) => {
+    const ts = row.updated_at ? new Date(row.updated_at).toLocaleString() : '—';
+    // Only the oldest entry can be pruned, and never the last remaining one; rows are
+    // ordered newest→oldest, so the oldest is the last in the list.
+    const canDelete = i === histData.length - 1 && histData.length > 1;
+    const del = canDelete
+      ? `<button class="hist-del" title="Delete this (oldest) history version"
+             onclick="event.stopPropagation();deleteOldestHistory(${row.version})">✕</button>`
+      : '<span></span>';
+    return `<div class="hist-row" onclick="toggleHistRow(${i})">
+      <span class="ver">v${row.version}</span>
+      <span class="user">${esc(row.updated_by || '—')}</span>
+      <span class="ts">${ts}</span>
+      <span class="expand-icon" id="hist-icon-${i}">▶</span>
+      ${del}
+    </div>
+    <div class="hist-diff" id="hist-diff-${i}"></div>`;
+  }).join('');
+}
+
+function deleteOldestHistory(version) {
+  const isBase = settingsState.mode === 'base';
+  const label = isBase ? 'Base' : settingsState.code;
+  showConfirm(
+    'Delete history version',
+    `Delete the oldest change-history entry (v${version}) for ${label}?\n` +
+    `Only this history record is removed — the current configuration is unaffected. ` +
+    `This cannot be undone.`,
+    'Delete',
+    async () => {
+      const url = isBase
+        ? '/api/settings/base/history/oldest'
+        : `/api/settings/${settingsState.code}/history/oldest`;
+      const r = await fetch(url, {method:'DELETE', credentials:'same-origin'});
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        document.getElementById('hist-body').insertAdjacentHTML('afterbegin',
+          `<div class="hist-empty">Delete failed: ${esc(d.error || r.statusText)}</div>`);
+        return;
+      }
+      openSettingsHistory();  // re-fetch and re-render
+    }
+  );
+}
+
+function toggleHistRow(i) {
+  const diffEl = document.getElementById(`hist-diff-${i}`);
+  const isOpen = diffEl.style.display === 'block';
+  histData.forEach((_, j) => {
+    const el = document.getElementById(`hist-diff-${j}`);
+    const ic = document.getElementById(`hist-icon-${j}`);
+    if (el) el.style.display = 'none';
+    if (ic) ic.textContent = '▶';
+  });
+  if (isOpen) return;
+  document.getElementById(`hist-icon-${i}`).textContent = '▼';
+  diffEl.style.display = 'block';
+  if (diffEl.innerHTML) return; // already rendered
+  const curr = histData[i];
+  let allChanges;
+  if (settingsState.mode === 'base') {
+    const prev = i + 1 < histData.length ? histData[i + 1] : {globals:{}, steps:[]};
+    allChanges = computeDiff({globals: prev.globals||{}, steps: prev.steps||[]},
+                             {globals: curr.globals||{}, steps: curr.steps||[]});
+  } else {
+    const prev = i + 1 < histData.length ? histData[i + 1] : {override:{}, run_context:{}};
+    const overrideChanges = computeDiff(prev.override, curr.override);
+    const rcChanges = computeDiff(prev.run_context, curr.run_context)
+      .map(c => ({...c, key: '[run_context].' + c.key}));
+    allChanges = [...rcChanges, ...overrideChanges];
+  }
+  if (!allChanges.length) {
+    diffEl.innerHTML = '<div class="diff-empty">No field changes in this version.</div>';
+    return;
+  }
+  diffEl.innerHTML = `<table class="diff-table">
+    <colgroup><col style="width:20%"><col style="width:40%"><col style="width:40%"></colgroup>
+    <thead><tr>
+      <th>Field<div class="col-resize-handle"></div></th>
+      <th>Before<div class="col-resize-handle"></div></th>
+      <th>After</th>
+    </tr></thead>
+    <tbody>${allChanges.map(c => {
+      const cls = c.type === 'added' ? 'diff-added' : c.type === 'removed' ? 'diff-removed' : 'diff-changed';
+      const oldStr = c.oldVal === undefined ? null : JSON.stringify(c.oldVal);
+      const newStr = c.newVal === undefined ? null : JSON.stringify(c.newVal);
+      let oldHtml, newHtml;
+      if (c.type === 'changed' && oldStr !== null && newStr !== null) {
+        [oldHtml, newHtml] = inlineDiff(oldStr, newStr);
+      } else if (c.type === 'added' && newStr !== null) {
+        // Field newly overriding — show base config value as Before
+        const baseVal = getBaseValue(c.key);
+        const baseStr = (baseVal !== undefined && baseVal !== null) ? JSON.stringify(baseVal) : null;
+        if (baseStr !== null) {
+          [oldHtml, newHtml] = inlineDiff(baseStr, newStr);
+        } else {
+          oldHtml = '<span class="diff-nil">—</span>';
+          newHtml = esc(newStr);
+        }
+      } else {
+        oldHtml = oldStr === null ? '<span class="diff-nil">—</span>' : esc(oldStr);
+        newHtml = newStr === null
+          ? (c.type === 'removed' ? '<span class="diff-base">(base)</span>' : '<span class="diff-nil">—</span>')
+          : esc(newStr);
+      }
+      return `<tr class="${cls}">
+        <td class="diff-path" title="${esc(c.key)}">${esc(c.key)}</td>
+        <td class="diff-old">${oldHtml}</td>
+        <td class="diff-new">${newHtml}</td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+  initTableResize(diffEl.querySelector('.diff-table'));
+}
+
+function getBaseValue(diffKey) {
+  if (settingsState.mode === 'base') return undefined;  // base rows carry full docs already
+  // diffKey: "ZFK_COMPARISON.params[@VAART].low" → stepId + fieldPath in settings notation
+  const dot = diffKey.indexOf('.');
+  if (dot === -1) return undefined;
+  const stepId = diffKey.substring(0, dot);
+  // Convert [@FOO] bracket notation → .@FOO dot notation used by config_settings
+  const fieldPath = diffKey.substring(dot + 1).replace(/\[(@[^\]]*)\]/g, '.$1').replace(/^\./,'');
+  const step = (settingsState.steps || []).find(s => s.step_id === stepId);
+  if (!step) return undefined;
+  const field = (step.fields || []).find(f => f.path === fieldPath);
+  return field ? field.base_value : undefined;
+}
+
+function inlineDiff(oldStr, newStr) {
+  // Word-level LCS diff. Returns [oldHtml, newHtml] with <mark> highlights.
+  const toks = s => s.match(/[^\s,.:;|{}"'\\[\]()]+|[\s,.:;|{}"'\\[\]()\n]+/g) || [s];
+  const a = toks(oldStr), b = toks(newStr);
+  if (a.length * b.length > 80000) return [esc(oldStr), esc(newStr)]; // too large, skip inline diff
+
+  // Build LCS table (backward fill)
+  const m = a.length, n = b.length;
+  const dp = Array.from({length: m + 1}, () => new Uint16Array(n + 1));
+  for (let i = m - 1; i >= 0; i--)
+    for (let j = n - 1; j >= 0; j--)
+      dp[i][j] = a[i] === b[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+
+  // Traceback
+  let i = 0, j = 0, oldHtml = '', newHtml = '';
+  while (i < m || j < n) {
+    if (i < m && j < n && a[i] === b[j]) {
+      oldHtml += esc(a[i]); newHtml += esc(b[j]); i++; j++;
+    } else if (j < n && (i >= m || dp[i][j+1] >= dp[i+1][j])) {
+      newHtml += `<mark class="diff-add">${esc(b[j])}</mark>`; j++;
+    } else {
+      oldHtml += `<mark class="diff-del">${esc(a[i])}</mark>`; i++;
+    }
+  }
+  return [oldHtml, newHtml];
+}
+
+function initTableResize(table) {
+  if (!table) return;
+  const cols = table.querySelectorAll('col');
+  const ths = table.querySelectorAll('thead th');
+  table.querySelectorAll('.col-resize-handle').forEach((handle, i) => {
+    let startX, w0, w1, tableW;
+    handle.addEventListener('mousedown', e => {
+      e.preventDefault(); e.stopPropagation();
+      handle.classList.add('dragging');
+      startX = e.clientX; w0 = ths[i].offsetWidth; w1 = ths[i+1].offsetWidth; tableW = table.offsetWidth;
+      document.body.style.userSelect = 'none';
+      const onMove = e => {
+        const d = e.clientX - startX;
+        cols[i].style.width     = (Math.max(40, w0 + d) / tableW * 100).toFixed(1) + '%';
+        cols[i+1].style.width   = (Math.max(40, w1 - d) / tableW * 100).toFixed(1) + '%';
+      };
+      const onUp = () => {
+        handle.classList.remove('dragging');
+        document.body.style.userSelect = '';
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  });
+}
+
+function flattenObj(obj, prefix) {
+  if (obj === null || obj === undefined || typeof obj !== 'object') {
+    return prefix ? {[prefix]: obj} : {};
+  }
+  if (Array.isArray(obj)) {
+    const result = {};
+    obj.forEach((item, i) => {
+      const hasSel = item && typeof item === 'object' && item.selname;
+      const key = prefix
+        ? (hasSel ? `${prefix}[@${item.selname}]` : `${prefix}[${i}]`)
+        : (hasSel ? `[@${item.selname}]` : `[${i}]`);
+      const sub = hasSel ? (({selname, ...rest}) => rest)(item) : item;
+      Object.assign(result, flattenObj(sub, key));
+    });
+    return result;
+  }
+  const result = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    Object.assign(result, (v !== null && typeof v === 'object') ? flattenObj(v, path) : {[path]: v});
+  }
+  return result;
+}
+
+function computeDiff(prev, curr) {
+  const fp = flattenObj(prev || {}, '');
+  const fc = flattenObj(curr || {}, '');
+  const keys = new Set([...Object.keys(fp), ...Object.keys(fc)]);
+  const changes = [];
+  for (const key of [...keys].sort()) {
+    const ps = JSON.stringify(fp[key]), cs = JSON.stringify(fc[key]);
+    if (ps !== cs) {
+      if (!(key in fp)) changes.push({type:'added',  key, newVal: fc[key]});
+      else if (!(key in fc)) changes.push({type:'removed', key, oldVal: fp[key]});
+      else changes.push({type:'changed', key, oldVal: fp[key], newVal: fc[key]});
+    }
+  }
+  return changes;
+}
+
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || typeof a !== 'object' || a === null || b === null) return false;
+  const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
+  if (ka.length !== kb.length || ka.some((k, i) => k !== kb[i])) return false;
+  return ka.every(k => deepEqual(a[k], b[k]));
+}
+
+function closeSettingsHistory() {
+  document.getElementById('settings-history-overlay').classList.remove('visible');
+}
+
+function applyLoaded(data) {
+  settingsState.version = data.version;
+  settingsState.steps = data.steps;
+  settingsState.runContext = data.run_context || {};
+  settingsState.runOverride = {...settingsState.runContext};
+  settingsState.override = data.override || {};
+  settingsState.savedOverride = JSON.parse(JSON.stringify(settingsState.override));
+  settingsState.savedRunOverride = JSON.parse(JSON.stringify(settingsState.runOverride));
+  updateVersionLink(data.version);
+  renderSettingsSteps();
+  renderSettingsFields();
+}
+
+function setSettingsMsg(m) { document.getElementById('settings-msg').textContent = m; }
+
+function updateVersionLink(version) {
+  const el = document.getElementById('settings-version-link');
+  if (!version) { el.style.display = 'none'; return; }
+  el.textContent = 'Version ' + version;
+  el.style.display = 'inline';
+}
+function cssId(s) { return s.replace(/[^a-z0-9]/gi,'_'); }
+
+// --- step-shaped delta leaf helpers (path syntax mirrors the server) ---
+function setLeaf(stepDelta, path, value) {
+  const segs = path.split('.');
+  let node = stepDelta;
+  for (let i = 0; i < segs.length - 1; i++) {
+    const seg = segs[i], nxt = segs[i+1];
+    if (seg.startsWith('@')) {
+      const sel = seg.slice(1);
+      let entry = node.find(e => e.selname === sel);
+      if (!entry) { entry = {selname: sel}; node.push(entry); }
+      node = entry;
+    } else {
+      if (!(seg in node)) node[seg] = nxt.startsWith('@') ? [] : {};
+      node = node[seg];
+    }
+  }
+  node[segs[segs.length - 1]] = value;
+}
+function leafGet(stepDelta, path) {
+  const segs = path.split('.');
+  let node = stepDelta;
+  for (const seg of segs) {
+    if (node == null) return undefined;
+    if (seg.startsWith('@')) node = Array.isArray(node) ? node.find(e => e.selname === seg.slice(1)) : undefined;
+    else node = node[seg];
+  }
+  return node;
+}
+function leafExists(stepDelta, path) { return leafGet(stepDelta, path) !== undefined; }
+function unsetLeaf(stepDelta, path) {
+  const segs = path.split('.');
+  let node = stepDelta;
+  for (let i = 0; i < segs.length - 1; i++) {
+    const seg = segs[i];
+    if (node == null) return;
+    node = seg.startsWith('@') ? (Array.isArray(node) ? node.find(e => e.selname === seg.slice(1)) : undefined) : node[seg];
+  }
+  if (node == null) return;
+  const leaf = segs[segs.length - 1];
+  if (leaf.startsWith('@') && Array.isArray(node)) {
+    const i = node.findIndex(e => e.selname === leaf.slice(1));
+    if (i >= 0) node.splice(i, 1);
+  } else if (Array.isArray(node)) {
+    // leaf is an attribute inside the current (param entry) — handled above; ignore
+  } else { delete node[leaf]; }
+}
+function pruneDelta() {
+  const o = settingsState.override;
+  const isEmptyParam = e => Object.keys(e).every(k => k === 'selname');
+  const prune = (node) => {
+    if (Array.isArray(node)) {
+      for (let i = node.length - 1; i >= 0; i--) { prune(node[i]); if (isEmptyParam(node[i])) node.splice(i,1); }
+      return;
+    }
+    if (node && typeof node === 'object') {
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (k === 'enabled') continue;
+        prune(v);
+        if (v && typeof v === 'object' && Object.keys(v).length === 0) delete node[k];
+        else if (Array.isArray(v) && v.length === 0) delete node[k];
+      }
+    }
+  };
+  for (const sid of Object.keys(o)) {
+    prune(o[sid]);
+    if (Object.keys(o[sid]).length === 0) delete o[sid];
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Step form — one schema-driven renderer for both modes
+//
+//  Base mode edits the step object itself; company mode edits a sparse delta over the
+//  base step, so every section, field and param row looks identical in both — a company
+//  field just also carries its inherited/overridden state and a ↺ reset.
+// ═══════════════════════════════════════════════════════════
+
+function curBaseStep() {
+  return settingsState.baseSteps.find(s => s.step_id === settingsState.selectedStep);
+}
+function numOrNull(v) { const t = String(v).trim(); if (t === '') return null; const n = Number(t); return isNaN(n) ? t : n; }
+function dotGet(o, path) { return path.split('.').reduce((n, k) => (n == null ? undefined : n[k]), o); }
+function dotSet(o, path, v) {
+  const s = path.split('.'); let n = o;
+  for (let i = 0; i < s.length - 1; i++) {
+    if (n[s[i]] == null || typeof n[s[i]] !== 'object' || Array.isArray(n[s[i]])) n[s[i]] = {};
+    n = n[s[i]];
+  }
+  n[s[s.length - 1]] = v;
+}
+function dotDel(o, path) {
+  const s = path.split('.'); let n = o;
+  for (let i = 0; i < s.length - 1; i++) { if (n == null) return; n = n[s[i]]; }
+  if (n && typeof n === 'object') delete n[s[s.length - 1]];
+}
+function showWhenMatches(model, sw) {
+  if (!sw) return true;
+  return Object.entries(sw).every(([p, vals]) => {
+    const cur = dotGet(model, p);
+    if (vals.length === 1 && vals[0] === '__truthy__') return !!cur;
+    // A list of "!X" entries is a blocklist: the field shows unless cur equals a listed value
+    // (e.g. ["!TOOLS"] hides Async only when action_type is TOOLS). An undefined value matches
+    // no "!X", so it shows — the safe default for steps that omit action_type.
+    if (vals.every(v => typeof v === 'string' && v.startsWith('!')))
+      return vals.every(v => String(v.slice(1)) !== String(cur));
+    return vals.some(v => v === cur || String(v) === String(cur));
+  });
+}
+
+/** Merge a company delta over a base step — mirrors config._merge_step (params by
+ *  selname, sections shallow-merged, scalars replaced). */
+function mergeStep(base, delta) {
+  const mergeParams = (b, o) => {
+    if (Array.isArray(b) && Array.isArray(o)) {
+      const byName = {}; o.forEach(p => { byName[p.selname] = {...p}; });
+      const out = [], used = new Set();
+      b.forEach(p => { out.push(byName[p.selname] || {...p}); used.add(p.selname); });
+      o.forEach(p => { if (!used.has(p.selname)) out.push({...p}); });
+      return out;
+    }
+    if (b && o && !Array.isArray(b) && !Array.isArray(o) && typeof b === 'object' && typeof o === 'object')
+      return {...b, ...o};
+    return o;
+  };
+  const mergeSection = (b, o) => {
+    const out = {...b};
+    Object.entries(o).forEach(([k, v]) => {
+      if (k === 'params') out.params = mergeParams(out.params, v);
+      else if (v && typeof v === 'object' && !Array.isArray(v) &&
+               out[k] && typeof out[k] === 'object' && !Array.isArray(out[k])) out[k] = {...out[k], ...v};
+      else out[k] = v;
+    });
+    return out;
+  };
+  const merged = JSON.parse(JSON.stringify(base || {}));
+  Object.entries(delta || {}).forEach(([k, v]) => {
+    if (k === 'step_id') return;
+    if (k === 'params') merged.params = mergeParams(merged.params, v);
+    else if (v && typeof v === 'object' && !Array.isArray(v) &&
+             merged[k] && typeof merged[k] === 'object' && !Array.isArray(merged[k])) merged[k] = mergeSection(merged[k], v);
+    else merged[k] = v;
+  });
+  return merged;
+}
+
+/** What the form is currently editing. `model` holds the values to display (the step
+ *  itself in base mode, base ⊕ delta in company mode); `delta`/`base` are company-only. */
+function formCtx() {
+  if (settingsState.mode === 'base') {
+    const step = curBaseStep();
+    return step ? {mode: 'base', sid: step.step_id, model: step} : null;
+  }
+  const step = (settingsState.steps || []).find(s => s.step_id === settingsState.selectedStep);
+  if (!step) return null;
+  const delta = stepDelta(step.step_id);   // live object: edits land in settingsState.override
+  return {mode: 'company', sid: step.step_id, base: step.base || {}, delta,
+          model: mergeStep(step.base || {}, delta)};
+}
+
+/** The inherited value a company field falls back to (bool defaults mirror the runtime). */
+function baseValueOf(ctx, path) {
+  const val = dotGet(ctx.mode === 'company' ? ctx.base : ctx.model, path);
+  if (val === undefined && (path === 'enabled' || path === 'async')) return true;
+  return val;
+}
+
+function renderStepForm(box) {
+  const ctx = formCtx();
+  if (!ctx) { box.innerHTML = '<div class="diff-empty" style="padding:20px">Select a step, or add one.</div>'; return; }
+  let html = '';
+  settingsState.descriptor.sections.forEach(sec => { html += renderFormSection(ctx, sec); });
+  box.innerHTML = html;
+  autoResizeTextareas(box);
+}
+
+// ── writable combobox (object_name under a TOOLS action) ──
+function closeAllCombos(except) {
+  document.querySelectorAll('.combo .combo-menu').forEach(m => {
+    if (except && m === except) return;
+    m.dataset.open = '0'; m.style.display = 'none';
+  });
+}
+function comboShow(input) {
+  const menu = input.closest('.combo').querySelector('.combo-menu');
+  closeAllCombos(menu);
+  menu.dataset.open = '1';
+  comboFilter(input);
+}
+function comboToggle(btn) {
+  const combo = btn.closest('.combo');
+  const menu = combo.querySelector('.combo-menu');
+  const input = combo.querySelector('.combo-input');
+  if (menu.dataset.open === '1') closeAllCombos();
+  else { input.focus(); comboShow(input); }
+}
+function comboFilter(input) {
+  const menu = input.closest('.combo').querySelector('.combo-menu');
+  if (menu.dataset.open !== '1') return;
+  const q = input.value.trim().toLowerCase();
+  let any = false;
+  menu.querySelectorAll('.combo-opt').forEach(o => {
+    const show = !q || o.textContent.toLowerCase().includes(q);
+    o.style.display = show ? '' : 'none';
+    if (show) any = true;
+  });
+  menu.style.display = any ? 'block' : 'none';
+}
+function comboPick(opt, val) {
+  const combo = opt.closest('.combo');
+  const input = combo.querySelector('.combo-input');
+  input.value = val;
+  onFormEdit(input.dataset.path, val);
+  closeAllCombos();
+}
+function comboKey(e, input) {
+  if (e.key === 'Escape') { closeAllCombos(); input.blur(); }
+}
+document.addEventListener('mousedown', e => { if (!e.target.closest('.combo')) closeAllCombos(); });
+
+function renderBaseFields() {
+  const box = document.getElementById('settings-fields');
+  if (settingsState.selectedStep === '__globals__') return renderGlobalsFields(box);
+  renderStepForm(box);
+}
+
+const STATIC_WIDGETS = new Set(['label', 'divider']);
+
+function renderFormSection(ctx, sec) {
+  // fields to show: auto fields whenever their show_when matches (even if a stale value
+  // lingers from before the condition changed — a value alone never keeps an auto field
+  // visible); optional fields additionally need a value, since they're only ever shown
+  // once added. Plain labels/dividers/params are never optional — show_when alone decides.
+  const visible = sec.fields.filter(f =>
+    STATIC_WIDGETS.has(f.widget) ? showWhenMatches(ctx.model, f.show_when)
+    : f.widget === 'params' ? showWhenMatches(ctx.model, f.show_when)
+    : f.auto ? showWhenMatches(ctx.model, f.show_when)
+    : (showWhenMatches(ctx.model, f.show_when) && dotGet(ctx.model, f.path) !== undefined));
+  // add-field candidates: optional, relevant now, not yet present
+  const candidates = sec.fields.filter(f =>
+    f.widget !== 'params' && !STATIC_WIDGETS.has(f.widget) && !f.auto &&
+    showWhenMatches(ctx.model, f.show_when) && dotGet(ctx.model, f.path) === undefined);
+
+  let addMenu = '';
+  if (candidates.length) {
+    const menuId = 'afm-' + sec.key;
+    addMenu = `<div class="add-field-wrap">
+      <button class="add-field-btn" onclick="toggleAddFieldMenu('${menuId}')">＋ Add field</button>
+      <div class="add-field-menu" id="${menuId}">
+        ${candidates.map(f => `<button onclick="addFormField('${esc(f.path)}');event.stopPropagation()">${esc(f.label)}</button>`).join('')}
+      </div></div>`;
+  }
+  let html = `<div class="set-section-header">${esc(SECTION_TITLES[sec.key] || sec.key)}${addMenu}</div>`;
+  visible.forEach(f => {
+    if (f.widget === 'label') html += `<div class="set-subheader">${esc(f.label)}</div>`;
+    else if (f.widget === 'divider') html += `<div class="set-divider"></div>`;
+    else html += f.widget === 'params' ? renderParamsEditor(ctx, f) : formFieldHTML(ctx, f);
+  });
+  return `<div class="set-section">${html}</div>`;
+}
+
+function formFieldHTML(ctx, f) {
+  const val = dotGet(ctx.model, f.path);
+  const company = ctx.mode === 'company';
+  const overridden = company && leafExists(ctx.delta, f.path);
+  let ctl;
+  const P = esc(f.path);
+  if (f.widget === 'bool') {
+    // top-level enabled/async default to true when the step omits them
+    const bv = (val === undefined) ? (f.path === 'enabled' || f.path === 'async') : !!val;
+    ctl = `<input type="checkbox" ${bv ? 'checked' : ''} onchange="onFormEdit('${P}', this.checked)">`;
+  } else if (f.widget === 'number') {
+    ctl = `<input type="text" value="${esc(val == null ? '' : val)}" oninput="onFormEdit('${P}', numOrNull(this.value))">`;
+  } else if (f.widget === 'select') {
+    // Legacy data may still carry a value the current enum no longer offers (e.g. the
+    // retired pre_check.mode "skip" — enabling now sets mode itself, see onFormEdit).
+    const sv = (f.enum || []).includes(val) ? val : (f.enum || [])[0];
+    ctl = `<select onchange="onFormEdit('${P}', this.value)">` +
+      (f.enum || []).map(o => `<option ${o === sv ? 'selected' : ''}>${esc(o)}</option>`).join('') + `</select>`;
+  } else if (f.widget === 'block_toggle') {
+    const on = !!val;
+    ctl = `<input type="checkbox" ${on ? 'checked' : ''}
+             onchange="onFormEdit('${P}', this.checked ? {action_type:'TOOLS', object_name:'', async:false} : null)">`;
+  } else if (f.widget === 'list') {
+    const j = Array.isArray(val) ? val.join(', ') : (val || '');
+    ctl = `<input type="text" value="${esc(j)}" oninput="onFormEdit('${P}', this.value.split(',').map(s=>s.trim()).filter(Boolean))">`;
+  } else if (f.widget === 'on_error_mode') {
+    ctl = onErrorModeCtl(P, val);
+  } else if (f.widget === 'textarea') {
+    const cur = val == null ? '' : String(val);
+    const prev = cur.trim() ? esc(cur.slice(0, 400)) : '(empty)';
+    ctl = `<div class="prompt-preview ${cur.trim()?'':'empty'}">${prev}</div>
+           <button class="prompt-expand-btn" onclick="editFormPrompt('${P}','${esc(f.label)}')">✎ Edit</button>`;
+  } else if (f.action_type_path && dotGet(ctx.model, f.action_type_path) === 'TOOLS') {
+    // object_name under a TOOLS action: writable combobox — suggests the tool catalog in a
+    // styled dropdown, still accepts a custom/new tool name typed straight into the input.
+    const tools = settingsState.descriptor.tools || [];
+    const opts = tools.map(t =>
+      `<div class="combo-opt" onmousedown="comboPick(this, '${esc(t)}')">${esc(t)}</div>`).join('');
+    ctl = `<div class="combo">
+      <input type="text" class="combo-input" data-path="${P}" autocomplete="off"
+             value="${esc(val == null ? '' : val)}"
+             oninput="onFormEdit('${P}', this.value); comboFilter(this)"
+             onfocus="comboShow(this)" onkeydown="comboKey(event, this)">
+      <button type="button" class="combo-caret" tabindex="-1"
+              onmousedown="event.preventDefault()" onclick="comboToggle(this)">▾</button>
+      <div class="combo-menu">${opts}</div>
+    </div>`;
+  } else {
+    ctl = `<input type="text" value="${esc(val == null ? '' : val)}" oninput="onFormEdit('${P}', this.value)">`;
+  }
+  const help = FIELD_HELP[f.path] || '';
+  const tip = help ? `<span class="tip-icon">ⓘ<span class="tip-text">${esc(help)}</span></span>` : '';
+  // base: optional fields can be removed outright — company: fields fall back to base
+  let trail;
+  if (company) {
+    trail = `<button class="reset-btn" ${overridden ? '' : 'disabled'}
+                     title="Revert to the base value"
+                     onclick="resetFormField('${P}')">↺ reset</button>`;
+  } else {
+    trail = (!f.auto && val !== undefined)
+      ? `<button class="del-field-btn" title="Remove field" onclick="removeFormField('${P}')">✕</button>`
+      : `<span></span>`;
+  }
+  const pf = f.widget === 'textarea' ? ' prompt-field' : '';
+  const state = company ? (overridden ? ' overridden' : ' inherited') : '';
+  return `<div class="set-field${pf}${state}" id="fld-${cssId(ctx.sid + f.path)}">
+            <label>${esc(f.label)}${tip}</label>
+            <div class="ctl">${ctl}</div>${trail}</div>`;
+}
+
+const CONTROLLER_RE = /(^|\.)(action_type|mode|enabled|run)$/;
+
+/** Write a field. Base mode edits the step; company mode records a delta leaf — and a
+ *  value edited back to what base says stops being an override. */
+function onFormEdit(path, value) {
+  const ctx = formCtx(); if (!ctx) return;
+  // Enabling pre-check used to leave Mode on its default "skip" — a check that looked
+  // on but silently did nothing. Enabled is now the sole on/off switch, so turning it
+  // on always also picks an actionable mode.
+  const needsModePick = path === 'pre_check.enabled' && value === true &&
+    (() => { const m = dotGet(ctx.model, 'pre_check.mode'); return !m || m === 'skip'; })();
+  if (ctx.mode === 'base') {
+    dotSet(ctx.model, path, value);
+    markBaseDirty();
+  } else if (deepEqual(value, baseValueOf(ctx, path))) {
+    unsetLeaf(ctx.delta, path);
+    pruneDelta();
+  } else {
+    setLeaf(stepDelta(ctx.sid), path, value);
+  }
+  // TOOLS actions never poll — drop the now-hidden Async sibling so no stale flag persists.
+  if (/(^|\.)action_type$/.test(path) && value === 'TOOLS') {
+    const sib = path.replace(/action_type$/, 'async');
+    if (ctx.mode === 'base') dotDel(ctx.model, sib); else unsetLeaf(ctx.delta, sib);
+  }
+  if (needsModePick) { onFormEdit('pre_check.mode', 'comparison'); return; }
+  if (CONTROLLER_RE.test(path)) renderSettingsFields();
+  else if (ctx.mode === 'company') markFieldOverridden(path);   // in place: keeps focus
+  renderSettingsSteps();
+}
+
+// on_error.mode is either a plain "explain"/"diagnose" string (applies to every failure)
+// or a {pre_check|execute|poll|validate: "explain"|"diagnose"} map for per-phase overrides.
+const ON_ERROR_MODE_SOURCES = [
+  ['pre_check', 'Pre-check failure'],
+  ['execute',   'Execute failure'],
+  ['poll',      'Poll failure'],
+  ['validate',  'Validate failure'],
+];
+const ON_ERROR_MODE_OPTS = [
+  ['', '(default — diagnose)'],
+  ['explain', 'explain — cheap read-only summary'],
+  ['diagnose', 'diagnose — full AI investigation with SAP tools'],
+];
+
+function onErrorModeCtl(path, val) {
+  const isMap = val && typeof val === 'object' && !Array.isArray(val);
+  if (!isMap) {
+    const cur = val || '';
+    return `<select onchange="this.value==='__custom__' ? onFormEdit('${path}', {}) : onFormEdit('${path}', this.value || null)">` +
+      ON_ERROR_MODE_OPTS.map(([o, label]) => `<option value="${o}" ${o===cur?'selected':''}>${esc(label)}</option>`).join('') +
+      `<option value="__custom__">Custom per failure type…</option></select>`;
+  }
+  const rows = ON_ERROR_MODE_SOURCES.map(([src, label]) => {
+    const cur = val[src] || '';
+    return `<div class="mode-map-row"><label>${esc(label)}</label>
+      <select onchange="onErrorModeSourceEdit('${path}','${src}', this.value)">
+        ${ON_ERROR_MODE_OPTS.filter(([o]) => o !== '__custom__')
+          .map(([o, label2]) => `<option value="${o}" ${o===cur?'selected':''}>${esc(o || '(default)')}</option>`).join('')}
+      </select></div>`;
+  }).join('');
+  return `<div class="mode-map">${rows}
+    <button type="button" class="mode-map-simplify" onclick="onFormEdit('${path}', null)">◂ Use one value for all failures</button>
+  </div>`;
+}
+
+function onErrorModeSourceEdit(path, src, value) {
+  const ctx = formCtx(); if (!ctx) return;
+  const obj = {...(dotGet(ctx.model, path) || {})};
+  if (value) obj[src] = value; else delete obj[src];
+  onFormEdit(path, obj);
+}
+
+/** Repaint one company row's inherited/overridden state without re-rendering the form. */
+function markFieldOverridden(path) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'company') return;
+  const row = document.getElementById('fld-' + cssId(ctx.sid + path));
+  if (!row) return;
+  const on = leafExists(ctx.delta, path);
+  row.classList.toggle('overridden', on);
+  row.classList.toggle('inherited', !on);
+  const btn = row.querySelector('.reset-btn');
+  if (btn) btn.disabled = !on;
+}
+
+function addFormField(path) {
+  const ctx = formCtx(); if (!ctx) return;
+  const f = findDescField(path);
+  const def = f.widget === 'bool' ? true : f.widget === 'list' ? []
+    : f.widget === 'number' ? 0 : f.widget === 'select' ? (f.enum || [''])[0] : '';
+  if (ctx.mode === 'base') { dotSet(ctx.model, path, def); markBaseDirty(); }
+  else setLeaf(stepDelta(ctx.sid), path, def);
+  renderSettingsFields();
+  renderSettingsSteps();
+}
+function removeFormField(path) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
+  dotDel(ctx.model, path);
+  markBaseDirty();
+  renderSettingsFields();
+}
+function resetFormField(path) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'company') return;
+  unsetLeaf(ctx.delta, path);
+  pruneDelta();
+  renderSettingsFields();
+  renderSettingsSteps();
+}
+function findDescField(path) {
+  for (const sec of settingsState.descriptor.sections)
+    for (const f of sec.fields) if (f.path === path) return f;
+  return {widget: 'text'};
+}
+function toggleAddFieldMenu(id) {
+  const m = document.getElementById(id); if (!m) return;
+  const open = m.classList.contains('open');
+  document.querySelectorAll('.add-field-menu.open').forEach(el => el.classList.remove('open'));
+  if (!open) m.classList.add('open');
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('.add-field-wrap'))
+    document.querySelectorAll('.add-field-menu.open').forEach(el => el.classList.remove('open'));
+});
+
+// ── TOOLS param templates (auto-fill on tool selection) ──
+
+// ── params editor (list for SUBMIT/FM/BAPI/BDC, dict for TOOLS) ──
+// Company mode shows the merged rows and writes edits into the delta: a base row is
+// overridden as a whole entry (that is how _merge_params keys by selname), so its
+// selname is fixed and it resets rather than deletes; rows added here are delta-only.
+function renderParamsEditor(ctx, f) {
+  const at = f.action_type_path ? (dotGet(ctx.model, f.action_type_path) || 'SUBMIT') : 'SUBMIT';
+  const cur = dotGet(ctx.model, f.path);
+  const company = ctx.mode === 'company';
+  const P = esc(f.path);
+  if (at === 'TOOLS') {
+    // Generic key→value grid: TOOLS params are a flat dict (iv_params_json), so any
+    // tool's params work with no per-tool code. Values may hold {{job_name}}/{{job_id}}
+    // placeholders (resolved at validate time). Base mode edits keys+values freely;
+    // company mode overrides base values per key (keys are a base concern), matching the
+    // range-param editor. Key names come verbatim from the tool's ABAP handler.
+    const d = (cur && !Array.isArray(cur)) ? cur : {};
+    if (company) {
+      const baseDict = dotGet(ctx.base, f.path) || {};
+      const deltaDict = dotGet(ctx.delta, f.path) || {};
+      const keys = [...new Set([...Object.keys(baseDict), ...Object.keys(deltaDict)])];
+      const rowsHtml = keys.map(k => {
+        const ov = deltaDict[k] !== undefined;
+        return `<div class="set-field${ov ? ' overridden' : ' inherited'}">
+          <label>${esc(k)}</label><div class="ctl">
+          <input type="text" value="${esc(d[k] == null ? '' : d[k])}"
+                 oninput="onParamDictEdit('${P}','${esc(k)}', this.value)"></div>
+          <button class="reset-btn" ${ov ? '' : 'disabled'} title="Revert to the base value"
+                  onclick="resetParamDict('${P}','${esc(k)}')">↺ reset</button></div>`;
+      }).join('');
+      return `<div class="params-dict">${rowsHtml || '<div class="param-empty">No parameters defined in base.</div>'}</div>`;
+    }
+    const rowsHtml = Object.keys(d).map(k =>
+      `<div class="param-row param-kv">
+        <input class="param-key" value="${esc(k)}" placeholder="Param"
+               onchange="onParamDictKeyEdit('${P}','${esc(k)}', this.value)">
+        <input class="param-val" value="${esc(d[k] == null ? '' : d[k])}" placeholder="Value"
+               oninput="onParamDictEdit('${P}','${esc(k)}', this.value)">
+        <button class="rm" title="Remove" onclick="removeParamDict('${P}','${esc(k)}')">✕</button>
+      </div>`).join('');
+    return `<div class="param-rows">${rowsHtml}</div>
+      <button class="param-add-btn" onclick="addParamDictRow('${P}')">＋ Add parameter</button>`;
+  }
+  const rows = Array.isArray(cur) ? cur : [];
+  const fromBase = new Set(company ? (dotGet(ctx.base, f.path) || []).map(p => p.selname) : []);
+  const deltaList = company ? (dotGet(ctx.delta, f.path) || []) : [];
+  let html = `<div class="param-rows">
+    <div class="param-row"><span class="param-head">selname</span><span class="param-head">kind</span>
+      <span class="param-head">low</span><span class="param-head">high</span><span></span></div>`;
+  rows.forEach((p, i) => {
+    const inherited = company && fromBase.has(p.selname);
+    const ov = company && deltaList.some(e => e.selname === p.selname);
+    const cell = (key, ph, ro) =>
+      `<input value="${esc(p[key] == null ? '' : p[key])}" placeholder="${ph}" ${ro ? 'readonly title="Defined in base — the key company overrides are matched on"' : ''}
+              oninput="onParamEdit('${P}',${i},'${key}',this.value)">`;
+    const kindCell = () => {
+      const kv = p.kind == null || p.kind === '' ? 'P' : p.kind;
+      return `<select title="P = Parameter (single value) · S = Select-option (range/multi-value)"
+                onchange="onParamEdit('${P}',${i},'kind',this.value)">` +
+        PARAM_KINDS.map(([o, label]) => `<option value="${o}" ${o===kv?'selected':''}>${label}</option>`).join('') +
+        `</select>`;
+    };
+    const trail = inherited
+      ? `<button class="rm" title="Revert to the base parameter" ${ov ? '' : 'disabled'}
+                 onclick="resetParam('${P}','${esc(p.selname)}')">↺</button>`
+      : `<button class="rm" title="Remove" onclick="removeParam('${P}',${i})">✕</button>`;
+    html += `<div class="param-row${company ? (ov ? ' overridden' : ' inherited') : ''}">
+      ${cell('selname', 'KOKRS', inherited)}${kindCell()}${cell('low', '')}${cell('high', '')}
+      ${trail}</div>`;
+  });
+  html += `</div><button class="param-add-btn" onclick="addParam('${P}')">＋ Add parameter</button>`;
+  return html;
+}
+function ensureParamList(step, path) {
+  let cur = dotGet(step, path);
+  if (!Array.isArray(cur)) { cur = []; dotSet(step, path, cur); }
+  return cur;
+}
+const setParamValue = (entry, key, value) => {
+  if (key === 'high' && value === '') delete entry.high; else entry[key] = value;
+};
+
+/** The delta entry for one merged param row, created from the merged row when absent —
+ *  an override replaces the whole base entry, so it has to start as a full copy. */
+function companyParamEntry(ctx, path, row) {
+  let list = dotGet(ctx.delta, path);
+  if (!Array.isArray(list)) { list = []; dotSet(ctx.delta, path, list); }
+  let entry = list.find(e => e.selname === row.selname);
+  if (!entry) { entry = {...row}; list.push(entry); }
+  return entry;
+}
+
+function onParamEdit(path, i, key, value) {
+  const ctx = formCtx(); if (!ctx) return;
+  if (ctx.mode === 'base') {
+    const list = ensureParamList(ctx.model, path);
+    if (!list[i]) list[i] = {selname: ''};
+    setParamValue(list[i], key, value);
+    markBaseDirty();
+    return;
+  }
+  const row = (dotGet(ctx.model, path) || [])[i];
+  if (!row) return;
+  setParamValue(companyParamEntry(ctx, path, row), key, value);
+  renderSettingsSteps();
+}
+
+function addParam(path) {
+  const ctx = formCtx(); if (!ctx) return;
+  const target = ctx.mode === 'base' ? ctx.model : ctx.delta;
+  ensureParamList(target, path).push({selname: '', kind: 'P', low: ''});
+  if (ctx.mode === 'base') markBaseDirty();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+function removeParam(path, i) {
+  const ctx = formCtx(); if (!ctx) return;
+  if (ctx.mode === 'base') {
+    const list = ensureParamList(ctx.model, path);
+    list.splice(i, 1); if (!list.length) dotDel(ctx.model, path);
+    markBaseDirty();
+  } else {
+    // company mode only offers ✕ on delta-only rows; base rows reset instead
+    const row = (dotGet(ctx.model, path) || [])[i];
+    if (row) resetParam(path, row.selname);
+    return;
+  }
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+/** Drop one param's override so the base parameter applies again. */
+function resetParam(path, selname) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'company') return;
+  const list = dotGet(ctx.delta, path);
+  if (Array.isArray(list)) {
+    const i = list.findIndex(e => e.selname === selname);
+    if (i >= 0) list.splice(i, 1);
+  }
+  pruneDelta();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+function onParamDictEdit(path, key, value) {
+  const ctx = formCtx(); if (!ctx) return;
+  const target = ctx.mode === 'base' ? ctx.model : ctx.delta;
+  let d = dotGet(target, path);
+  if (!d || Array.isArray(d)) { d = {}; dotSet(target, path, d); }
+  if (value === '') delete d[key]; else d[key] = (key === 'max_rows') ? numOrNull(value) : value;
+  if (ctx.mode === 'base') markBaseDirty(); else renderSettingsSteps();
+}
+
+/** Drop one TOOLS param key's override so the base value applies again. */
+function resetParamDict(path, key) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'company') return;
+  const d = dotGet(ctx.delta, path);
+  if (d && !Array.isArray(d)) delete d[key];
+  pruneDelta();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+/** Base mode: rename a TOOLS param key (on blur), preserving its value and order. */
+function onParamDictKeyEdit(path, oldKey, newKey) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
+  newKey = (newKey || '').trim();
+  if (newKey === oldKey) return;
+  let d = dotGet(ctx.model, path);
+  if (!d || Array.isArray(d)) { d = {}; dotSet(ctx.model, path, d); }
+  // Rebuild preserving insertion order; a blank or duplicate name reverts to render.
+  if (!newKey || (newKey in d && newKey !== oldKey)) { renderSettingsFields(); return; }
+  const rebuilt = {};
+  for (const [k, v] of Object.entries(d)) rebuilt[k === oldKey ? newKey : k] = v;
+  dotSet(ctx.model, path, rebuilt);
+  markBaseDirty();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+/** Base mode: remove a TOOLS param key outright. */
+function removeParamDict(path, key) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
+  const d = dotGet(ctx.model, path);
+  if (d && !Array.isArray(d)) delete d[key];
+  markBaseDirty();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+/** Base mode: add an empty TOOLS param row inline (Param + Value editable in place). The
+ *  key is named by typing into the Param field; a single unnamed ('') row is allowed at a
+ *  time, and blank keys are stripped on save (see saveBaseSettings). */
+function addParamDictRow(path) {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
+  let d = dotGet(ctx.model, path);
+  if (!d || Array.isArray(d)) { d = {}; dotSet(ctx.model, path, d); }
+  if ('' in d) { setSettingsMsg('Name the empty parameter before adding another.'); return; }
+  d[''] = '';
+  markBaseDirty();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+// ── base step CRUD ──
+function markBaseDirty() { setSettingsMsg('Unsaved changes'); }
+function addBaseStep() {
+  showInputDialog('Add step', 'New step_id (SAP tcode / report)', '', 'Add', id => {
+    if (!id) return;
+    if (settingsState.baseSteps.some(s => s.step_id === id)) { setSettingsMsg('Step ' + id + ' already exists.'); return; }
+    settingsState.baseSteps.push({step_id: id, action_type: 'SUBMIT', async: true});
+    settingsState.selectedStep = id;
+    markBaseDirty(); renderSettingsSteps(); renderSettingsFields();
+  });
+}
+function deleteBaseStep(i) {
+  const s = settingsState.baseSteps[i]; if (!s) return;
+  showConfirm('Delete step', 'Remove step "' + s.step_id + '" from the base pipeline?', 'Delete', () => {
+    settingsState.baseSteps.splice(i, 1);
+    if (settingsState.selectedStep === s.step_id) settingsState.selectedStep = '__globals__';
+    markBaseDirty(); renderSettingsSteps(); renderSettingsFields();
+  });
+}
+function moveBaseStep(i, dir) {
+  const j = i + dir; const a = settingsState.baseSteps;
+  if (j < 0 || j >= a.length) return;
+  [a[i], a[j]] = [a[j], a[i]];
+  markBaseDirty(); renderSettingsSteps();
+}
+
+// ── globals editor ──
+function renderGlobalsFields(box) {
+  let html = '';
+  (settingsState.descriptor.globals || []).forEach(g => {
+    let inner = `<div class="set-section-header">${esc(g.title)}</div>`;
+    g.fields.forEach(f => { inner += globalFieldHTML(f); });
+    html += `<div class="set-section">${inner}</div>`;
+  });
+  box.innerHTML = html;
+  autoResizeTextareas(box);
+}
+function globalFieldHTML(f) {
+  const val = dotGet(settingsState.globals, f.path);
+  const P = esc(f.path);
+  let ctl;
+  if (f.widget === 'bool') ctl = `<input type="checkbox" ${val ? 'checked' : ''} onchange="onGlobalEdit('${P}', this.checked)">`;
+  else if (f.widget === 'number') ctl = `<input type="text" value="${esc(val == null ? '' : val)}" oninput="onGlobalEdit('${P}', numOrNull(this.value))">`;
+  else if (f.widget === 'select') ctl = `<select onchange="onGlobalEdit('${P}', this.value)">` +
+      (f.enum || []).map(o => `<option ${o === val ? 'selected' : ''}>${esc(o)}</option>`).join('') + `</select>`;
+  else if (f.widget === 'textarea') {
+    const cur = val == null ? '' : String(val);
+    const prev = cur.trim() ? esc(cur.slice(0, 400)) : '(empty)';
+    ctl = `<div class="prompt-preview ${cur.trim()?'':'empty'}">${prev}</div>
+           <button class="prompt-expand-btn" onclick="editGlobalPrompt('${P}','${esc(f.label)}')">✎ Edit</button>`;
+  } else ctl = `<input type="text" value="${esc(val == null ? '' : val)}" oninput="onGlobalEdit('${P}', this.value)">`;
+  const help = GLOBAL_FIELD_HELP[f.path] || '';
+  const tip = help ? `<span class="tip-icon">ⓘ<span class="tip-text">${esc(help)}</span></span>` : '';
+  const pf = f.widget === 'textarea' ? ' prompt-field' : '';
+  return `<div class="set-field${pf}"><label>${esc(f.label)}${tip}</label><div class="ctl">${ctl}</div><span></span></div>`;
+}
+function onGlobalEdit(path, value) { dotSet(settingsState.globals, path, value); markBaseDirty(); }
+
+// ═══════════════════════════════════════════════════════════
+//  Prompt (Markdown) editor — vendored CodeMirror + live preview
+// ═══════════════════════════════════════════════════════════
+
+let _cm = null, _peApply = null;
+
+function openPromptEditor(title, text, onApply) {
+  _peApply = onApply;
+  document.getElementById('pe-title').textContent = 'Edit · ' + title;
+  document.getElementById('prompt-editor-overlay').classList.add('visible');
+  const pane = document.getElementById('pe-editor-pane');
+  pane.innerHTML = '';
+  _cm = CodeMirror(pane, {
+    value: text || '', mode: 'markdown', lineWrapping: true, lineNumbers: false,
+    viewportMargin: Infinity, theme: 'default',
+  });
+  // highlight {{placeholder}} tokens
+  _cm.addOverlay({
+    token: function (stream) {
+      if (stream.match(/\{\{[^}]*\}\}/)) return 'placeholder-token';
+      while (stream.next() != null && !stream.match(/\{\{/, false)) {}
+      return null;
+    },
+  });
+  _cm.on('change', updatePromptPreview);
+  setPromptView('split');
+  setTimeout(() => { _cm.refresh(); _cm.focus(); updatePromptPreview(); }, 30);
+}
+function updatePromptPreview() {
+  if (!_cm) return;
+  document.getElementById('pe-preview').innerHTML = renderMarkdown(_cm.getValue());
+}
+function setPromptView(mode) {
+  const ed = document.getElementById('pe-editor-pane'), pv = document.getElementById('pe-preview');
+  ed.classList.toggle('hidden', mode === 'preview');
+  pv.classList.toggle('hidden', mode === 'edit');
+  ['edit', 'split', 'preview'].forEach(m =>
+    document.getElementById('pe-mode-' + m).classList.toggle('active', m === mode));
+  if (_cm && mode !== 'preview') setTimeout(() => _cm.refresh(), 10);
+}
+function closePromptEditor(apply) {
+  if (apply && _peApply && _cm) _peApply(_cm.getValue());
+  document.getElementById('prompt-editor-overlay').classList.remove('visible');
+  _cm = null; _peApply = null;
+}
+/** Open the markdown editor on the field at `path` in whichever step form is showing. */
+function editFormPrompt(path, label) {
+  const ctx = formCtx(); if (!ctx) return;
+  openPromptEditor(label, String(dotGet(ctx.model, path) || ''), text => {
+    onFormEdit(path, text);
+    renderSettingsFields();
+  });
+}
+function editGlobalPrompt(path, label) {
+  openPromptEditor(label, String(dotGet(settingsState.globals, path) || ''), text => {
+    dotSet(settingsState.globals, path, text); markBaseDirty(); renderGlobalsFields(document.getElementById('settings-fields'));
+  });
+}
+
+function renderMarkdown(src) {
+  // Minimal, safe Markdown → HTML (escaped first). Covers headings, bold/italic, code,
+  // fenced blocks, lists, links, and {{placeholder}} highlighting.
+  //
+  // These are prompts, not prose: their JSON skeletons and indented blocks carry meaning
+  // in the whitespace, so plain lines keep their line breaks and indentation (rendered in
+  // a pre-wrap block) and lists nest by indent, instead of everything reflowing flat.
+  const es = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const lines = String(src).replace(/\r\n/g, '\n').split('\n');
+  let out = '', inCode = false;
+  const listStack = [];          // [{type:'ul'|'ol', indent:n}] — open lists, outermost first
+  let para = [];                 // buffered plain lines of the current paragraph block
+  const inline = t => es(t)
+    .replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, t2, u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${t2}</a>`)
+    .replace(/\{\{[^}]*\}\}/g, m => `<span class="ph">${m}</span>`);
+  // Each open list has exactly one open <li>; a deeper list nests inside it.
+  const closeLists = (toIndent = -1) => {
+    while (listStack.length && listStack[listStack.length - 1].indent > toIndent)
+      out += `</li></${listStack.pop().type}>`;
+  };
+  const flushPara = () => {
+    if (!para.length) return;
+    out += `<p class="md-block">${para.map(inline).join('\n')}</p>`;
+    para = [];
+  };
+  const openItem = (type, indent, text) => {
+    closeLists(indent);
+    const top = listStack[listStack.length - 1];
+    if (top && top.indent === indent) {
+      if (top.type === type) out += '</li>';                       // sibling item
+      else { out += `</li></${listStack.pop().type}>`; out += `<${type}>`; listStack.push({type, indent}); }
+    } else { out += `<${type}>`; listStack.push({type, indent}); } // first / deeper item
+    out += `<li>${text}`;
+  };
+  for (const raw of lines) {
+    if (/^```/.test(raw)) {
+      if (inCode) { out += '</code></pre>'; inCode = false; }
+      else { flushPara(); closeLists(); out += '<pre><code>'; inCode = true; }
+      continue;
+    }
+    if (inCode) { out += es(raw) + '\n'; continue; }
+    let m;
+    if ((m = raw.match(/^(#{1,6})\s+(.*)$/))) {
+      flushPara(); closeLists();
+      out += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`;
+      continue;
+    }
+    if ((m = raw.match(/^(\s*)([-*]|\d+\.)\s+(.*)$/))) {
+      flushPara();
+      openItem(/^\d+\./.test(m[2]) ? 'ol' : 'ul', m[1].length, inline(m[3]));
+      continue;
+    }
+    if (raw.trim() === '') { flushPara(); closeLists(); continue; }
+    closeLists();
+    para.push(raw);
+  }
+  flushPara(); closeLists();
+  if (inCode) out += '</code></pre>';
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Company registry manager
+// ═══════════════════════════════════════════════════════════
+
+async function openRegistry() {
+  document.getElementById('registry-overlay').classList.add('visible');
+  await renderRegistry();
+}
+function closeRegistry() { document.getElementById('registry-overlay').classList.remove('visible'); }
+
+async function renderRegistry() {
+  const body = document.getElementById('registry-body');
+  body.innerHTML = '<div class="diff-empty">Loading…</div>';
+  const r = await fetch('/api/registry/companies', {credentials:'same-origin'});
+  if (!r.ok) { body.innerHTML = '<div class="diff-empty">Error ' + r.status + '</div>'; return; }
+  const rows = await r.json();
+  body.innerHTML = rows.map(c => `<div class="reg-row">
+      <span class="code">${esc(c.code)}</span>
+      <span class="name">${esc(c.display_name || c.code)}</span>
+      <button title="Rename" onclick="renameCompany('${esc(c.code)}','${esc(c.display_name||'')}')">✎</button>
+      <button title="Delete" onclick="deleteCompanyReg('${esc(c.code)}')">✕</button>
+    </div>`).join('') +
+    `<div class="reg-new">
+       <input id="reg-new-code" placeholder="CODE" maxlength="12">
+       <input id="reg-new-name" placeholder="Display name">
+       <button onclick="createCompany()">＋ Add</button>
+     </div>`;
+}
+async function registryPost(url, method, body) {
+  const r = await fetch(url, {method, credentials:'same-origin',
+    headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined});
+  if (!r.ok) { const e = await r.json().catch(()=>({})); alert('Error: ' + (e.error || r.status)); return false; }
+  return true;
+}
+
+/** Re-read the registry into the Company dropdown and the dashboard after a change. */
+async function afterRegistryChange(select) {
+  await renderRegistry();
+  await refreshSettingsCompanies(select);
+  const me = await fetch('/api/me', {credentials:'same-origin'});
+  if (me.ok) {
+    const data = await me.json();
+    appState.user = data;
+    appState.companies = data.companies || [];
+    renderDashboard();
+  }
+}
+
+async function createCompany() {
+  const code = (document.getElementById('reg-new-code').value || '').trim();
+  const name = (document.getElementById('reg-new-name').value || '').trim();
+  if (!code) return;
+  if (!await registryPost('/api/registry/companies', 'POST', {code, display_name: name || code})) return;
+  await afterRegistryChange(code);
+  loadSettings(code);       // jump straight into the new company's settings
+}
+function renameCompany(code, cur) {
+  showInputDialog('Rename company', 'Display name for ' + code, cur, 'Save', async name => {
+    if (!name) return;
+    if (await registryPost('/api/registry/companies/' + encodeURIComponent(code), 'PUT', {display_name: name}))
+      await afterRegistryChange();
+  });
+}
+function deleteCompanyReg(code) {
+  showConfirm('Delete company', 'Delete company "' + code + '" and all its saved settings? This cannot be undone.', 'Delete',
+    async () => {
+      if (!await registryPost('/api/registry/companies/' + encodeURIComponent(code), 'DELETE')) return;
+      const wasOpen = settingsState.code === code;
+      await afterRegistryChange(wasOpen ? '__base__' : undefined);
+      if (wasOpen) loadSettings('__base__');
+    });
+}
 
 // ═══════════════════════════════════════════════════════════
 //  Boot

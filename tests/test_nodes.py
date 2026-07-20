@@ -1,5 +1,7 @@
 """Per-node tests for the graph factory nodes, using fake MCP session + fake LLMs."""
 
+import json
+
 import pytest
 
 from graph_builder import (make_analysis_node, make_execute_node, make_poll_node,
@@ -60,7 +62,7 @@ def _cmp_step(comparison):
 
 
 async def test_precheck_comparison_empty_pass_executes(make_session, make_llms, make_state):
-    session = make_session(sap_read_table=_table_result([]))
+    session = make_session(sap_run_tool=_table_result([]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "empty", "on_pass": "execute", "on_fail": "skip"})
     out = await node(make_state([step]))
@@ -69,7 +71,7 @@ async def test_precheck_comparison_empty_pass_executes(make_session, make_llms, 
 
 
 async def test_precheck_comparison_non_empty_on_pass_skip(make_session, make_llms, make_state):
-    session = make_session(sap_read_table=_table_result([{"X": "1"}]))
+    session = make_session(sap_run_tool=_table_result([{"X": "1"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "non_empty", "on_pass": "skip", "on_fail": "execute"})
     out = await node(make_state([step]))
@@ -77,7 +79,7 @@ async def test_precheck_comparison_non_empty_on_pass_skip(make_session, make_llm
 
 
 async def test_precheck_comparison_field_mismatch_on_fail_skip(make_session, make_llms, make_state):
-    session = make_session(sap_read_table=_table_result([{"SPERRE": "X"}]))
+    session = make_session(sap_run_tool=_table_result([{"SPERRE": "X"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "first", "field": "SPERRE", "operator": "eq",
                       "value": "", "on_fail": "skip"})
@@ -89,7 +91,7 @@ async def test_precheck_comparison_field_mismatch_on_fail_skip(make_session, mak
 async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_state):
     # "error" is a backward-compatible alias of "analyse": failure → passed=False and a
     # uniform ErrorContext handed to the source-aware analysis_node (no inline current_analysis).
-    session = make_session(sap_read_table=_table_result([{"SPERRE": "X"}]))
+    session = make_session(sap_run_tool=_table_result([{"SPERRE": "X"}]))
     node = make_pre_check_node(session, make_llms())
     step = _cmp_step({"select": "first", "field": "SPERRE", "operator": "eq",
                       "value": "", "on_fail": "error"})
@@ -102,7 +104,7 @@ async def test_precheck_comparison_on_fail_error(make_session, make_llms, make_s
 
 
 async def test_precheck_llm_pass(make_session, make_llms, make_state):
-    session = make_session(sap_read_table=_table_result([{"A": "1"}]))
+    session = make_session(sap_run_tool=_table_result([{"A": "1"}]))
     node = make_pre_check_node(session, make_llms(validation="yes"))
     step = {"step_id": "A", "pre_check": {
         "enabled": True, "mode": "llm", "action_type": "TOOLS", "object_name": "COKP",
@@ -113,7 +115,7 @@ async def test_precheck_llm_pass(make_session, make_llms, make_state):
 
 
 async def test_precheck_llm_fail_skips(make_session, make_llms, make_state):
-    session = make_session(sap_read_table=_table_result([{"A": "1"}]))
+    session = make_session(sap_run_tool=_table_result([{"A": "1"}]))
     node = make_pre_check_node(session, make_llms(validation="no"))
     step = {"step_id": "A", "pre_check": {
         "enabled": True, "mode": "llm", "action_type": "TOOLS", "object_name": "COKP",
@@ -213,7 +215,7 @@ async def test_precheck_submit_completed_without_spool_not_verified(make_session
 # ===========================================================================
 
 async def test_execute_tools(make_session, make_state):
-    session = make_session(sap_read_table=_table_result([{"K": "1"}]))
+    session = make_session(sap_run_tool=_table_result([{"K": "1"}]))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "TOOLS", "object_name": "COKP",
             "params": {"table": "COKP"}}
@@ -379,7 +381,7 @@ async def test_validate_llm_non_json_escalates(make_session, make_llms, make_sta
 
 async def test_validate_run_verification_action(make_session, make_llms, make_state):
     # validate.run executes a TOOLS read and validates ITS rows.
-    session = make_session(sap_read_table=_table_result([{"KOKRS": "X500"}]))
+    session = make_session(sap_run_tool=_table_result([{"KOKRS": "X500"}]))
     node = make_validate_node(session, make_llms())
     step = _vstep({"mode": "keyword",
                    "run": {"action_type": "TOOLS", "object_name": "COKP",
@@ -388,8 +390,31 @@ async def test_validate_run_verification_action(make_session, make_llms, make_st
                                "error_patterns": ["FATAL"]}})
     out = await node(make_state([step]))
     assert out["current_validate"]["verdict"] == "ok"
-    assert ("sap_read_table", {"table": "COKP", "where": "", "fields": "",
-                               "max_rows": 100}) in session.calls
+    assert ("sap_run_tool", {"object_name": "TOOL_READ_TABLE",
+                             "params_json": json.dumps({"table": "COKP"}),
+                             "test_run": True}) in session.calls
+
+
+async def test_validate_run_job_spool_resolves_placeholders(make_session, make_llms, make_state):
+    # validate.run calls an explicit tool (TOOL_READ_JOB_SPOOL) and resolves this step's
+    # job id from the poll result into the {{job_name}}/{{job_id}} param placeholders.
+    spool_env = {"status": "ok", "messages": [], "meta": {"object_name": "TOOL_READ_JOB_SPOOL"},
+                 "data": {"spool": {"available": True, "line_count": 1, "text": "settlement done"}}}
+    session = make_session(sap_run_tool=spool_env)
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"mode": "keyword",
+                   "run": {"action_type": "TOOLS", "object_name": "TOOL_READ_JOB_SPOOL",
+                           "params": {"job_name": "{{job_name}}", "job_id": "{{job_id}}"}},
+                   "keyword": {"source": "spool", "ok_patterns": ["done"],
+                               "error_patterns": ["FATAL"]}})
+    state = make_state([step],
+                       current_execute=_exec_env(requires_poll=True, job_name="J", job_id="42"),
+                       current_poll={"job_name": "J", "job_id": "42", "sap_status": "FINISHED"})
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "ok"
+    assert ("sap_run_tool", {"object_name": "TOOL_READ_JOB_SPOOL",
+                             "params_json": json.dumps({"job_name": "J", "job_id": "42"}),
+                             "test_run": True}) in session.calls
 
 
 # ===========================================================================
@@ -453,3 +478,79 @@ async def test_analysis_explain_depth_via_on_error_mode_map(make_session, make_l
     state = make_state([step], retry_count=0, current_error_context=ec)
     out = await node(state)
     assert out["current_analysis"]["action"] == "user_input"
+
+
+async def test_analysis_diagnose_structured_result(make_session, make_llms, make_state,
+                                                   patch_react_agent):
+    # New final_answer carries a structured {status, errors[], resolutions[]} block;
+    # errors reference resolutions via resolution_id, and the flat back-compat fields
+    # are synthesized from it.
+    patch_react_agent(json.dumps({
+        "action": "user_input",
+        "result": {
+            "status": "completed",
+            "errors": [{"object_id": "FK01", "error": "KD205",
+                        "cause": "settlement rule missing", "resolution_id": "R1"}],
+            "resolutions": [{"id": "R1", "recommendation": "Maintain rule in KO02",
+                             "affected_objects": ["FK01"]}],
+        },
+    }))
+    node = make_analysis_node(make_session(), make_llms())
+    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
+    out = await node(state)
+    an = out["current_analysis"]
+    assert an["status"] == "completed"
+    assert an["action"] == "user_input"
+    # resolution_id links an error to a resolution
+    assert an["result"]["errors"][0]["resolution_id"] == an["result"]["resolutions"][0]["id"]
+    # flat back-compat fields are derived from the structured result
+    assert "FK01" in an["diagnosis"]
+    assert "KO02" in an["user_instructions"]
+
+
+async def test_analysis_diagnose_budget_exhausted_is_partial(make_session, make_llms,
+                                                             make_state, patch_react_agent):
+    # The model never emits a final_answer (always a tool_call) → the tool-call budget
+    # runs out → status downgraded to "partial" and routed to the operator.
+    patch_react_agent('{"type":"tool_call","tool":"sap_read_table",'
+                      '"args":{"table":"AUFK"}}')
+    node = make_analysis_node(make_session(), make_llms())
+    step = {"step_id": "A",
+            "on_error": {"analysis": {"instructions": "diagnose", "max_tool_calls": 2}}}
+    state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX)
+    out = await node(state)
+    an = out["current_analysis"]
+    assert an["status"] == "partial"
+    assert an["action"] == "user_input"
+
+
+async def test_analysis_diagnose_section_prompt_assembled(make_session, make_llms, make_state):
+    # Section-based prompt: on_error.analysis sections + analysis_defaults fallback,
+    # with {{placeholders}} resolved from company_config.
+    captured = {}
+
+    def analysis_fn(messages):
+        captured["system"] = messages[0].content
+        return '{"action":"user_input","result":{"status":"completed",' \
+               '"errors":[],"resolutions":[]}}'
+
+    llms = make_llms()
+    llms["analysis"].content = analysis_fn
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "KO8G", "action_type": "SUBMIT", "object_name": "RKO7KO8G",
+            "on_error": {"analysis": {
+                "role": "You are an analyst.",
+                "context_template": "Area {{controlling_area}} period {{period}}.\n{{errors}}",
+                "goal": "Find the cause.",
+                "instructions": "Step 1 read AUFK.",
+            }}}
+    state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX,
+                       company_config={"controlling_area": "X500", "period": "11"},
+                       analysis_defaults={"rules": "Be honest.", "max_tool_calls": 8})
+    out = await node(state)
+    sysmsg = captured["system"]
+    assert "## Goal" in sysmsg and "Find the cause." in sysmsg
+    assert "Step 1 read AUFK." in sysmsg            # instructions section
+    assert "Area X500 period 11." in sysmsg         # placeholders resolved
+    assert "Be honest." in sysmsg                   # rules pulled from analysis_defaults
+    assert out["current_analysis"]["status"] == "completed"

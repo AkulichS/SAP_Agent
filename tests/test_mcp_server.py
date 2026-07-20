@@ -116,6 +116,42 @@ def test_read_spool_truncates():
 
 
 # ---------------------------------------------------------------------------
+# sap_run_tool — generic passthrough + shape-based normalisation
+# ---------------------------------------------------------------------------
+
+def test_run_tool_read_table_normalises_rows():
+    out = mcp_server.sap_run_tool("TOOL_READ_TABLE", json.dumps({"table": "COKP"}))
+    _assert_envelope(out)
+    assert out["status"] == "ok"
+    assert out["meta"]["object_name"] == "TOOL_READ_TABLE"
+    assert out["meta"]["row_count"] == 1
+    assert out["data"]["rows"][0]["KOKRS"] == "X500"
+    assert out["data"]["raw"]["data"][0]["KOKRS"] == "X500"   # raw always preserved
+
+
+def test_run_tool_read_job_spool_normalises_spool():
+    out = mcp_server.sap_run_tool(
+        "TOOL_READ_JOB_SPOOL", json.dumps({"jobname": "STUB_RKO7KO8G", "jobcount": "1"}))
+    _assert_envelope(out)
+    assert out["status"] == "ok"
+    assert out["meta"]["row_count"] == 0            # spool-like tool → no rows
+    spool = out["data"]["spool"]
+    assert spool["available"] is True               # status "S" → available
+    assert spool["line_count"] > 0
+    assert "KO8G" in spool["text"]                  # stub KO8G spool header
+
+
+def test_run_tool_unknown_tool_passes_through_raw():
+    # A tool with no ABAP handler in the stub still returns a clean envelope; its raw
+    # payload stays reachable under data.raw (no rows/spool to normalise).
+    out = mcp_server.sap_run_tool("TOOL_FUTURE_CUSTOM", json.dumps({"x": "1"}))
+    _assert_envelope(out)
+    assert out["status"] == "ok"
+    assert "rows" not in out["data"] and "spool" not in out["data"]
+    assert out["data"]["raw"] == {}
+
+
+# ---------------------------------------------------------------------------
 # sap_check_period
 # ---------------------------------------------------------------------------
 

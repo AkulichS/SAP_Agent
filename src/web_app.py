@@ -29,11 +29,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
 
 import auth
-from config import load_config, reset_each_run_enabled
+import config_settings
+from config import reset_each_run_enabled
+from config_schema import step_json_schema
+from config_store import VersionConflict, get_config_store, load_effective_config
 from run_manager import get_company, get_run_manager, load_companies
 
 logging.basicConfig(level=logging.INFO,
@@ -81,7 +85,7 @@ def _companies_for_user(session: dict) -> list[dict]:
             entry["run_status"] = mgr.get_status(c["code"])
             # Dev/testing flag: when on, a finished run can be re-run (Start stays active).
             try:
-                cfg = load_config(c["config_file"])
+                cfg = load_effective_config(c["code"])
                 entry["reset_each_run"] = reset_each_run_enabled(cfg.get("defaults", {}))
             except Exception as exc:
                 logger.warning("reset_each_run lookup failed for %s: %s", c["code"], exc)
@@ -166,6 +170,265 @@ async def companies(request: Request):
     if not session:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     return JSONResponse(_companies_for_user(session))
+
+
+# ---------------------------------------------------------------------------
+# Admin Settings REST endpoints (per-company config deltas)
+# ---------------------------------------------------------------------------
+
+def _require_admin(request: Request, code: str | None = None):
+    """Return (session, None) when the caller is an admin authorized for `code`,
+    else (None, JSONResponse) with the right status.
+
+    An admin may configure any company in the registry — registry management is already
+    role-only, so a company an admin created must also be one they can set up. Companies
+    listed in their users.yaml `company_codes` stay reachable too (that list still gates
+    running/monitoring, which is a separate, operator-level concern)."""
+    session = _get_session(request)
+    if not session:
+        return None, JSONResponse({"error": "Not authenticated"}, status_code=401)
+    if session.get("role") != "admin":
+        return None, JSONResponse({"error": "Admin role required"}, status_code=403)
+    if code is not None and code not in set(session.get("company_codes", [])):
+        registered = {c["code"] for c in get_config_store().list_registry()}
+        if code not in registered:
+            return None, JSONResponse({"error": "Not authorized for this company"},
+                                      status_code=403)
+    return session, None
+
+
+@app.get("/api/settings/schema")
+async def settings_schema(request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    return JSONResponse(step_json_schema())
+
+
+@app.get("/api/settings/form-schema")
+async def settings_form_schema(request: Request):
+    """UI form descriptor (sections, fields, conditional visibility, logical enums)."""
+    _, err = _require_admin(request)
+    if err:
+        return err
+    # Base globals feed only the advisory TOOLS catalog; if the base can't be loaded
+    # (unseeded store, no seed file) fall back to the built-in default catalog.
+    try:
+        base = await run_in_threadpool(config_settings.build_base_settings)
+        globals_ = base.get("globals")
+    except Exception:
+        globals_ = None
+    return JSONResponse(config_settings.form_descriptor(globals_))
+
+
+# --- Base tier: the product base (globals + ordered steps), edited as "Company Base" ---
+# Registered before /api/settings/{code} so the literal "base" path wins the match.
+
+@app.get("/api/settings/base")
+async def get_base_settings(request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    data = await run_in_threadpool(config_settings.build_base_settings)
+    return JSONResponse(data)
+
+
+@app.put("/api/settings/base")
+async def put_base_settings(request: Request):
+    session, err = _require_admin(request)
+    if err:
+        return err
+    body = await request.json()
+    globals_ = body.get("globals", {}) or {}
+    steps = body.get("steps", []) or []
+    version = body.get("version", 0)
+    try:
+        config_settings.validate_base_steps(steps)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    try:
+        await run_in_threadpool(
+            get_config_store().save_base, globals_, steps, version, session["username"],
+        )
+    except VersionConflict as exc:
+        return JSONResponse(
+            {"error": "Base changed elsewhere — reload and retry", "detail": str(exc)},
+            status_code=409,
+        )
+    data = await run_in_threadpool(config_settings.build_base_settings)
+    logger.info("Base config saved by %s", session["username"])
+    return JSONResponse(data)
+
+
+@app.get("/api/settings/base/history")
+async def get_base_history(request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    rows = await run_in_threadpool(get_config_store().base_history)
+    return JSONResponse(rows)
+
+
+@app.delete("/api/settings/base/history/oldest")
+async def delete_base_history_oldest(request: Request):
+    session, err = _require_admin(request)
+    if err:
+        return err
+    try:
+        result = await run_in_threadpool(get_config_store().delete_oldest_base_history)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("Base history v%s pruned by %s", result["deleted_version"], session["username"])
+    return JSONResponse(result)
+
+
+@app.get("/api/settings/{code}")
+async def get_settings(code: str, request: Request):
+    _, err = _require_admin(request, code)
+    if err:
+        return err
+    data = await run_in_threadpool(config_settings.build_settings, code)
+    return JSONResponse(data)
+
+
+@app.put("/api/settings/{code}")
+async def put_settings(code: str, request: Request):
+    session, err = _require_admin(request, code)
+    if err:
+        return err
+    body = await request.json()
+    override = body.get("override", {}) or {}
+    run_context = body.get("run_context")
+    version = body.get("version", 0)
+    try:
+        config_settings.validate_override(override)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    try:
+        await run_in_threadpool(
+            get_config_store().save_override,
+            code, override, run_context, version, session["username"],
+        )
+    except VersionConflict as exc:
+        return JSONResponse(
+            {"error": "Settings changed elsewhere — reload and retry", "detail": str(exc)},
+            status_code=409,
+        )
+    data = await run_in_threadpool(config_settings.build_settings, code)
+    logger.info("Settings saved for %s by %s", code, session["username"])
+    return JSONResponse(data)
+
+
+@app.get("/api/settings/{code}/history")
+async def settings_history(code: str, request: Request):
+    session, err = _require_admin(request, code)
+    if err:
+        return err
+    try:
+        rows = await run_in_threadpool(get_config_store().history, code)
+    except Exception as exc:
+        logger.exception("Failed to load history for %s", code)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return JSONResponse(rows)
+
+
+@app.delete("/api/settings/{code}/history/oldest")
+async def delete_settings_history_oldest(code: str, request: Request):
+    session, err = _require_admin(request, code)
+    if err:
+        return err
+    try:
+        result = await run_in_threadpool(get_config_store().delete_oldest_history, code)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("History v%s for %s pruned by %s",
+                result["deleted_version"], code, session["username"])
+    return JSONResponse(result)
+
+
+@app.post("/api/settings/{code}/reset")
+async def reset_settings(code: str, request: Request):
+    session, err = _require_admin(request, code)
+    if err:
+        return err
+    body = await request.json()
+    version = body.get("version")
+    store = get_config_store()
+    try:
+        if body.get("scope") == "all":
+            await run_in_threadpool(store.reset_company, code, version, session["username"])
+        elif body.get("step_id"):
+            await run_in_threadpool(store.reset_step, code, body["step_id"], version, session["username"])
+        else:
+            return JSONResponse({"error": "Provide scope:'all' or step_id"}, status_code=400)
+    except VersionConflict as exc:
+        return JSONResponse(
+            {"error": "Settings changed elsewhere — reload and retry", "detail": str(exc)},
+            status_code=409,
+        )
+    data = await run_in_threadpool(config_settings.build_settings, code)
+    return JSONResponse(data)
+
+
+# ---------------------------------------------------------------------------
+# Admin company registry (create / rename / delete companies)
+# ---------------------------------------------------------------------------
+# Role-only admin check: registry management spans all companies. Editing a company's
+# per-company delta still requires that code in the admin's users.yaml company_codes.
+
+@app.get("/api/registry/companies")
+async def registry_list(request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
+
+
+@app.post("/api/registry/companies")
+async def registry_create(request: Request):
+    session, err = _require_admin(request)
+    if err:
+        return err
+    body = await request.json()
+    code = (body.get("code") or "").strip()
+    display_name = (body.get("display_name") or code).strip()
+    run_context = body.get("run_context") or {}
+    if not code:
+        return JSONResponse({"error": "code is required"}, status_code=400)
+    try:
+        await run_in_threadpool(
+            get_config_store().create_company, code, display_name, run_context, session["username"],
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("Company %s created by %s", code, session["username"])
+    return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
+
+
+@app.put("/api/registry/companies/{code}")
+async def registry_update(code: str, request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    body = await request.json()
+    display_name = body.get("display_name")
+    if display_name is None:
+        return JSONResponse({"error": "display_name is required"}, status_code=400)
+    try:
+        await run_in_threadpool(get_config_store().rename_company, code, display_name)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
+
+
+@app.delete("/api/registry/companies/{code}")
+async def registry_delete(code: str, request: Request):
+    _, err = _require_admin(request)
+    if err:
+        return err
+    await run_in_threadpool(get_config_store().delete_company, code)
+    logger.info("Company %s deleted", code)
+    return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
 
 
 # ---------------------------------------------------------------------------
