@@ -2548,13 +2548,17 @@ function renderSettingsFields() {
 function renderCompanyFields() {
   const box = document.getElementById('settings-fields');
   if (settingsState.selectedStep === '__run_context__') {
+    const rowsHtml = Object.entries(settingsState.runOverride).map(([k,v]) =>
+      `<div class="param-row param-kv">
+         <input class="param-key" value="${esc(k)}" placeholder="Key"
+                onchange="onRunContextKeyEdit('${esc(k)}', this.value)">
+         <input class="param-val" value="${esc(v==null?'':v)}" placeholder="Value"
+                oninput="onRunContextValueEdit('${esc(k)}', this.value)">
+         <button class="rm" title="Remove" onclick="removeRunContextField('${esc(k)}')">✕</button>
+       </div>`).join('');
     box.innerHTML = '<div class="set-section-header">Company data</div>' +
-      Object.entries(settingsState.runOverride).map(([k,v]) =>
-        `<div class="set-field">
-           <label>${esc(k)}</label>
-           <div class="ctl"><input type="text" value="${esc(v==null?'':v)}"
-                oninput="settingsState.runOverride['${esc(k)}']=this.value"></div>
-           <span></span></div>`).join('');
+      `<div class="param-rows">${rowsHtml}</div>` +
+      `<button class="param-add-btn" onclick="addRunContextField()">＋ Add field</button>`;
     return;
   }
   // Same descriptor-driven form as base mode — see renderStepForm.
@@ -2630,6 +2634,7 @@ function autoResizeTextareas(container) {
 
 async function saveSettings() {
   if (settingsState.mode === 'base') return saveBaseSettings();
+  delete settingsState.runOverride[''];   // drop an unnamed field left over from "＋ Add field"
   pruneDelta();
   if (deepEqual(settingsState.override, settingsState.savedOverride) &&
       deepEqual(settingsState.runOverride, settingsState.savedRunOverride)) {
@@ -3678,6 +3683,33 @@ function addParamDictRow(path) {
   d[''] = '';
   markBaseDirty();
   renderSettingsFields(); renderSettingsSteps();
+}
+
+function onRunContextValueEdit(key, value) {
+  settingsState.runOverride[key] = value;
+}
+/** Rename a run_context key (on blur), preserving its value and order. */
+function onRunContextKeyEdit(oldKey, newKey) {
+  newKey = (newKey || '').trim();
+  if (newKey === oldKey) return;
+  const d = settingsState.runOverride;
+  if (!newKey || (newKey in d && newKey !== oldKey)) { renderSettingsFields(); return; }
+  const rebuilt = {};
+  for (const [k, v] of Object.entries(d)) rebuilt[k === oldKey ? newKey : k] = v;
+  settingsState.runOverride = rebuilt;
+  renderSettingsFields();
+}
+function removeRunContextField(key) {
+  delete settingsState.runOverride[key];
+  renderSettingsFields();
+}
+/** Add an empty run_context row inline; the key is named by typing into the Key field.
+ *  A single unnamed ('') row is allowed at a time (stripped on save if left unnamed). */
+function addRunContextField() {
+  const d = settingsState.runOverride;
+  if ('' in d) { setSettingsMsg('Name the empty field before adding another.'); return; }
+  d[''] = '';
+  renderSettingsFields();
 }
 
 // ── base step CRUD ──
