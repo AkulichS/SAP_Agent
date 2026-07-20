@@ -9,16 +9,11 @@
 *&   BDC          - Batch Data Communication (CALL TRANSACTION)
 *&   TOOLS        - Different tools like Direct table read via RFC_READ_TABLE or read spool for job
 *&============================================================*
-*& DDIC PREREQUISITES (create in SE11 before activating — RFC interfaces
-*& require dictionary types, so these cannot be local TYPES):
-*&   Structure  ZFI_AI_MSG    — lean message row, fields:
-*&       TYPE   (CHAR1)  | ID     (CHAR20)
-*&       NUMBER (NUMC3)  | MESSAGE (CHAR255 / SYMSGV-compatible)
-*&   Table type ZFI_AI_MSG_T  — standard table of ZFI_AI_MSG.
-*& ET_MESSAGES now uses ZFI_AI_MSG_T instead of BAPIRET2_T: only TYPE/ID/
-*& NUMBER/MESSAGE are consumed downstream, so the unused BAPIRET2 fields
-*& (MESSAGE_V1..V4, PARAMETER, ROW, FIELD, SYSTEM, LOG_*) are dropped.
-*& Field names match BAPIRET2 so MOVE-CORRESPONDING maps BAPI/BDC results.
+*& ET_MESSAGES uses the standard BAPIRET2_T (no custom DDIC objects
+*& required — nothing to create per client before activating). Only
+*& TYPE/ID/NUMBER/MESSAGE are consumed downstream (mcp_server.py); the
+*& unused BAPIRET2 fields (MESSAGE_V1..V4, PARAMETER, ROW, FIELD,
+*& SYSTEM, LOG_*) are simply left blank.
 *&============================================================*
 
 *&============================================================*
@@ -51,7 +46,7 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
 *"     VALUE(EV_RESULT_JSON) TYPE  STRING
 *"     VALUE(EV_MESSAGE) TYPE  STRING
 *"  CHANGING
-*"     VALUE(ET_MESSAGES) TYPE  ZFI_AI_MSG_T
+*"     VALUE(ET_MESSAGES) TYPE  BAPIRET2_T
 *"----------------------------------------------------------------------
 
   DATA: lv_action      TYPE string,
@@ -136,7 +131,7 @@ FORM z_execute_fm
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   "--- RTTI metadata tables from FUNCTION_IMPORT_INTERFACE ---
   DATA: lt_exc_list   TYPE STANDARD TABLE OF rsexc WITH DEFAULT KEY,
@@ -271,12 +266,8 @@ FORM z_execute_fm
   ENDIF.
 
   "--- Step 8: Harvest RETURN table messages (BAPI pattern) ---
-  "    BAPIs return BAPIRET2; map the relevant fields into the lean ZFI_AI_MSG.
-  DATA: ls_aimsg TYPE zfi_ai_msg.
   LOOP AT lt_return ASSIGNING <fs_ret>.
-    CLEAR ls_aimsg.
-    MOVE-CORRESPONDING <fs_ret> TO ls_aimsg.
-    APPEND ls_aimsg TO et_messages.
+    APPEND <fs_ret> TO et_messages.
   ENDLOOP.
 
   "--- Step 9: Collect scalar Exporting params for result JSON ---
@@ -299,9 +290,7 @@ FORM z_execute_fm
       EXPORTING  wait   = 'X'
       IMPORTING  return = ls_ret.
     IF ls_ret-type CA 'EAX'.
-      CLEAR ls_aimsg.
-      MOVE-CORRESPONDING ls_ret TO ls_aimsg.
-      APPEND ls_aimsg TO et_messages.
+      APPEND ls_ret TO et_messages.
     ENDIF.
   ENDIF.
 
@@ -361,7 +350,7 @@ FORM z_execute_submit
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   DATA: lt_selopts        TYPE ty_zai_selparam_tab,
         ls_selopt         LIKE LINE OF lt_selopts,
@@ -591,7 +580,7 @@ FORM z_execute_bdc
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   DATA: lt_screens TYPE ty_zai_bdc_screen_tab,
         ls_screen  TYPE ty_zai_bdc_screen,
@@ -604,7 +593,6 @@ FORM z_execute_bdc
         lv_prog    TYPE sy-repid,
         lv_dynr    TYPE sy-dynnr,
         ls_bapiret TYPE bapiret2,
-        ls_aimsg   TYPE zfi_ai_msg,
         lv_msg     TYPE string,
         lv_message_count TYPE i.
 
@@ -674,10 +662,7 @@ FORM z_execute_bdc
                    ls_messtab-msgv3
                    ls_messtab-msgv4.
 
-    "--- Map the formatted BAPIRET2 row into the lean ZFI_AI_MSG ---
-    CLEAR ls_aimsg.
-    MOVE-CORRESPONDING ls_bapiret TO ls_aimsg.
-    APPEND ls_aimsg TO et_messages.
+    APPEND ls_bapiret TO et_messages.
   ENDLOOP.
 
   "--- Determine overall status ---
@@ -705,7 +690,7 @@ FORM z_execute_tool
            iv_params_json TYPE string
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
    CASE iv_toolname.
 
@@ -772,7 +757,7 @@ FORM ztool_read_table
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   DATA: ls_params   TYPE ty_zai_check_params,
         lt_options  TYPE STANDARD TABLE OF rfc_db_opt,
@@ -975,7 +960,7 @@ FORM ztool_job_status
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   DATA: ls_job   TYPE ty_zai_job_params,
         lv_state TYPE string,
@@ -1018,7 +1003,7 @@ FORM ztool_read_job_spool
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
            ev_result_json TYPE string
-           et_messages    TYPE zfi_ai_msg_t.
+           et_messages    TYPE bapiret2_t.
 
   DATA: ls_job                TYPE ty_zai_job_params,
         lv_message            TYPE string,
@@ -1312,13 +1297,13 @@ ENDFORM.
 
 *&--------------------------------------------------------------------*
 *& FORM z_add_msg
-*&  Appends a simple message to ET_MESSAGES (lean ZFI_AI_MSG).
+*&  Appends a simple message to ET_MESSAGES (standard BAPIRET2).
 *&--------------------------------------------------------------------*
 FORM z_add_msg USING    iv_type     TYPE c
                         iv_text     TYPE string
-               CHANGING et_messages TYPE zfi_ai_msg_t.
+               CHANGING et_messages TYPE bapiret2_t.
 
-  DATA: ls_msg TYPE zfi_ai_msg.
+  DATA: ls_msg TYPE bapiret2.
   ls_msg-type    = iv_type.
   ls_msg-id      = 'ZAI_PERIOD'.
   ls_msg-number  = '001'.
