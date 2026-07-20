@@ -11,11 +11,12 @@ Three tiers, all versioned with optimistic locking so two admins can't silently 
                     renamed and deleted in the admin UI ("Manage companies"), never in a
                     file. A fresh DB simply starts with no companies.
 
-The base tier was one-time seeded from configs/base.yaml (now deleted — the DB is the
-sole source of truth post-seeding). If base_config is ever unseeded (version 0, e.g. a
-fresh DB with no seed file present), get_base_config's file fallback raises
-FileNotFoundError rather than silently producing an empty config — seed it explicitly
-(config.load_base_config(path) + ConfigStore.save_base(...)) or via the admin UI.
+The base tier has no bundled seed file — a fresh deployment seeds it via the admin UI
+(Settings → Company Base → Manage companies → upload a base.yaml exported from another
+deployment), which round-trips through ConfigStore.save_base(...). If base_config is
+unseeded (version 0) and nothing has been uploaded yet, get_base_config/build_base_settings
+return an empty scaffold ({defaults:{}, llm_profiles:{}, analysis_defaults:{}, steps:[]})
+so the Settings panel loads (empty) instead of erroring.
 
 Company delta shape mirrors a step so it feeds the existing merge engine directly:
     {"KO8G": {"params": [{"selname": "VAART", "low": "2"}],
@@ -406,17 +407,24 @@ def _apply_company_delta(base_steps: list[dict], override: dict) -> list[dict]:
     return out
 
 
+_EMPTY_BASE = {"defaults": {}, "llm_profiles": {}, "analysis_defaults": {}, "steps": []}
+
+
 def get_base_config(store: "ConfigStore | None" = None, base_path=None) -> dict:
     """Return the effective base (product) config dict — the same shape
     config.load_base_config produces ({defaults, llm_profiles, analysis_defaults, steps}).
     Sourced from the DB base tier; falls back to a file when the store is unseeded
-    (version 0) — the repo's own configs/base.yaml seed file was deleted after this
-    project's DB was seeded, so callers relying on the fallback for a genuinely fresh
-    DB must pass an explicit base_path."""
+    (version 0) and base_path is given (tests / one-off standalone runs). A genuinely
+    fresh deployment has no seed file and no base_path — that's not an error, it's the
+    normal state before an admin seeds the base via Settings → Company Base → upload, so
+    this returns an empty scaffold rather than raising."""
     import config
     base_state = (store or get_config_store()).get_base()
     if base_state["version"] == 0:
-        return config.load_base_config(base_path)          # file fallback / seed source
+        try:
+            return config.load_base_config(base_path)
+        except FileNotFoundError:
+            return dict(_EMPTY_BASE)
     return {**(base_state["globals"] or {}), "steps": base_state["steps"] or []}
 
 

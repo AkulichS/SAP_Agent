@@ -1046,8 +1046,10 @@
   .reg-row { display:flex; align-items:center; gap:8px; padding:7px 0; border-bottom:1px solid rgba(44,49,60,.5); font-size:13px; color:#c3cad6; }
   .reg-row .code { font-family:monospace; color:#9dc0ef; width:80px; }
   .reg-row .name { flex:1; }
-  .reg-row button { background:none;border:none;color:#7b8494;cursor:pointer;font-size:12px; }
+  .reg-row button { background:none;border:none;color:#7b8494;cursor:pointer;font-size:12px;display:inline-flex;align-items:center; }
   .reg-row button:hover { color:#e06c75; }
+  .reg-row button svg { display:block; }
+  .reg-row-base { border-bottom:1px solid #3c4252; margin-bottom:6px; padding-bottom:11px; }
   .reg-new { display:grid; grid-template-columns:90px 1fr auto; gap:8px; padding:12px 0 4px; }
   .reg-new input { background:#11141a;color:#e8edf5;border:1px solid #2c313c;border-radius:5px;padding:6px 8px;font-size:12.5px; }
   .reg-new button { background:#22314a;border:1px solid #34507a;color:#9dc0ef;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12.5px; }
@@ -3863,6 +3865,9 @@ function renderMarkdown(src) {
 //  Company registry manager
 // ═══════════════════════════════════════════════════════════
 
+const ICON_UPLOAD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 L20 12 H14 V22 H10 V12 H4 Z"/></svg>';
+const ICON_DOWNLOAD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22 L4 12 H10 V2 H14 V12 H20 Z"/></svg>';
+
 async function openRegistry() {
   document.getElementById('registry-overlay').classList.add('visible');
   await renderRegistry();
@@ -3875,9 +3880,17 @@ async function renderRegistry() {
   const r = await fetch('/api/registry/companies', {credentials:'same-origin'});
   if (!r.ok) { body.innerHTML = '<div class="diff-empty">Error ' + r.status + '</div>'; return; }
   const rows = await r.json();
-  body.innerHTML = rows.map(c => `<div class="reg-row">
+  const baseRow = `<div class="reg-row reg-row-base">
+      <span class="code"></span>
+      <span class="name">⚙ Base</span>
+      <button title="Upload Base from a YAML file" onclick="triggerUploadYaml('__base__')">${ICON_UPLOAD}</button>
+      <button title="Download Base as a YAML file" onclick="downloadConfigYaml('__base__')">${ICON_DOWNLOAD}</button>
+    </div>`;
+  body.innerHTML = baseRow + rows.map(c => `<div class="reg-row">
       <span class="code">${esc(c.code)}</span>
       <span class="name">${esc(c.display_name || c.code)}</span>
+      <button title="Upload from a YAML file" onclick="triggerUploadYaml('${esc(c.code)}')">${ICON_UPLOAD}</button>
+      <button title="Download as a YAML file" onclick="downloadConfigYaml('${esc(c.code)}')">${ICON_DOWNLOAD}</button>
       <button title="Rename" onclick="renameCompany('${esc(c.code)}','${esc(c.display_name||'')}')">✎</button>
       <button title="Delete" onclick="deleteCompanyReg('${esc(c.code)}')">✕</button>
     </div>`).join('') +
@@ -3886,6 +3899,79 @@ async function renderRegistry() {
        <input id="reg-new-name" placeholder="Display name">
        <button onclick="createCompany()">＋ Add</button>
      </div>`;
+}
+
+/** Download a company's (or Base's) YAML config to disk, via the native Save dialog
+ * when the browser supports it (File System Access API), else a plain download. */
+async function downloadConfigYaml(code) {
+  const url = code === '__base__' ? '/api/settings/base/export'
+                                   : `/api/settings/${encodeURIComponent(code)}/export`;
+  const r = await fetch(url, {credentials:'same-origin'});
+  if (!r.ok) { alert('Download failed: ' + r.status); return; }
+  const text = await r.text();
+  const filename = (code === '__base__' ? 'base' : code) + '.yaml';
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{description: 'YAML', accept: {'application/x-yaml': ['.yaml', '.yml']}}],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      return;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;   // user cancelled the picker
+      // fall through to the plain-download fallback below
+    }
+  }
+  const blob = new Blob([text], {type: 'application/x-yaml'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
+/** Pick a local YAML file and upload it to overwrite a company's (or Base's) config.
+ * Confirms first, except for the very first Base upload into an unseeded store. */
+function triggerUploadYaml(code) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.yaml,.yml';
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const doUpload = async () => {
+      const url = code === '__base__' ? '/api/settings/base/import'
+                                       : `/api/settings/${encodeURIComponent(code)}/import`;
+      const r = await fetch(url, {method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/x-yaml'}, body: text});
+      if (!r.ok) {
+        const e = await r.json().catch(() => ({}));
+        alert('Import failed: ' + (e.error || r.status));
+        return;
+      }
+      await renderRegistry();
+      await afterRegistryChange(code === '__base__' ? '__base__' : code);
+      if (settingsState.code === code) loadSettings(code);
+    };
+    if (code === '__base__') {
+      const r = await fetch('/api/settings/base', {credentials: 'same-origin'});
+      if (r.ok && (await r.json()).version === 0) { await doUpload(); return; }
+    }
+    showConfirm(
+      'Overwrite ' + (code === '__base__' ? 'Base' : code) + '?',
+      'This will overwrite the current ' +
+        (code === '__base__' ? 'Base configuration' : 'company "' + code + '" configuration') +
+        ' with the uploaded file. This cannot be undone.',
+      'Overwrite', doUpload,
+    );
+  };
+  input.click();
 }
 async function registryPost(url, method, body) {
   const r = await fetch(url, {method, credentials:'same-origin',

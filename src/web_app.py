@@ -25,9 +25,10 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query, Request, Response, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -282,6 +283,47 @@ async def delete_base_history_oldest(request: Request):
     return JSONResponse(result)
 
 
+@app.get("/api/settings/base/export")
+async def export_base_settings(request: Request):
+    """Download the base (globals + steps) as a YAML file — the seed an admin hands to
+    another deployment (Manage companies → Base → download/upload)."""
+    _, err = _require_admin(request)
+    if err:
+        return err
+    data = await run_in_threadpool(config_settings.build_base_settings)
+    text = yaml.safe_dump({"globals": data["globals"], "steps": data["steps"]},
+                          allow_unicode=True, sort_keys=False)
+    return PlainTextResponse(text, media_type="application/x-yaml",
+                             headers={"Content-Disposition": 'attachment; filename="base.yaml"'})
+
+
+@app.post("/api/settings/base/import")
+async def import_base_settings(request: Request):
+    """Replace the base with an uploaded YAML file (same shape as the export). The
+    overwrite itself is confirmed client-side; this always writes against the current
+    version (a deliberate full replace, not an optimistic-locked edit)."""
+    session, err = _require_admin(request)
+    if err:
+        return err
+    raw = (await request.body()).decode("utf-8")
+    try:
+        doc = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        return JSONResponse({"error": f"Invalid YAML: {exc}"}, status_code=400)
+    globals_ = doc.get("globals", {}) or {}
+    steps = doc.get("steps", []) or []
+    try:
+        config_settings.validate_base_steps(steps)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    store = get_config_store()
+    current_version = await run_in_threadpool(lambda: store.get_base()["version"])
+    await run_in_threadpool(store.save_base, globals_, steps, current_version, session["username"])
+    data = await run_in_threadpool(config_settings.build_base_settings)
+    logger.info("Base config imported by %s", session["username"])
+    return JSONResponse(data)
+
+
 @app.get("/api/settings/{code}")
 async def get_settings(code: str, request: Request):
     _, err = _require_admin(request, code)
@@ -344,6 +386,46 @@ async def delete_settings_history_oldest(code: str, request: Request):
     logger.info("History v%s for %s pruned by %s",
                 result["deleted_version"], code, session["username"])
     return JSONResponse(result)
+
+
+@app.get("/api/settings/{code}/export")
+async def export_settings(code: str, request: Request):
+    """Download a company's override + run_context as a YAML file."""
+    _, err = _require_admin(request, code)
+    if err:
+        return err
+    state = await run_in_threadpool(get_config_store().get_override, code)
+    text = yaml.safe_dump({"override": state["override"], "run_context": state["run_context"]},
+                          allow_unicode=True, sort_keys=False)
+    return PlainTextResponse(text, media_type="application/x-yaml",
+        headers={"Content-Disposition": f'attachment; filename="{code}.yaml"'})
+
+
+@app.post("/api/settings/{code}/import")
+async def import_settings(code: str, request: Request):
+    """Replace a company's override + run_context with an uploaded YAML file (same shape
+    as the export). Always writes against the current version — the overwrite is
+    confirmed client-side, not optimistic-locked."""
+    session, err = _require_admin(request, code)
+    if err:
+        return err
+    raw = (await request.body()).decode("utf-8")
+    try:
+        doc = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        return JSONResponse({"error": f"Invalid YAML: {exc}"}, status_code=400)
+    override = doc.get("override", {}) or {}
+    run_context = doc.get("run_context", {}) or {}
+    try:
+        config_settings.validate_override(override)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    store = get_config_store()
+    current_version = await run_in_threadpool(lambda: store.get_override(code)["version"])
+    await run_in_threadpool(store.save_override, code, override, run_context, current_version, session["username"])
+    data = await run_in_threadpool(config_settings.build_settings, code)
+    logger.info("Settings for %s imported by %s", code, session["username"])
+    return JSONResponse(data)
 
 
 @app.post("/api/settings/{code}/reset")

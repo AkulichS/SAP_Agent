@@ -1,0 +1,1036 @@
+globals:
+  defaults:
+    max_retries: 3
+    poll_interval_sec: 30
+    poll_timeout_sec: 14400
+    test_run: true
+    reset_each_run: true
+  llm_profiles:
+    analysis:
+      provider: openrouter
+      model: meta-llama/llama-3.3-70b-instruct
+      temperature: 0
+    validation:
+      provider: groq
+      model: openai/gpt-oss-120b
+      temperature: 0
+  analysis_defaults:
+    max_tool_calls: 8
+    role: 'You are an SAP period-close error analyst. You diagnose why a closing step
+      failed,
+
+      using read-only SAP tools, then report the root cause and how the operator can
+      fix it.
+
+      '
+    tools: 'You have read-only diagnostic tools (exact names and arguments are listed
+      under
+
+      AVAILABLE TOOLS in the response-format section):
+
+      - sap_read_table   — read any SAP table by fields / WHERE clause.
+
+      - sap_read_spool   — read the spool (job log) of a completed background job.
+
+      - sap_job_status   — check the status of a background job.
+
+      - sap_check_period — check whether a posting period is open.
+
+      '
+    output_format: 'When every reported object is diagnosed, return ONE final_answer
+      JSON object whose
+
+      `result` contains:
+
+      - status: completed | partial | undetermined
+
+      - errors[]:      {object_id, error, cause, resolution_id}
+
+      - resolutions[]: {id, recommendation, affected_objects[]}
+
+      Group objects that share the same fix under a single resolution and point each
+      error
+
+      at it via resolution_id — never repeat the same recommendation per object.
+
+      '
+    rules: "- Never fabricate data. Report only what the tools actually return.\n\
+      - Make ONE tool call at a time and wait for its result before the next.\n- Do\
+      \ not repeat an identical tool call with the same arguments.\n- If a tool returns\
+      \ no data for an object, flag it (it may not exist or the key may\n  be formatted\
+      \ wrong) rather than guessing.\n- If you cannot determine a root cause from\
+      \ the available data, say so and set\n  status to \"undetermined\" (or \"partial\"\
+      \ when only some objects are unresolved);\n  suggest a manual check.\n- Respond\
+      \ in the same language as the Context section.\n"
+steps:
+- step_id: ZFK_COMPARISON
+  description: FI Data Comparison & Reconciliation
+  group: null
+  action_type: SUBMIT
+  object_name: ZFK_COMPARISON
+  async: true
+  test_run: true
+  params:
+  - selname: S_BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: P_GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: P_MONAT
+    kind: P
+    low: '{{period}}'
+  - selname: P_REP
+    kind: P
+    low: X
+  - selname: P_REQ
+    kind: P
+    low: ''
+  - selname: P_LOG
+    kind: P
+    low: ''
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    keyword:
+      ok_patterns:
+      - completed
+      - finished
+      - successful
+      error_patterns:
+      - error
+      - Error
+      - abort
+      - difference
+      source: spool
+    run:
+      action_type: SUBMIT
+      object_name: ''
+    llm:
+      prompt: '# header 1
+
+        ## header 2
+
+
+        text row 1
+
+        text row 2'
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'Z_FI_COMPARISON reconciles FI data before period close.
+
+      Common issues:
+
+      - Company code {{company_code}} missing customizing.
+
+      - Unposted documents still open in period {{period}}/{{fiscal_year}}.
+
+      Check BKPF: WHERE BUKRS = ''{{company_code}}'' AND GJAHR = ''{{fiscal_year}}''
+
+      AND MONAT = ''{{period}}'' AND BSTAT = ''''.
+
+      '
+    mode: {}
+- step_id: KO8G
+  description: 'CO Actual Settlement: Internal Orders'
+  action_type: SUBMIT
+  object_name: RKO7KO8G
+  async: true
+  test_run: false
+  poll_timeout_sec: 7200
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: PERIO
+    kind: P
+    low: '{{period}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: VAART
+    kind: P
+    low: '1'
+  - selname: AUSF
+    kind: P
+    low: X
+  - selname: VARIANT
+    kind: P
+    low: TEST
+  pre_check:
+    enabled: true
+    mode: llm
+    action_type: SUBMIT
+    object_name: RKASELRULES_OR
+    async: false
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: S_KOSTL
+      kind: S
+      low: ''
+    - selname: VARIANT
+      kind: P
+      low: TEST
+    llm:
+      prompt: 'Check the spool below.
+
+
+        If the spool contains header lines, separator lines (----), and a message
+        such as
+
+        "List does not contain any data" — that means the check passed (no wrong orders).
+
+        If the spool contains any rows with order numbers, that means
+
+        there are wrong orders and the check failed.
+
+        Answer with a single word: YES if the check passed, NO if wrong orders were
+        found.
+
+
+        Spool:
+
+        {{spool_text}}
+
+        '
+      pass_values:
+      - 'yes'
+  validate:
+    mode: llm
+    llm:
+      max_spool_lines: 300
+      system_prompt: You are an SAP job-log analyser. Respond ONLY with the JSON object
+        requested. No prose.
+      prompt: "Respond strictly in the specified format:\n\n{\n  \"error_count\":\
+        \ integer,\n  \"errors\": [\n    {\n      \"sender\": string|null,\n     \
+        \ \"msg_type\": \"E\"|\"A\"|\"X\",\n      \"msg_num\": string|null,\n    \
+        \  \"message\": string\n    }\n  ]\n}\n\nRules:\n- Only messages of types\
+        \ E, A, X count as errors.\n- \"sender\" extracted from a row like \"Sender:\
+        \ ...\".\n- \"msg_num\" has the format 2 letters + 3 digits, e.g. KB101.\n\
+        - \"message\" is located in the \"Message text\" column.\n- If there are no\
+        \ errors, return {\"error_count\": 0, \"errors\": []}\n\nText:\n\n{{spool_text}}\n"
+    run:
+      action_type: TOOLS
+      object_name: TOOL_READ_JOB_SPOOL
+      params:
+        jobname: '{{job_name}}'
+        jobcount: '{{job_id}}'
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RKO7KO8G
+    async: true
+    test_run: false
+    poll_timeout_sec: 3600
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: PERIO
+      kind: P
+      low: '{{period}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: VAART
+      kind: P
+      low: '1'
+    - selname: STOR
+      kind: P
+      low: X
+    - selname: VARIANT
+      kind: P
+      low: TEST
+  on_error:
+    mode:
+      pre_check: explain
+      validate: diagnose
+    analysis:
+      goal: 'Diagnose the root cause for each failed order and provide a clear fix.
+        Every
+
+        failed order listed in the Context must be accounted for in the final result.
+
+        '
+      context_template: 'KO8G performs periodic settlement of CO orders for controlling
+        area
+
+        {{controlling_area}}, fiscal year {{fiscal_year}}, period {{period}}.
+
+        After the settlement run, validation detected internal orders that were NOT
+
+        settled due to errors:
+
+        {{errors}}
+
+        '
+      instructions: "## Diagnostic Procedure (follow steps in order; do NOT skip to\
+        \ assumptions)\n\n### Step 1: Retrieve order master data\nUse sap_read_table\
+        \ on table AUFK, fields:\n  AUFNR, AUART, AUTYP, BUKRS, KOKRS, WERKS, LOEKZ,\
+        \ PHAS0, PHAS1, PHAS2, PHAS3\nWHERE AUFNR IN (<failed order numbers from the\
+        \ Context>).\nOrder-number formatting:\n- Digits only → pad with leading zeros\
+        \ to 12 chars (\"20001\" → \"000000020001\").\n- Contains any letter → use\
+        \ exactly as provided (\"F0K01023\" → \"F0K01023\").\n\n### Step 2: Check\
+        \ order status (most common cause)\n| PHAS1 | PHAS2 | PHAS3 | LOEKZ | System\
+        \ Status | Settlement allowed? |\n|-------|-------|-------|-------|---------------|---------------------|\n\
+        | 1 | 0 | 0 | (empty) | REL (Released / ТЗКР)            | YES |\n| 0 | 0\
+        \ | 0 | (empty) | CRTD (Created / ТЗАК)            | NO — not yet released\
+        \ |\n| 1 | 1 | 0 | (empty) | TECO (Technically closed / ТКЗК) | NO — technically\
+        \ closed |\n| any | any | 1 | (empty) | CLSD (Closed / ЗАКР)          | NO\
+        \ — order is closed |\n| any | any | any | X   | DLFL (Deletion flag / УДАЛ)\
+        \      | NO — marked for deletion |\nAlso: LOEKZ = 'X' (deletion flag) → cannot\
+        \ be settled.\n\n### Step 3: Check controlling area assignment\nVerify KOKRS\
+        \ in AUFK matches the settlement run's controlling area\n{{controlling_area}}.\
+        \ A different KOKRS → the order belongs to another\ncontrolling area and is\
+        \ excluded from this run.\n\n### Step 4: Check settlement rule existence\n\
+        Use sap_read_table on table COBRB, fields OBJNR, BURESSION, KONTY, EMPGE,\
+        \ PROZS\nWHERE OBJNR IN (<\"OR\" + AUFNR as stored in AUFK>).\n- No records\
+        \ → settlement rule missing → fix in KO02 (Settlement Rule tab).\n- Records\
+        \ found but PROZS does not sum to 100 → settlement rule incomplete.\n\n###\
+        \ Step 5: Cross-reference with error messages\nMatch findings against the\
+        \ KO8G error messages in the Context to confirm the\nroot cause for each order,\
+        \ then group orders that share the same fix.\n"
+    explain_prompt: 'The settlement-rules report RKASELRULES_OR listed the internal
+      orders below,
+
+      which are missing settlement rules and would block KO8G settlement.
+
+      List the affected order numbers, explain the root cause, and tell the SAP
+
+      operator to maintain settlement rules (KO02) for these orders before KO8G —
+
+      then retry the pre-check, or skip the step if intentional.
+
+      '
+  enabled: true
+- step_id: S_ALR_87013127
+  description: 'Cost Centers: Actual/Plan/Variance'
+  group: co_period_reports
+  action_type: SUBMIT
+  object_name: RKSAB000
+  async: true
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: PERBL
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: keyword
+    keyword:
+      ok_patterns:
+      - completed
+      - report
+      - printed
+      error_patterns:
+      - error
+      - Error
+      - abort
+      source: spool
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'S_ALR_87013127 generates the CO cost center variance report.
+
+      Common issues: missing cost center data for period, authorization errors.
+
+      Check TKA01 for controlling area settings and COSP for cost totals.
+
+      '
+- step_id: S_ALR_87009712
+  description: CO-PA Actual Line Items Report
+  group: co_period_reports
+  action_type: SUBMIT
+  object_name: RKEB0601
+  async: true
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: PERBL
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: keyword
+    keyword:
+      ok_patterns:
+      - completed
+      - report
+      error_patterns:
+      - error
+      - Error
+      - abort
+      source: spool
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'S_ALR_87009712 reports CO-PA actual line items.
+
+      Common issues: CO-PA not active for operating concern, missing value fields.
+
+      Check TKE1 for operating concern settings.
+
+      '
+- step_id: KP46
+  description: CO Activity Price Planning
+  group: null
+  action_type: SUBMIT
+  object_name: RKACRPLN
+  async: false
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: PERAB
+    kind: P
+    low: '{{period}}'
+  - selname: PERAE
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: keyword
+    keyword:
+      ok_patterns:
+      - saved
+      - planned
+      - completed
+      error_patterns:
+      - error
+      - Error
+      - authorization
+      source: messages
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RKACRPLN
+    async: false
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: PERAB
+      kind: P
+      low: '{{period}}'
+    - selname: PERAE
+      kind: P
+      low: '{{period}}'
+    - selname: DELETE
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'KP46 plans activity prices for cost centers.
+
+      Common issues: activity type not defined in cost center, version mismatch.
+
+      Check CSLA (activity type) and TKA09 (controlling area version).
+
+      '
+- step_id: KSW5
+  description: CO Assessment Cycles
+  group: null
+  action_type: SUBMIT
+  object_name: RKABL000
+  async: true
+  test_run: true
+  poll_timeout_sec: 7200
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: ABPER
+    kind: P
+    low: '{{period}}'
+  - selname: ABGJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse KSW5 CO assessment spool. Were all cycles processed without
+        errors? Note any cycles that failed.
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RKABL000
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: ABPER
+      kind: P
+      low: '{{period}}'
+    - selname: ABGJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'KSW5 executes CO assessment cycles for controlling area {{controlling_area}}.
+
+      Common issues:
+
+      - Cycle not defined: verify in KSW3 that cycles exist for this period.
+
+      - Sender cost centre has zero costs: check COSP/COSS tables.
+
+      - Receiver tracing factor = 0: check SKF statistical key figures.
+
+      Use TOOL_READ_TABLE: TKA3I WHERE KOKRS = ''{{controlling_area}}''.
+
+      '
+- step_id: KSC5
+  description: CO Distribution Cycles
+  group: null
+  action_type: SUBMIT
+  object_name: RKAV0000
+  async: true
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: ABPER
+    kind: P
+    low: '{{period}}'
+  - selname: ABGJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse KSC5 CO distribution spool. Were all distribution cycles executed
+        successfully?
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RKAV0000
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: ABPER
+      kind: P
+      low: '{{period}}'
+    - selname: ABGJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'KSC5 distributes CO costs between cost centres.
+
+      Common issues:
+
+      - Distribution cycle not configured: check in KSC3.
+
+      - Sender cost centre locked or has no costs.
+
+      Use TOOL_READ_TABLE: TKA3D WHERE KOKRS = ''{{controlling_area}}''.
+
+      '
+- step_id: S_ALR_87013611
+  description: 'Cost Centers: Actual Costs Report'
+  group: null
+  action_type: SUBMIT
+  object_name: REKSB000
+  async: true
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: PERBL
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: keyword
+    keyword:
+      ok_patterns:
+      - completed
+      - report
+      error_patterns:
+      - error
+      - Error
+      - abort
+      source: spool
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'S_ALR_87013611 reports actual costs by cost centre.
+
+      Check that COSP/COSS tables have data for period {{period}}/{{fiscal_year}}.
+
+      '
+- step_id: KSII
+  description: Actual Activity Price Calculation
+  group: null
+  action_type: SUBMIT
+  object_name: RKSSVFAK
+  async: true
+  test_run: true
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: PERBIS
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse KSII actual price calculation spool. Were prices calculated
+        for all activity types?
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RKSSVFAK
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: PERBIS
+      kind: P
+      low: '{{period}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'KSII calculates actual activity prices for controlling area
+      {{controlling_area}}.
+
+      Common issues:
+
+      - Activity type not confirmed: check CSLA, verify activity quantity posted.
+
+      - Version mismatch: check TKA09 (controlling version settings).
+
+      Use TOOL_READ_TABLE: CSSL WHERE KOKRS = ''{{controlling_area}}'' AND GJAHR =
+      ''{{fiscal_year}}''.
+
+      '
+- step_id: CO88
+  description: 'Actual Settlement: Production/Process Orders'
+  group: null
+  action_type: SUBMIT
+  object_name: RCOARSR0
+  async: true
+  test_run: true
+  poll_timeout_sec: 14400
+  params:
+  - selname: KOKRS
+    kind: P
+    low: '{{controlling_area}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: ABPER
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse CO88 production order settlement spool. Were all orders settled?
+        Note any errors or unsettled orders.
+      max_spool_lines: 500
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: RCOARSR0
+    async: true
+    poll_timeout_sec: 7200
+    params:
+    - selname: KOKRS
+      kind: P
+      low: '{{controlling_area}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: ABPER
+      kind: P
+      low: '{{period}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'CO88 settles production/process orders for controlling area
+      {{controlling_area}}.
+
+      Common issues:
+
+      - Settlement rule missing: check AUFK (order master) and CO02/COR2.
+
+      - Material ledger active: settlement may depend on CKMLCP completion.
+
+      - Order status TECO required before settlement.
+
+      Use TOOL_READ_TABLE: AUFK WHERE KOKRS=''{{controlling_area}}'' AND AUTYP IN
+      (''10'',''20'').
+
+      '
+- step_id: CKMLCP
+  description: 'Material Ledger Closing: Actual Costing'
+  group: null
+  action_type: SUBMIT
+  object_name: CKMLCP
+  async: true
+  test_run: true
+  poll_timeout_sec: 14400
+  params:
+  - selname: BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: POPER
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: true
+    mode: comparison
+    action_type: TOOLS
+    object_name: TOOL_READ_TABLE
+    params:
+      table: CKMLHD
+      where: BUKRS EQ '{{company_code}}' AND POPER EQ '{{period}}' AND BDATJ EQ '{{fiscal_year}}'
+      fields: BUKRS,POPER,BDATJ,MLJAHR,STATUS
+      max_rows: 1
+    comparison:
+      field: STATUS
+      operator: ne
+      value: '50'
+      on_pass: execute
+      on_fail: skip
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse CKMLCP material ledger closing spool. Was actual costing completed
+        for all materials?
+      max_spool_lines: 500
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: CKMLCP
+    async: true
+    poll_timeout_sec: 7200
+    params:
+    - selname: BUKRS
+      kind: P
+      low: '{{company_code}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: POPER
+      kind: P
+      low: '{{period}}'
+    - selname: REOPEN
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'CKMLCP closes the Material Ledger for company code {{company_code}}.
+
+      Common issues:
+
+      - CO88 must complete before CKMLCP (production order settlement feeds ML).
+
+      - Unconfirmed quantities on production orders.
+
+      - Check CKMLHD for current ML period status.
+
+      Use TOOL_READ_TABLE: CKMLHD WHERE BUKRS = ''{{company_code}}'' AND POPER = ''{{period}}''.
+
+      '
+- step_id: CKMLCPAVR
+  description: 'Material Ledger: Revaluation at Actual Prices'
+  group: null
+  action_type: SUBMIT
+  object_name: CKMLCPAVR
+  async: true
+  test_run: true
+  poll_timeout_sec: 7200
+  params:
+  - selname: BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: POPER
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse CKMLCPAVR revaluation spool. Were all materials revalued at
+        actual prices successfully?
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: CKMLCPAVR
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: BUKRS
+      kind: P
+      low: '{{company_code}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: POPER
+      kind: P
+      low: '{{period}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'CKMLCPAVR revalues inventory at actual costing prices.
+
+      Must run AFTER CKMLCP (actual costing closing).
+
+      Common issues: materials without actual prices, price determination errors.
+
+      Check CKMLHD status first (must be status 40+ for revaluation to proceed).
+
+      '
+- step_id: FB03
+  description: FI Closing Documents Verification
+  group: null
+  action_type: TOOLS
+  object_name: TOOL_READ_TABLE
+  async: false
+  params:
+    table: BKPF
+    where: BUKRS EQ '{{company_code}}' AND GJAHR EQ '{{fiscal_year}}' AND MONAT EQ
+      '{{period}}' AND BLART EQ 'SA'
+    fields: BUKRS,BELNR,GJAHR,MONAT,BLART,BSTAT
+    max_rows: 20
+  pre_check:
+    enabled: false
+  validate:
+    mode: keyword
+    keyword:
+      ok_patterns: []
+      error_patterns:
+      - error
+      - Error
+      - not authorized
+      source: messages
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'FB03 verifies that FI closing documents (type SA) were posted
+      for
+
+      company code {{company_code}}, period {{period}}/{{fiscal_year}}.
+
+      If no documents found, check whether CKMLCPAVR posted the revaluation entries.
+
+      Use TOOL_READ_TABLE: BKPF WHERE BUKRS=''{{company_code}}'' AND MONAT=''{{period}}''.
+
+      '
+- step_id: ZFKTAXREP
+  description: Custom FI Tax Report
+  group: null
+  action_type: SUBMIT
+  object_name: ZFKTAXREP
+  async: true
+  test_run: true
+  params:
+  - selname: BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: MONAT
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse ZFKTAXREP tax report spool. Was the tax report generated without
+        errors?
+      max_spool_lines: 300
+  rollback:
+    enabled: false
+  on_error:
+    analysis_guidance: 'ZFKTAXREP is a custom FI tax reporting program.
+
+      Common issues: tax codes not configured, missing FI documents for period.
+
+      Check BSET (tax data) WHERE BUKRS = ''{{company_code}}'' AND GJAHR = ''{{fiscal_year}}''.
+
+      '
+- step_id: Z_FI_TRNSFR
+  description: Custom FI Data Transfer
+  group: null
+  action_type: SUBMIT
+  object_name: Z_FI_TRNSFR
+  async: true
+  test_run: true
+  params:
+  - selname: BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: MONAT
+    kind: P
+    low: '{{period}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse Z_FI_TRNSFR transfer spool. Was all FI data transferred successfully?
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: Z_FI_TRNSFR
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: BUKRS
+      kind: P
+      low: '{{company_code}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: MONAT
+      kind: P
+      low: '{{period}}'
+    - selname: STORNO
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'Z_FI_TRNSFR is a custom FI data transfer program.
+
+      Verify that source FI data is complete for period {{period}}/{{fiscal_year}}.
+
+      Check BKPF and BSEG for company code {{company_code}}.
+
+      '
+- step_id: ZFI_SLD_CLOSING
+  description: FI SLD Final Period Closing
+  group: null
+  action_type: SUBMIT
+  object_name: ZFI_SLD_CLOSING
+  async: true
+  test_run: true
+  params:
+  - selname: BUKRS
+    kind: P
+    low: '{{company_code}}'
+  - selname: GJAHR
+    kind: P
+    low: '{{fiscal_year}}'
+  - selname: MONAT
+    kind: P
+    low: '{{period}}'
+  - selname: WAERS
+    kind: P
+    low: '{{currency}}'
+  pre_check:
+    enabled: false
+  validate:
+    mode: llm
+    llm:
+      prompt: Analyse ZFI_SLD_CLOSING spool. Was the final FI SLD period closing completed
+        successfully?
+      max_spool_lines: 300
+  rollback:
+    enabled: true
+    action_type: SUBMIT
+    object_name: ZFI_SLD_CLOSING
+    async: true
+    poll_timeout_sec: 3600
+    params:
+    - selname: BUKRS
+      kind: P
+      low: '{{company_code}}'
+    - selname: GJAHR
+      kind: P
+      low: '{{fiscal_year}}'
+    - selname: MONAT
+      kind: P
+      low: '{{period}}'
+    - selname: WAERS
+      kind: P
+      low: '{{currency}}'
+    - selname: REOPEN
+      kind: P
+      low: X
+  on_error:
+    analysis_guidance: 'ZFI_SLD_CLOSING is the final SLD closing step for company
+      code {{company_code}}.
+
+      This must run LAST — all prior steps must be completed.
+
+      Common issues: prior steps incomplete, document balance issues.
+
+      Verify all previous steps completed via step_records before retrying.
+
+      '

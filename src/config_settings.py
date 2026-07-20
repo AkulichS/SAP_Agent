@@ -181,11 +181,14 @@ def validate_override(override: dict, base_path=None) -> None:
 def build_base_settings(store: ConfigStore | None = None, base_path=None) -> dict:
     """Payload for the 'Company Base' editor: the versioned globals + full ordered steps.
     Unlike build_settings (company delta), steps are returned verbatim for full editing.
-    When the store is unseeded (version 0) it falls back to the file base so the editor is
-    populated; the first save then writes that content into the DB (version 1)."""
+    When the store is unseeded (version 0) and base_path names a real file, that file
+    populates the editor (tests / one-off runs). Otherwise — the normal state for a fresh
+    deployment before an admin uploads a base.yaml — this returns an empty scaffold so the
+    panel loads (empty) instead of erroring; the first save/import then writes into the DB
+    (version 1)."""
     base = (store or get_config_store()).get_base()
     if base["version"] == 0:
-        b = config.load_base_config(base_path)
+        b = config_store.get_base_config(store=store, base_path=base_path)
         globals_ = {k: b[k] for k in ("defaults", "llm_profiles", "analysis_defaults") if k in b}
         return {"version": 0, "globals": globals_, "steps": b.get("steps") or []}
     return {
