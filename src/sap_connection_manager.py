@@ -199,8 +199,30 @@ class _StubConnection:
         "COKP":   [{"KOKRS": "X500", "GJAHR": "2025", "PERAB": "11", "SPERRE": ""}],
         "BKPF":   [{"BUKRS": "RU06", "GJAHR": "2025", "MONAT": "11",
                     "BELNR": "1000000001", "BSTAT": "", "WAERS": "RUB"}],
-        "AUFK":   [{"AUFNR": "000100000001", "KOKRS": "X500",
-                    "KOSTL": "", "OBJNR": "OR000100000001"}],
+        # Master data for the three KO8G orders that fail settlement (see the
+        # RKO7KO8G spool below). All three are released (PHAS1=1 → REL) so the
+        # KD205 error is genuinely about the settlement rule, and each carries
+        # DIFFERENT evidence so the analysis table is informative per order.
+        "AUFK":   [
+            {"AUFNR": "000005000000", "AUART": "0400", "AUTYP": "01",
+             "BUKRS": "RU06", "KOKRS": "X500", "WERKS": "RU01", "LOEKZ": "",
+             "PHAS0": "0", "PHAS1": "1", "PHAS2": "0", "PHAS3": "0",
+             "KTEXT": "Технический заказ для RU06", "OBJNR": "OR000005000000"},
+            {"AUFNR": "FK01", "AUART": "0400", "AUTYP": "01",
+             "BUKRS": "RU06", "KOKRS": "X500", "WERKS": "RU01", "LOEKZ": "",
+             "PHAS0": "0", "PHAS1": "1", "PHAS2": "0", "PHAS3": "0",
+             "KTEXT": "Заказ производства FK01", "OBJNR": "ORFK01"},
+            {"AUFNR": "FK02", "AUART": "0400", "AUTYP": "01",
+             "BUKRS": "RU06", "KOKRS": "X500", "WERKS": "RU01", "LOEKZ": "",
+             "PHAS0": "0", "PHAS1": "1", "PHAS2": "0", "PHAS3": "0",
+             "KTEXT": "Заказ производства FK01", "OBJNR": "ORFK02"},
+        ],
+        # Settlement rules. Orders 5000000 and FK01 have NO rows (rule missing);
+        # FK02 has a single rule that distributes only 50% (rule incomplete).
+        "COBRB":  [
+            {"OBJNR": "ORFK02", "KONTY": "KS", "EMPGE": "0000101000",
+             "PROZS": "50.00", "PERBZ": "PER"},
+        ],
         "COSS":   [{"LEDNR": "00", "OBJNR": "OR000100000001",
                     "GJAHR": "2025", "PERAB": "11", "WKGBTR": "1000.00"}],
         "CKMLHD": [{"MATNR": "000000000000100001", "BWKEY": "RU06",

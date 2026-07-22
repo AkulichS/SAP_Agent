@@ -26,6 +26,30 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+def _bake_action_update(action_log: list, event: dict) -> None:
+    """Fold a transient ``action_update`` into the stored ``action_start`` so a
+    late-joining browser sees the final state without needing the (unstored)
+    update stream. Poll updates keep the latest message; analysis updates
+    accumulate their per-tool/LLM ``substep`` list."""
+    sub = event.get("substep")
+    if event.get("action") == "analysis" and sub:
+        for e in reversed(action_log):
+            if e.get("type") == "action_start" and e.get("action") == "analysis":
+                subs = e.setdefault("substeps", [])
+                for idx, existing in enumerate(subs):
+                    if existing.get("id") == sub.get("id"):
+                        subs[idx] = dict(sub)
+                        break
+                else:
+                    subs.append(dict(sub))
+                break
+        return
+    for e in reversed(action_log):
+        if e.get("type") == "action_start" and e.get("action") == "poll":
+            e["message"] = event.get("message", e.get("message"))
+            break
+
+
 # ---------------------------------------------------------------------------
 # CompanyRun
 # ---------------------------------------------------------------------------
@@ -131,13 +155,10 @@ class RunManager:
                 if sid:
                     run.step_action_log.setdefault(sid, []).append(dict(event))
             elif t == "action_update":
-                # Bake the latest poll message into the stored action_start so
-                # replay shows the final message without needing action_update events.
+                # Bake transient updates into the stored action_start so replay
+                # reflects the final state without needing update events.
                 if sid and sid in run.step_action_log:
-                    for e in reversed(run.step_action_log[sid]):
-                        if e.get("type") == "action_start" and e.get("action") == "poll":
-                            e["message"] = event.get("message", e.get("message"))
-                            break
+                    _bake_action_update(run.step_action_log[sid], event)
             elif t == "action_end":
                 if sid:
                     run.step_action_log.setdefault(sid, []).append(dict(event))
@@ -296,10 +317,7 @@ class RunManager:
                     run.step_action_log.setdefault(sid, []).append(dict(event))
             elif t == "action_update":
                 if sid and sid in run.step_action_log:
-                    for e in reversed(run.step_action_log[sid]):
-                        if e.get("type") == "action_start" and e.get("action") == "poll":
-                            e["message"] = event.get("message", e.get("message"))
-                            break
+                    _bake_action_update(run.step_action_log[sid], event)
             elif t == "action_end":
                 if sid:
                     run.step_action_log.setdefault(sid, []).append(dict(event))

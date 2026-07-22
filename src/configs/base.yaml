@@ -44,14 +44,14 @@ globals:
 
       - status: completed | partial | undetermined
 
-      - errors[]:      {object_id, error, cause, resolution_id}
+      - errors[]:      {object_id, error, cause, analysis}
 
-      - resolutions[]: {id, recommendation, affected_objects[]}
+      - resolutions[]: {recommendation, affected_objects[]}
 
-      Group objects that share the same fix under a single resolution and point each
-      error
+      Group objects that share the same fix under a single resolution and list every
 
-      at it via resolution_id — never repeat the same recommendation per object.
+      object it covers in affected_objects — never repeat the same recommendation per
+      object.
 
       '
     rules: "- Never fabricate data. Report only what the tools actually return.\n\

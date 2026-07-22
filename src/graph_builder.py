@@ -147,11 +147,43 @@ def _synthesize_result(diagnosis: str, status: str = "completed",
     always render the two-table view, even for legacy / fallback answers."""
     return {
         "status": status,
-        "errors": [{"object_id": "", "error": diagnosis, "cause": "",
-                    "resolution_id": "R1"}],
-        "resolutions": [{"id": "R1", "recommendation": recommendation or diagnosis,
+        "errors": [{"object_id": "", "error": diagnosis, "cause": ""}],
+        "analysis": [],
+        "resolutions": [{"recommendation": recommendation or diagnosis,
                          "affected_objects": []}],
     }
+
+
+def _normalize_analysis(result: dict) -> None:
+    """Populate ``result['analysis']`` (the per-object evidence the UI's Analysis
+    table renders) from each error's model-supplied ``analysis`` field. Prefers a
+    standalone ``analysis`` array if the model already gave one. Never fabricates
+    from ``cause`` — if the model provided no evidence, the table stays empty."""
+    existing = result.get("analysis")
+    if isinstance(existing, list) and existing:
+        return
+    rows: list[dict] = []
+    for e in result.get("errors") or []:
+        finding = str(e.get("analysis") or "").strip()
+        if finding:
+            rows.append({"object_id": e.get("object_id") or "", "finding": finding})
+    result["analysis"] = rows
+
+
+def _summarize_tool_args(args: dict | None) -> str:
+    """Pick a short, human-readable label for a diagnostic tool call so the UI
+    can show e.g. "sap_read_table · AUFK" rather than an opaque arg blob."""
+    if not isinstance(args, dict) or not args:
+        return ""
+    for key in ("table", "job_name", "spool_id", "spool_no", "object_name", "name"):
+        val = args.get(key)
+        if val:
+            return str(val)
+    # Fall back to the first scalar value present.
+    for val in args.values():
+        if isinstance(val, (str, int)) and str(val).strip():
+            return str(val)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1051,14 +1083,16 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             "To give your final answer:\n"
             '  {"type":"final_answer","action":"retry|user_input|skip",'
             '"result":{"status":"completed|partial|undetermined",'
-            '"errors":[{"object_id":"...","error":"...","cause":"...",'
-            '"resolution_id":"R1"}],'
-            '"resolutions":[{"id":"R1","recommendation":"...",'
-            '"affected_objects":["..."]}]}}\n'
+            '"errors":[{"object_id":"...","error":"...","cause":"...","analysis":"..."}],'
+            '"resolutions":[{"recommendation":"...","affected_objects":["..."]}]}}\n'
             "- action: retry (re-run the step), skip (skip it), or user_input "
             "(operator must intervene).\n"
-            "- Every error must reference a resolution via resolution_id; group "
-            "identical fixes under one resolution to avoid duplicates.\n"
+            "- Group identical fixes under one resolution to avoid duplicates; "
+            "list every object a resolution covers in its affected_objects.\n"
+            "- Each error's \"analysis\" field is REQUIRED: a short summary of the "
+            "concrete facts you read from the tools for THAT object (statuses, "
+            "flags, percentages, amounts, or that a table returned no rows). "
+            "Fill it whenever you called any tool.\n"
             "- status: completed (all diagnosed), partial (some unresolved), "
             "undetermined (no root cause found).\n"
             f"- You may make at most {max_steps} tool calls. When every reported "
@@ -1071,7 +1105,17 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         tools_used: list[str] = []
         budget_exhausted = True
 
-        for _ in range(max_steps):
+        async def _substep(sid_: str, kind: str, label: str, status: str, message: str) -> None:
+            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
+                        "message": message,
+                        "substep": {"id": sid_, "kind": kind, "label": label,
+                                    "status": status}})
+
+        reformat_tries = 0
+        MAX_REFORMAT   = 2
+        for i in range(max_steps):
+            llm_sub = f"llm-{i}"
+            await _substep(llm_sub, "llm", "Reasoning…", "running", "Reasoning…")
             response = await llm.ainvoke(conv)
             new_msgs.append(response)
             conv.append(response)
@@ -1081,19 +1125,42 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
                 parsed = _extract_json_object(raw)
-                if parsed is None:
+            if parsed is None:
+                # Model emitted non-JSON. One malformed turn shouldn't abort the
+                # whole diagnosis — nudge it to reformat a bounded number of
+                # times before giving up.
+                reformat_tries += 1
+                if reformat_tries > MAX_REFORMAT:
+                    await _substep(llm_sub, "llm", "Unparsable reply",
+                                   "error", "Analysis reply could not be parsed")
                     budget_exhausted = False
-                    break  # model deviated from format — treat as terminal
+                    break  # model won't produce valid JSON — treat as terminal
+                await _substep(llm_sub, "llm", "Reply not JSON — asking to reformat",
+                               "error", "Analysis reply was not valid JSON; retrying")
+                correction = HumanMessage(content=(
+                    "Your last reply was not valid JSON. Reply with ONLY a single "
+                    "JSON object in the required format — a tool_call or a "
+                    "final_answer — with no prose, explanation, or markdown fences."))
+                new_msgs.append(correction)
+                conv.append(correction)
+                continue
 
             if parsed.get("type") != "tool_call":
+                await _substep(llm_sub, "llm", "Reached conclusion", "ok",
+                               "Analysis concluded")
                 budget_exhausted = False
                 break  # final_answer or unrecognised — exit loop
 
             tool_name = parsed.get("tool", "")
             tool_args = parsed.get("args", {})
+            arg_hint  = _summarize_tool_args(tool_args)
+            tool_label = tool_name + (f" · {arg_hint}" if arg_hint else "")
 
-            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
-                        "message": f"Calling SAP: {tool_name}…"})
+            await _substep(llm_sub, "llm", f"Requested {tool_name}", "ok",
+                           f"Calling SAP: {tool_name}…")
+            tool_sub = f"tool-{i}"
+            await _substep(tool_sub, "tool", tool_label, "running",
+                           f"Calling SAP: {tool_name}…")
             try:
                 result = await call_tool(tool_name, tool_args)
                 tools_used.append(tool_name)
@@ -1101,8 +1168,9 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 result = {"status": "error",
                           "messages": [{"TYPE": "E", "MESSAGE": str(exc)}], "data": {}}
 
-            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
-                        "message": f"Tool returned ({tool_name}): {result.get('status')}"})
+            tool_status = "ok" if result.get("status") == "ok" else "error"
+            await _substep(tool_sub, "tool", tool_label, tool_status,
+                           f"Tool returned ({tool_name}): {result.get('status')}")
 
             feedback = json.dumps(
                 {"tool": tool_name, "status": result.get("status"),
@@ -1296,6 +1364,11 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             instructions = None
             result_block = None
             tools_used   = []
+
+        # Lift the model's per-error `analysis` evidence into result['analysis']
+        # so the operator's Analysis-result table renders it.
+        if isinstance(result_block, dict):
+            _normalize_analysis(result_block)
 
         logger.info("analysis step=%s action=%s status=%s", step_id, action, status)
         await _emit({"type": "action_end", "step_id": step_id, "action": "analysis",

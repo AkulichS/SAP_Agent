@@ -223,6 +223,23 @@
     .det-msg  { color: var(--text-dim); padding: 1px 0; font-family: var(--mono); font-size: 11px; }
     .det-spool summary { cursor: pointer; color: var(--text-dim); font-size: 11px; user-select: none; }
     .det-spool summary:hover { color: var(--text); }
+    .an-steps { margin-top: 6px; }
+    .an-steps > summary { cursor: pointer; color: var(--text-dim); font-size: 11px; user-select: none; list-style: none; }
+    .an-steps > summary::-webkit-details-marker { display: none; }
+    .an-steps > summary::before { content: '▸ '; }
+    .an-steps[open] > summary::before { content: '▾ '; }
+    .an-steps > summary:hover { color: var(--text); }
+    .an-steps-body {
+      margin-top: 4px; padding: 4px 8px;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border); border-radius: 3px;
+    }
+    .an-substep { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; font-size: 11px; line-height: 1.5; }
+    .an-sub-ic  { flex: none; width: 14px; text-align: center; }
+    .an-sub-kind { flex: none; }
+    .an-sub-lbl { color: var(--text); font-family: var(--mono); word-break: break-word; }
+    .an-sub-ok  { color: var(--ok); }
+    .an-sub-x   { color: var(--failed); }
     .det-pre {
       font-family: var(--mono); font-size: 11px; color: var(--text-dim);
       white-space: pre-wrap; word-break: break-all;
@@ -254,8 +271,8 @@
     #modal-overlay.visible { display: flex; }
     #modal {
       background: #252526; border: 1px solid #555; border-radius: 6px;
-      width: 560px; max-width: calc(100vw - 40px); max-height: 90vh;
-      overflow-y: auto; padding: 20px 24px;
+      width: fit-content; min-width: 560px; max-width: calc(100vw - 40px);
+      max-height: 90vh; overflow-y: auto; padding: 20px 24px;
     }
     #modal h2 { font-size: 14px; font-weight: 600; color: var(--failed); margin-bottom: 14px; }
     .modal-section { margin-bottom: 14px; }
@@ -265,7 +282,13 @@
     .status-badge.completed   { background: #1e3a2a; color: var(--ok); }
     .status-badge.partial     { background: #3c2a00; color: var(--warn); }
     .status-badge.undetermined{ background: #3a1e1e; color: var(--failed); }
-    #modal-errors .det-table, #modal-resolutions .det-table { width: 100%; }
+    /* Modal tables: window hugs content; every column except the last sizes to
+       its own content, and the last column absorbs the remaining window width. */
+    #modal .det-table { width: 100%; table-layout: auto; }
+    #modal .det-table th, #modal .det-table td { white-space: nowrap; }
+    #modal .det-table th:last-child, #modal .det-table td:last-child {
+      width: 100%; white-space: pre-wrap; word-break: break-word;
+    }
     #modal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
     .modal-btn { padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; font-weight: 500; transition: opacity .15s; }
     .modal-btn:hover { opacity: .8; }
@@ -599,6 +622,7 @@
       <div class="value"><span id="modal-step"></span> <span id="modal-status-badge" class="status-badge" style="display:none"></span></div>
     </div>
     <div class="modal-section" id="modal-errors-wrap" style="display:none"><label>Errors</label><div id="modal-errors"></div></div>
+    <div class="modal-section" id="modal-analysis-wrap" style="display:none"><label>Analysis result</label><div id="modal-analysis"></div></div>
     <div class="modal-section" id="modal-resolutions-wrap" style="display:none"><label>Recommendations</label><div id="modal-resolutions"></div></div>
     <div class="modal-section" id="modal-diagnosis-wrap"><label>Diagnosis</label><div id="modal-diagnosis" class="value"></div></div>
     <div class="modal-section" id="modal-instructions-wrap"><label>Instructions</label><div id="modal-instructions" class="value"></div></div>
@@ -1719,6 +1743,8 @@ const ACTION_STATUS = {
 
 function onActionStart(e) {
   const entry = {id: newId(), action: e.action, status: 'running', message: e.message || '', detail: null};
+  // Replayed analysis action_start carries baked substeps (see run_manager).
+  if (Array.isArray(e.substeps)) entry.substeps = e.substeps.map(s => ({...s}));
   if (e.action === 'poll') appState.pollActionId[e.step_id] = entry.id;
   appState.stepActions[e.step_id].push(entry);
   if (appState.selectedStep === e.step_id) appendActionEntry(e.step_id, entry);
@@ -1739,7 +1765,17 @@ function onActionUpdate(e) {
   if (entry) {
     entry.message = e.message;
     const el = document.getElementById(`action-${entry.id}`);
-    if (el) el.querySelector('.action-msg').textContent = e.message;
+    if (e.substep) {
+      // Analysis ReAct sub-step: upsert into the collapsible list rather than
+      // overwriting a single status line.
+      entry.substeps = entry.substeps || [];
+      const i = entry.substeps.findIndex(s => s.id === e.substep.id);
+      if (i >= 0) entry.substeps[i] = e.substep; else entry.substeps.push(e.substep);
+      if (el) el.querySelector('.action-body').innerHTML = actionBodyHTML(entry);
+    } else if (el) {
+      const msg = el.querySelector('.action-msg');
+      if (msg) msg.textContent = e.message;
+    }
   }
   if (e.message) setStatus(`${e.step_id}: ${e.message}`);
 }
@@ -1762,11 +1798,7 @@ function onActionEnd(e) {
     const el = document.getElementById(`action-${entry.id}`);
     if (el) {
       el.dataset.status = e.status;
-      const body = el.querySelector('.action-body');
-      body.innerHTML =
-        `<div class="action-title">${actionLabel(e.action, e.status)}</div>` +
-        (e.action !== 'validate' ? `<div class="action-msg">${esc(entry.message)}</div>` : '') +
-        (entry.detail ? renderDetail(e.action, entry.detail) : '');
+      el.querySelector('.action-body').innerHTML = actionBodyHTML(entry);
     }
   }
   if (e.action === 'poll') delete appState.pollActionId[e.step_id];
@@ -1796,21 +1828,24 @@ function onInterrupt(e) {
 
   const badge   = document.getElementById('modal-status-badge');
   const errWrap = document.getElementById('modal-errors-wrap');
+  const anWrap  = document.getElementById('modal-analysis-wrap');
   const resWrap = document.getElementById('modal-resolutions-wrap');
   const diagWrap = document.getElementById('modal-diagnosis-wrap');
   const instrWrap = document.getElementById('modal-instructions-wrap');
   const result = e.result;
 
   if (result && (Array.isArray(result.errors) || Array.isArray(result.resolutions))) {
-    // Structured view: status badge + errors table + deduplicated resolutions table
+    // Structured view: status badge + errors table + analysis table + resolutions table
     const status = result.status || 'completed';
     badge.textContent = status;
     badge.className = 'status-badge ' + status;
     badge.style.display = '';
 
     document.getElementById('modal-errors').innerHTML = renderErrorsTable(result.errors || []);
+    document.getElementById('modal-analysis').innerHTML = renderAnalysisTable(result.analysis || []);
     document.getElementById('modal-resolutions').innerHTML = renderResolutionsTable(result.resolutions || []);
     errWrap.style.display = (result.errors || []).length ? '' : 'none';
+    anWrap.style.display  = (result.analysis || []).length ? '' : 'none';
     resWrap.style.display = (result.resolutions || []).length ? '' : 'none';
     diagWrap.style.display = 'none';
     instrWrap.style.display = 'none';
@@ -1818,6 +1853,7 @@ function onInterrupt(e) {
     // Legacy text view
     badge.style.display = 'none';
     errWrap.style.display = 'none';
+    anWrap.style.display = 'none';
     resWrap.style.display = 'none';
     diagWrap.style.display = '';
     instrWrap.style.display = '';
@@ -1834,19 +1870,28 @@ function renderErrorsTable(errors) {
   if (!errors.length) return '';
   const rows = errors.map(x => `<tr>
     <td>${esc(x.object_id)}</td><td>${esc(x.error)}</td>
-    <td>${esc(x.cause)}</td><td>${esc(x.resolution_id)}</td></tr>`).join('');
+    <td>${esc(x.cause)}</td></tr>`).join('');
   return `<table class="det-table"><thead><tr>
-    <th>Object</th><th>Error</th><th>Cause</th><th>Fix →</th>
+    <th>Object</th><th>Error</th><th>Cause</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderAnalysisTable(analysis) {
+  if (!analysis.length) return '';
+  const rows = analysis.map(a => `<tr>
+    <td>${esc(a.object_id)}</td><td>${esc(a.finding)}</td></tr>`).join('');
+  return `<table class="det-table"><thead><tr>
+    <th>Object</th><th>Analysis result</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderResolutionsTable(resolutions) {
   if (!resolutions.length) return '';
   const rows = resolutions.map(r => `<tr>
-    <td>${esc(r.id)}</td><td>${esc(r.recommendation)}</td>
+    <td>${esc(r.recommendation)}</td>
     <td>${esc((r.affected_objects || []).join(', '))}</td></tr>`).join('');
   return `<table class="det-table"><thead><tr>
-    <th>#</th><th>Recommendation</th><th>Affected objects</th>
+    <th>Recommendation</th><th>Affected objects</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
 
@@ -2236,13 +2281,37 @@ function appendActionEntry(step_id, entry, scroll = true) {
   div.dataset.status = entry.status;
   div.innerHTML =
     `<div class="action-icon">${actionIcon(entry.action)}</div>` +
-    `<div class="action-body">` +
-      `<div class="action-title">${actionLabel(entry.action, entry.status)}</div>` +
-      (entry.action !== 'validate' ? `<div class="action-msg">${esc(entry.message)}</div>` : '') +
-      (entry.detail ? renderDetail(entry.action, entry.detail) : '') +
-    `</div>`;
+    `<div class="action-body">${actionBodyHTML(entry)}</div>`;
   log.appendChild(div);
   if (scroll) log.scrollTop = log.scrollHeight;
+}
+
+// Inner HTML of an action entry's body — shared by initial render, live
+// updates, and completion so all three stay in sync.
+function actionBodyHTML(entry) {
+  return `<div class="action-title">${actionLabel(entry.action, entry.status)}</div>` +
+    (entry.action !== 'validate' ? `<div class="action-msg">${esc(entry.message)}</div>` : '') +
+    (entry.action === 'analysis' && entry.substeps && entry.substeps.length
+       ? renderAnalysisSubsteps(entry.substeps, entry.status) : '') +
+    (entry.detail ? renderDetail(entry.action, entry.detail) : '');
+}
+
+// Collapsible list of the analysis ReAct steps (each LLM turn + tool call),
+// auto-expanded while the analysis is still running.
+function renderAnalysisSubsteps(substeps, status) {
+  const open = status === 'running' ? ' open' : '';
+  const rows = substeps.map(s => {
+    const ic = s.status === 'running' ? '<span class="spinner"></span>'
+             : s.status === 'error'   ? '<span class="an-sub-x">✗</span>'
+             : '<span class="an-sub-ok">✓</span>';
+    const kind = s.kind === 'tool' ? '🔧' : '🧠';
+    return `<div class="an-substep"><span class="an-sub-ic">${ic}</span>` +
+           `<span class="an-sub-kind">${kind}</span>` +
+           `<span class="an-sub-lbl">${esc(s.label)}</span></div>`;
+  }).join('');
+  return `<details class="an-steps"${open}>` +
+    `<summary>Analysis steps (${substeps.length})</summary>` +
+    `<div class="an-steps-body">${rows}</div></details>`;
 }
 
 // ═══════════════════════════════════════════════════════════
