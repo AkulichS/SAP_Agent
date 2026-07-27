@@ -443,6 +443,54 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tool: sap_read_job_log
+# Read the SM37 runtime job log of a background job (abort reason lives here)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
+    """
+    Read the runtime job log (SM37 "Job log") of a SAP background job.
+
+    Unlike the spool (the report's list output), the job log holds the job's
+    own runtime messages — including the abort reason and the last messages
+    before an ABORTED job terminated — so it is the primary artefact for
+    diagnosing a job that aborted or timed out during polling. Keyed only by
+    job_name/job_id, which the caller already holds; no log-name lookup needed.
+
+    Returns
+    -------
+    The unified envelope {status, messages, meta, data} where
+        meta — {"job_name", "job_id", "line_count", "truncated"}
+        data — {"joblog": {available, line_count, text}}
+    """
+    conn = conn_mgr.get_connection()
+    result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_LOG", {
+        "jobname":  job_name,
+        "jobcount": job_id,
+    })
+
+    # ABAP (ztool_read_job_log) returns the same {"status","text"} shape as the
+    # spool handler, so it normalises identically. Then trim to max_lines.
+    joblog    = _norm_spool(result["result_json"]) or {"available": False, "line_count": 0, "text": ""}
+    lines     = joblog["text"].splitlines()
+    truncated = len(lines) > max_lines
+    trimmed   = lines[:max_lines]
+    joblog    = {"available": joblog["available"], "line_count": len(trimmed),
+                 "text": "\n".join(trimmed)}
+
+    logger.info("sap_read_job_log job=%s/%s lines=%d truncated=%s",
+                job_name, job_id, len(trimmed), truncated)
+    return _envelope(
+        "error" if result["status"] == "E" else "ok",
+        messages = result["messages"],
+        meta     = {"job_name": job_name, "job_id": job_id,
+                    "line_count": len(trimmed), "truncated": truncated},
+        data     = {"joblog": joblog},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

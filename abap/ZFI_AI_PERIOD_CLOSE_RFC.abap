@@ -715,6 +715,13 @@ FORM z_execute_tool
                    ev_result_json
                    et_messages.
 
+      WHEN 'TOOL_READ_JOB_LOG'.
+        PERFORM ztool_read_job_log
+          USING    iv_params_json
+          CHANGING ev_status
+                   ev_result_json
+                   et_messages.
+
       WHEN OTHERS.
         ev_status = lc_error.
         DATA(lv_msg) = 'Unknown TOOL: ' && iv_toolname.
@@ -1060,6 +1067,127 @@ FORM ztool_read_job_spool
 
   ev_status  = lc_success.
   lv_message = |Spool read successfully. Lines={ lv_spool_rows }|.
+  PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+
+ENDFORM.
+
+
+*&============================================================*
+*& HANDLER: READ_JOB_LOG — SM37 background-job log
+*&============================================================*
+*
+*  Reads the runtime job log (SM37 "Job log" button) of a background
+*  job via BP_JOBLOG_READ. Unlike the spool (the report's list output),
+*  the job log records the job's own runtime messages — including the
+*  abort reason and the last messages emitted before an ABORTED job
+*  terminated — so it is the primary artefact for diagnosing a poll
+*  failure. Keyed purely by JOBNAME / JOBCOUNT, which the caller already
+*  holds from the submit/poll, so no log-name lookup is needed.
+*
+*  JSON format for IV_PARAMS_JSON (same shape as TOOL_READ_JOB_SPOOL):
+*    { "jobname": "ZAI_KO8G_...", "jobcount": "12345678" }
+*
+*  Result JSON: { "status": "S"|"E", "text": "<newline-joined log>" }
+*  — deliberately the same {status,text} shape as TOOL_READ_JOB_SPOOL so
+*  the Python side normalises both with the same helper. An empty log is
+*  a success with empty text (a job may legitimately log nothing).
+*&============================================================*
+
+FORM ztool_read_job_log
+  USING    iv_params_json TYPE string
+  CHANGING ev_status      TYPE c
+           ev_result_json TYPE string
+           et_messages    TYPE bapiret2_t.
+
+  DATA: ls_job              TYPE ty_zai_job_params,
+        lt_joblog           TYPE TABLE OF tbtc5,
+        lt_lines            TYPE stringtab,
+        lv_line             TYPE string,
+        lv_message          TYPE string,
+        lv_log_json         TYPE string,
+        lv_log_text         TYPE string.
+
+  "------------------------------------------------------------
+  " 1. Deserialize input JSON
+  "------------------------------------------------------------
+  TRY.
+    /ui2/cl_json=>deserialize( EXPORTING json = iv_params_json
+                               CHANGING data = ls_job ).
+  CATCH cx_root INTO DATA(lx_json).
+    ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    lv_message = 'JSON deserialize error: ' && lx_json->get_text( ).
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+    RETURN.
+  ENDTRY.
+
+  "------------------------------------------------------------
+  " 2. Read the job log
+  "------------------------------------------------------------
+  CALL FUNCTION 'BP_JOBLOG_READ'
+    EXPORTING
+      jobcount              = ls_job-jobcount
+      jobname               = ls_job-jobname
+    TABLES
+      joblogtbl             = lt_joblog
+    EXCEPTIONS
+      cant_read_joblog      = 1
+      jobcount_missing      = 2
+      joblog_does_not_exist = 3
+      joblog_is_empty       = 4
+      joblog_name_missing   = 5
+      jobname_missing       = 6
+      job_does_not_exist    = 7
+      OTHERS                = 8.
+
+  " joblog_is_empty (4) and joblog_does_not_exist (3) are not hard
+  " failures — the job may simply not have logged anything yet. Return
+  " a successful, empty result so the caller can fall back to the spool.
+  IF sy-subrc <> 0 AND sy-subrc <> 3 AND sy-subrc <> 4.
+    ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    CASE sy-subrc.
+      WHEN 1. lv_message = |Cannot read job log for { ls_job-jobname }/{ ls_job-jobcount }|.
+      WHEN 2. lv_message = |Jobcount missing for { ls_job-jobname }|.
+      WHEN 5. lv_message = |Joblog name missing for { ls_job-jobname }|.
+      WHEN 6. lv_message = |Jobname missing|.
+      WHEN 7. lv_message = |Job does not exist: { ls_job-jobname }/{ ls_job-jobcount }|.
+      WHEN OTHERS. lv_message = |Unexpected error reading job log (subrc={ sy-subrc })|.
+    ENDCASE.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+    RETURN.
+  ENDIF.
+
+  "------------------------------------------------------------
+  " 3. Collect the readable log text (TBTC5-TEXT holds the
+  "    already-formatted message line)
+  "------------------------------------------------------------
+  LOOP AT lt_joblog INTO DATA(ls_log).
+    lv_line = ls_log-text.
+    APPEND lv_line TO lt_lines.
+  ENDLOOP.
+
+  CONCATENATE LINES OF lt_lines INTO lv_log_text
+    SEPARATED BY cl_abap_char_utilities=>newline.
+
+  "------------------------------------------------------------
+  " 4. Serialise result to JSON ({status, text}) — same shape as spool
+  "------------------------------------------------------------
+  TRY.
+    lv_log_json = /ui2/cl_json=>serialize( data = lv_log_text ).
+  CATCH cx_root INTO DATA(lx_json_ser).
+    ev_status  = lc_error.
+    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
+    PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+    RETURN.
+  ENDTRY.
+
+  DATA(lv_log_rows) = lines( lt_lines ).
+  ev_result_json = '{"status":"' && lc_success && '","text":' && lv_log_json && '}'.
+
+  ev_status  = lc_success.
+  lv_message = |Job log read successfully. Lines={ lv_log_rows }|.
   PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
 
 ENDFORM.

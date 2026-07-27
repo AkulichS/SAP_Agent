@@ -17,41 +17,25 @@ globals:
   analysis_defaults:
     max_tool_calls: 8
     role: 'You are an SAP period-close error analyst. You diagnose why a closing step
-      failed,
-
-      using read-only SAP tools, then report the root cause and how the operator can
-      fix it.
+      failed, using read-only SAP tools, then report the root cause and how the operator
+      can fix it.
 
       '
-    tools: 'You have read-only diagnostic tools (exact names and arguments are listed
-      under
+    tools: 'You have these read-only diagnostic tools (call one at a time):
 
-      AVAILABLE TOOLS in the response-format section):
+      - sap_read_table(table, where, fields, max_rows) — read any SAP table by WHERE
+      clause.
 
-      - sap_read_table   — read any SAP table by fields / WHERE clause.
+      - sap_read_job_log(job_name, job_id, max_lines) — read the SM37 runtime job
+      log (holds the abort reason and the last messages before an aborted job terminated).
 
-      - sap_read_spool   — read the spool (job log) of a completed background job.
+      - sap_read_spool(job_name, job_id, max_lines) — read the spool (report list
+      output) of a completed background job.
 
-      - sap_job_status   — check the status of a background job.
+      - sap_job_status(job_name, job_id) — check the status of a background job.
 
-      - sap_check_period — check whether a posting period is open.
-
-      '
-    output_format: 'When every reported object is diagnosed, return ONE final_answer
-      JSON object whose
-
-      `result` contains:
-
-      - status: completed | partial | undetermined
-
-      - errors[]:      {object_id, error, cause, analysis}
-
-      - resolutions[]: {recommendation, affected_objects[]}
-
-      Group objects that share the same fix under a single resolution and list every
-
-      object it covers in affected_objects — never repeat the same recommendation per
-      object.
+      - sap_check_period(action_type, object_name, params_json) — check whether a
+      posting period is open.
 
       '
     rules: "- Never fabricate data. Report only what the tools actually return.\n\
@@ -61,7 +45,7 @@ globals:
       \ wrong) rather than guessing.\n- If you cannot determine a root cause from\
       \ the available data, say so and set\n  status to \"undetermined\" (or \"partial\"\
       \ when only some objects are unresolved);\n  suggest a manual check.\n- Respond\
-      \ in the same language as the Context section.\n"
+      \ in the same language as the error messages in the task message.\n"
 steps:
 - step_id: ZFK_COMPARISON
   description: FI Data Comparison & Reconciliation
@@ -253,57 +237,64 @@ steps:
       goal: 'Diagnose the root cause for each failed order and provide a clear fix.
         Every
 
-        failed order listed in the Context must be accounted for in the final result.
+        failed order listed in the task message must be accounted for in the final
+        result.
 
         '
       context_template: 'KO8G performs periodic settlement of CO orders for controlling
-        area
-
-        {{controlling_area}}, fiscal year {{fiscal_year}}, period {{period}}.
+        area {{controlling_area}}, fiscal year {{fiscal_year}}, period {{period}}.
 
         After the settlement run, validation detected internal orders that were NOT
-
-        settled due to errors:
-
-        {{errors}}
+        settled due to errors. The failed orders and the KO8G error messages are given
+        in the task message below.
 
         '
       instructions: "## Diagnostic Procedure (follow steps in order; do NOT skip to\
         \ assumptions)\n\n### Step 1: Retrieve order master data\nUse sap_read_table\
-        \ on table AUFK, fields:\n  AUFNR, AUART, AUTYP, BUKRS, KOKRS, WERKS, LOEKZ,\
-        \ PHAS0, PHAS1, PHAS2, PHAS3\nWHERE AUFNR IN (<failed order numbers from the\
-        \ Context>).\nOrder-number formatting:\n- Digits only → pad with leading zeros\
-        \ to 12 chars (\"20001\" → \"000000020001\").\n- Contains any letter → use\
-        \ exactly as provided (\"F0K01023\" → \"F0K01023\").\n\n### Step 2: Check\
-        \ order status (most common cause)\n| PHAS1 | PHAS2 | PHAS3 | LOEKZ | System\
-        \ Status | Settlement allowed? |\n|-------|-------|-------|-------|---------------|---------------------|\n\
+        \ on table AUFK, fields:\n  AUFNR, PHAS0, PHAS1, PHAS2, PHAS3, LOEKZ\nWHERE\
+        \ AUFNR IN (<failed order numbers from the Errors list>).\nOrder-number formatting:\n\
+        - Digits only → pad with leading zeros to 12 chars (\"20001\" → \"000000020001\"\
+        ).\n- Contains any letter → use exactly as provided (\"F0K01023\" → \"F0K01023\"\
+        ).\n  \n### Step 2: Check order status (most common cause)\n| PHAS1 | PHAS2\
+        \ | PHAS3 | LOEKZ | System Status | Settlement allowed? |\n|-------|-------|-------|-------|---------------|---------------------|\n\
         | 1 | 0 | 0 | (empty) | REL (Released / ТЗКР)            | YES |\n| 0 | 0\
         \ | 0 | (empty) | CRTD (Created / ТЗАК)            | NO — not yet released\
         \ |\n| 1 | 1 | 0 | (empty) | TECO (Technically closed / ТКЗК) | NO — technically\
         \ closed |\n| any | any | 1 | (empty) | CLSD (Closed / ЗАКР)          | NO\
         \ — order is closed |\n| any | any | any | X   | DLFL (Deletion flag / УДАЛ)\
-        \      | NO — marked for deletion |\nAlso: LOEKZ = 'X' (deletion flag) → cannot\
-        \ be settled.\n\n### Step 3: Check controlling area assignment\nVerify KOKRS\
-        \ in AUFK matches the settlement run's controlling area\n{{controlling_area}}.\
-        \ A different KOKRS → the order belongs to another\ncontrolling area and is\
-        \ excluded from this run.\n\n### Step 4: Check settlement rule existence\n\
-        Use sap_read_table on table COBRB, fields OBJNR, BURESSION, KONTY, EMPGE,\
-        \ PROZS\nWHERE OBJNR IN (<\"OR\" + AUFNR as stored in AUFK>).\n- No records\
-        \ → settlement rule missing → fix in KO02 (Settlement Rule tab).\n- Records\
-        \ found but PROZS does not sum to 100 → settlement rule incomplete.\n\n###\
-        \ Step 5: Cross-reference with error messages\nMatch findings against the\
-        \ KO8G error messages in the Context to confirm the\nroot cause for each order,\
-        \ then group orders that share the same fix.\n"
+        \      | NO — marked for deletion |\nAlso: PHAS0 = 'X' - means order status\
+        \ Open → cannot be settled yet.\n\n### Step 3: Check settlement rule existence\n\
+        Use sap_read_table on table COBRB, fields OBJNR, PROZS\nWHERE OBJNR IN (<\"\
+        OR\" + AUFNR as stored in AUFK>).\n- No records → settlement rule missing\
+        \ → fix in KO02 (Settlement Rule tab).\n- Records found but PROZS does not\
+        \ sum to 100 → settlement rule incomplete.\n\n### Step 4: Cross-reference\
+        \ with error messages\nMatch findings against the KO8G error messages in the\
+        \ task message to confirm the root cause for each order, then group orders\
+        \ that share the same fix.\n"
+      tools: 'You have these read-only diagnostic tools (call one at a time):
+
+        - sap_read_table(table, where, fields, max_rows) — read any SAP table by WHERE
+        clause.'
+      rules: '- Never fabricate data. Report only what the tools actually return.
+
+        - Make ONE tool call at a time and wait for its result before the next.
+
+        - Do not repeat an identical tool call with the same arguments.
+
+        - If a tool returns no data for an object, flag it (it may not exist or the
+        key may be formatted wrong) rather than guessing.
+
+        - If you cannot determine a root cause from the available data, say so and
+        set  status to "undetermined" (or "partial" when only some objects are unresolved);   suggest
+        a manual check.
+
+        '
     explain_prompt: 'The settlement-rules report RKASELRULES_OR listed the internal
-      orders below,
+      orders below, which are missing settlement rules and would block KO8G settlement.
 
-      which are missing settlement rules and would block KO8G settlement.
-
-      List the affected order numbers, explain the root cause, and tell the SAP
-
-      operator to maintain settlement rules (KO02) for these orders before KO8G —
-
-      then retry the pre-check, or skip the step if intentional.
+      List the affected order numbers, explain the root cause, and tell the SAP operator
+      to maintain settlement rules (KO02) for these orders before KO8G — then retry
+      the pre-check, or skip the step if intentional.
 
       '
   enabled: true

@@ -29,8 +29,9 @@ ENUMS: dict[str, list[str]] = {
     "on_fail": ["analyse", "skip", "execute"],
 }
 TEXTAREA_KEYS = {
-    "prompt", "instructions", "analysis_guidance", "context_template", "explain_prompt",
-    "system_prompt", "role", "tools", "output_format", "rules", "goal",
+    "prompt", "instructions", "tech_instructions", "analysis_guidance",
+    "context_template", "explain_prompt",
+    "system_prompt", "role", "tools", "rules", "goal",
 }
 
 
@@ -150,6 +151,10 @@ def build_settings(company_code: str, store: ConfigStore | None = None, base_pat
         for k, v in run_ctx.items()
     ]
 
+    # Base analysis_defaults travel with the company payload so the step form can
+    # prefill an added Role/Tools/Rules override from the Base value (the same value
+    # the step inherits at runtime when the override is absent).
+    base_globals = config_store.get_base_config(store=store, base_path=base_path)
     return {
         "company_code": company_code,
         "version": state["version"],
@@ -157,6 +162,7 @@ def build_settings(company_code: str, store: ConfigStore | None = None, base_pat
         "run_context_fields": run_ctx_fields,
         "override": override,      # raw delta, so the UI edits it directly
         "steps": steps_out,
+        "analysis_defaults": base_globals.get("analysis_defaults") or {},
     }
 
 
@@ -234,7 +240,7 @@ _ACTION = ["SUBMIT", "FM", "BAPI", "BDC", "TOOLS"]
 # object_name field whose action_type is TOOLS. Purely advisory — an object_name not
 # in the catalog still runs (a client adds a tool with only an ABAP WHEN branch). The
 # effective catalog is this default merged with any `tools` list saved in base globals.
-DEFAULT_TOOLS = ["TOOL_READ_TABLE", "TOOL_READ_JOB_SPOOL", "TOOL_JOB_STATUS"]
+DEFAULT_TOOLS = ["TOOL_READ_TABLE", "TOOL_READ_JOB_SPOOL", "TOOL_READ_JOB_LOG", "TOOL_JOB_STATUS"]
 
 
 def tool_catalog(globals_: dict | None = None) -> list[str]:
@@ -380,7 +386,8 @@ def form_descriptor(globals_: dict | None = None) -> dict:
             _f("on_error.analysis.goal", "Analysis · goal", "textarea"),
             _f("on_error.analysis.tools", "Analysis · tools", "textarea"),
             _f("on_error.analysis.instructions", "Analysis · instructions", "textarea"),
-            _f("on_error.analysis.output_format", "Analysis · output format", "textarea"),
+            _f("on_error.analysis.tech_instructions",
+               "Analysis · technical playbook", "textarea"),
             _f("on_error.analysis.rules", "Analysis · rules", "textarea"),
             _f("on_error.analysis.max_tool_calls", "Analysis · max tool calls", "number"),
         ]},
@@ -413,7 +420,9 @@ def globals_descriptor() -> list[dict]:
             _f("analysis_defaults.max_tool_calls", "Max tool calls", "number", auto=True),
             _f("analysis_defaults.role", "Role", "textarea", auto=True),
             _f("analysis_defaults.tools", "Tools", "textarea", auto=True),
-            _f("analysis_defaults.output_format", "Output format", "textarea", auto=True),
+            # Optional (auto=False) → hidden behind the section's "+ Add field" until
+            # an admin overrides the built-in TECH_DIAGNOSIS_PLAYBOOK.
+            _f("analysis_defaults.tech_instructions", "Technical playbook", "textarea"),
             _f("analysis_defaults.rules", "Rules", "textarea", auto=True),
         ]},
     ]

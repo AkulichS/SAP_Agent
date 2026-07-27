@@ -517,7 +517,10 @@ async def test_analysis_diagnose_budget_exhausted_is_partial(make_session, make_
     node = make_analysis_node(make_session(), make_llms())
     step = {"step_id": "A",
             "on_error": {"analysis": {"instructions": "diagnose", "max_tool_calls": 2}}}
-    state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX)
+    state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX,
+                       analysis_defaults={"role": "analyst", "tools": "sap_read_table",
+                                          "goal": "diagnose", "output_format": "json",
+                                          "rules": "be honest"})
     out = await node(state)
     an = out["current_analysis"]
     assert an["status"] == "partial"
@@ -531,6 +534,7 @@ async def test_analysis_diagnose_section_prompt_assembled(make_session, make_llm
 
     def analysis_fn(messages):
         captured["system"] = messages[0].content
+        captured["human"] = "\n".join(m.content for m in messages[1:])
         return '{"action":"user_input","result":{"status":"completed",' \
                '"errors":[],"resolutions":[]}}'
 
@@ -540,17 +544,128 @@ async def test_analysis_diagnose_section_prompt_assembled(make_session, make_llm
     step = {"step_id": "KO8G", "action_type": "SUBMIT", "object_name": "RKO7KO8G",
             "on_error": {"analysis": {
                 "role": "You are an analyst.",
-                "context_template": "Area {{controlling_area}} period {{period}}.\n{{errors}}",
+                "context_template": "Area {{controlling_area}} period {{period}}. Diagnose the failures.",
                 "goal": "Find the cause.",
                 "instructions": "Step 1 read AUFK.",
             }}}
     state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX,
                        company_config={"controlling_area": "X500", "period": "11"},
-                       analysis_defaults={"rules": "Be honest.", "max_tool_calls": 8})
+                       analysis_defaults={"tools": "sap_read_table(...)",
+                                          "rules": "Be honest.", "max_tool_calls": 8})
     out = await node(state)
     sysmsg = captured["system"]
     assert "## Goal" in sysmsg and "Find the cause." in sysmsg
     assert "Step 1 read AUFK." in sysmsg            # instructions section
     assert "Area X500 period 11." in sysmsg         # placeholders resolved
     assert "Be honest." in sysmsg                   # rules pulled from analysis_defaults
+    # Output format + response format are code-owned sections, always present,
+    # with the tool budget interpolated into the response format.
+    assert "## Output Format" in sysmsg
+    assert "## Response Format" in sysmsg
+    assert "at most 8 tool calls" in sysmsg
+    # No auto tool-schema dump: execution tools are never advertised.
+    assert "sap_execute_step" not in sysmsg and "sap_run_tool" not in sysmsg
+    # The runtime error data lives once, in the Human task message — not the
+    # system prompt (which is a static step description).
+    assert "boom" not in sysmsg                     # spool_text from _DIAGNOSE_CTX
+    assert "Error context:" in captured["human"] and "boom" in captured["human"]
     assert out["current_analysis"]["status"] == "completed"
+
+
+_POLL_CTX = {"source": "poll", "summary": "Job ZAI_KO8G/123 aborted",
+             "default_depth": "diagnose", "job_name": "ZAI_KO8G", "job_id": "123"}
+
+
+async def test_analysis_diagnose_poll_uses_technical_playbook(make_session, make_llms, make_state):
+    # A poll (job-abort) failure swaps the step's business `instructions` decision
+    # tree for the source-aware technical playbook. With no tech_instructions
+    # override configured, the built-in TECH_DIAGNOSIS_PLAYBOOK is injected, which
+    # names sap_read_job_log — the SM37 job-log reader.
+    captured = {}
+
+    def analysis_fn(messages):
+        captured["system"] = messages[0].content
+        return '{"action":"user_input","result":{"status":"completed","errors":[],"resolutions":[]}}'
+
+    llms = make_llms()
+    llms["analysis"].content = analysis_fn
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "KO8G", "action_type": "SUBMIT", "object_name": "RKO7KO8G",
+            "on_error": {"analysis": {
+                "role": "You are an analyst.",
+                "goal": "Find the cause.",
+                "instructions": "Step 1 read AUFK.",   # business tree — wrong for a poll abort
+            }}}
+    state = make_state([step], retry_count=0, current_error_context=_POLL_CTX,
+                       analysis_defaults={"tools": "sap_read_job_log(...)",
+                                          "rules": "Be honest.", "max_tool_calls": 8})
+    out = await node(state)
+    sysmsg = captured["system"]
+    assert "sap_read_job_log" in sysmsg and "SM37 job log" in sysmsg   # tech playbook
+    assert "Step 1 read AUFK." not in sysmsg          # business instructions suppressed
+    assert out["current_analysis"]["status"] == "completed"
+
+
+async def test_analysis_diagnose_poll_tech_instructions_override(make_session, make_llms, make_state):
+    # A configured tech_instructions (step override) wins over the built-in playbook.
+    captured = {}
+
+    def analysis_fn(messages):
+        captured["system"] = messages[0].content
+        return '{"action":"user_input","result":{"status":"completed","errors":[],"resolutions":[]}}'
+
+    llms = make_llms()
+    llms["analysis"].content = analysis_fn
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "KO8G", "action_type": "SUBMIT", "object_name": "RKO7KO8G",
+            "on_error": {"analysis": {
+                "role": "You are an analyst.", "goal": "Find the cause.",
+                "instructions": "Step 1 read AUFK.",
+                "tech_instructions": "CUSTOM: read the KO8G job log first.",
+            }}}
+    state = make_state([step], retry_count=0, current_error_context=_POLL_CTX,
+                       analysis_defaults={"tools": "t", "rules": "r", "max_tool_calls": 8})
+    out = await node(state)
+    sysmsg = captured["system"]
+    assert "CUSTOM: read the KO8G job log first." in sysmsg
+    assert "SM37 job log" not in sysmsg               # built-in default not used
+    assert "Step 1 read AUFK." not in sysmsg
+
+
+async def test_analysis_diagnose_legacy_poll_appends_playbook(make_session, make_llms, make_state):
+    # Legacy (analysis_guidance blob) step on a poll failure keeps the business blob
+    # and appends the generic job-abort playbook after it.
+    captured = {}
+
+    def analysis_fn(messages):
+        captured["system"] = messages[0].content
+        return '{"action":"user_input","result":{"status":"completed","errors":[],"resolutions":[]}}'
+
+    llms = make_llms()
+    llms["analysis"].content = analysis_fn
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "S1", "action_type": "SUBMIT", "object_name": "RKSAB000",
+            "on_error": {"analysis_guidance": "Business domain guidance here."}}
+    state = make_state([step], retry_count=0, current_error_context=_POLL_CTX)
+    out = await node(state)
+    sysmsg = captured["system"]
+    assert "Business domain guidance here." in sysmsg   # legacy blob kept
+    assert "sap_read_job_log" in sysmsg                 # + technical playbook appended
+
+
+async def test_analysis_diagnose_incomplete_config_flags(make_session, make_llms, make_state):
+    # A section-based step whose required analysis sections resolve to nothing
+    # (neither the step nor analysis_defaults supply them) short-circuits to a
+    # clear operator message without ever calling the LLM.
+    llms = make_llms()
+    node = make_analysis_node(make_session(), llms)
+    step = {"step_id": "KO8G", "action_type": "SUBMIT", "object_name": "RKO7KO8G",
+            "on_error": {"analysis": {"goal": "Find the cause."}}}  # role/tools/instructions/output_format/rules missing
+    state = make_state([step], retry_count=0, current_error_context=_DIAGNOSE_CTX,
+                       analysis_defaults={})
+    out = await node(state)
+    an = out["current_analysis"]
+    assert an["action"] == "user_input"
+    assert "incomplete" in an["diagnosis"].lower()
+    assert "role" in an["diagnosis"] and "rules" in an["diagnosis"]
+    assert llms["analysis"].calls == []             # LLM never invoked

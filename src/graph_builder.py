@@ -777,7 +777,12 @@ def make_execute_node(session: ClientSession):
                 out["current_error_context"] = {
                     "source": "execute", "summary": msg,
                     "rows": _rows(env)[:50], "messages": [{"MESSAGE": msg}],
-                    "default_depth": "diagnose",
+                    # Execute hard-fails before a job exists (RFC/transport error,
+                    # rejected params) — the diagnose tools all ride the same dead
+                    # RFC channel and have no job log/spool to read, so the cheap
+                    # one-call explain of the captured messages is the right default.
+                    # A step can still opt into diagnose via on_error.mode.
+                    "default_depth": "explain",
                 }
             return out
 
@@ -807,7 +812,10 @@ def make_execute_node(session: ClientSession):
             out["current_error_context"] = {
                 "source": "execute", "summary": msg,
                 "messages": env["messages"],
-                "default_depth": "diagnose",
+                # See the TOOLS branch above: execute failures are transport-side
+                # (no job, dead RFC), so explain the captured messages rather than
+                # spin up the diagnose ReAct loop. Overridable via on_error.mode.
+                "default_depth": "explain",
             }
         return out
 
@@ -1026,34 +1034,106 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 # Node: analysis_node  (ReAct loop)
 # ---------------------------------------------------------------------------
 
+# Tools the diagnostic analyst must NEVER call because they can mutate SAP.
+# The gate is a deny-list, not an allow-list: everything else MCP exposes is
+# treated as read-only diagnostic, so new read-only tools (ours or a customer's)
+# become callable without any code change — only a newly added *mutating* tool
+# ever needs to be added here.
+MUTATING_TOOLS = {"sap_execute_step", "sap_run_tool"}
+
+# Analysis sections a section-based (on_error.analysis) step must resolve to
+# non-empty text — from the step override or the Base analysis_defaults — for a
+# useful diagnosis. context_template is excluded (optional, step-specific); the
+# machine-coupled output/response formats are code constants below, not settings.
+# Missing sections surface as a clear "config incomplete" message to the operator
+# instead of a silently degraded prompt.
+REQUIRED_ANALYSIS_SECTIONS = ("role", "tools", "goal", "instructions", "rules")
+
+# Failure sources whose diagnosis is *technical* (a background job aborted, or the
+# execute call failed) rather than *business/logical* (a validate/pre_check finding).
+# For these the step's own `instructions` decision tree — authored for that step's
+# business failure — is the wrong playbook, so the diagnose prompt swaps in a generic
+# job-abort procedure (TECH_DIAGNOSIS_PLAYBOOK below), overridable per step/base via
+# a `tech_instructions` analysis section.
+TECHNICAL_FAILURE_SOURCES = ("poll", "execute")
+
+# Built-in default technical-failure playbook. Used when neither the step's
+# on_error.analysis.tech_instructions nor Base analysis_defaults.tech_instructions
+# is set, so a poll/execute diagnosis always has an ordered procedure rather than
+# improvising. Mentions sap_read_job_log — the SM37 job-log reader keyed by the
+# job_name/job_id already carried in the poll ErrorContext.
+TECH_DIAGNOSIS_PLAYBOOK = (
+    "The background job for this step aborted/timed out, or the execute call "
+    "failed before a job ran. Follow these steps in order; stop as soon as you "
+    "have the root cause:\n"
+    "1. Call sap_job_status(job_name, job_id) to confirm the final job state.\n"
+    "2. Call sap_read_job_log(job_name, job_id) to read the SM37 job log — the "
+    "abort reason and the last messages before termination are recorded there. "
+    "If the job log is empty, call sap_read_spool(job_name, job_id) for the "
+    "report's list output.\n"
+    "3. Interpret the message text:\n"
+    "   - it references a posting period or date -> call sap_check_period to "
+    "confirm the period is open;\n"
+    "   - it references a table, lock, or customizing object -> call "
+    "sap_read_table on that object to check its state;\n"
+    "   - it is a transport/RFC/connection error with no job log -> report it as "
+    "an infrastructure failure (SAP host or MCP server unreachable), NOT a data "
+    "problem, and set action to user_input.\n"
+    "4. Conclude with the root cause and the exact action the operator must take."
+)
+
+# OUTPUT_FORMAT and RESPONSE_FORMAT describe the machine-parsed diagnosis result,
+# so both are code-owned (coupled to _flatten_result / _normalize_analysis / the
+# json.loads protocol) — deliberately NOT settings, since editing their shape in
+# the UI would break parsing. They are split by concern with no overlap:
+#   OUTPUT_FORMAT   — the semantics of the result the model must produce.
+#   RESPONSE_FORMAT — the wire protocol for every turn (+ the tool-call budget).
+OUTPUT_FORMAT = (
+    "Account for every failed object listed in the Errors list.\n"
+    "- status: completed (all objects diagnosed) | partial (some unresolved) | "
+    "undetermined (no root cause found).\n"
+    "- Give each error a concrete `cause`, and an `analysis`: a short summary of "
+    "the facts you read from the tools for THAT object (statuses, flags, amounts, "
+    "or that a table returned no rows). Fill `analysis` whenever you called a tool.\n"
+    "- Group objects that share the same fix under ONE resolution and list every "
+    "object it covers in affected_objects — never repeat the same recommendation "
+    "per object."
+)
+
+# `{{max_tool_calls}}` is resolved against the per-step tool budget at assembly time.
+RESPONSE_FORMAT = (
+    "Every response MUST be a single JSON object — no other text.\n"
+    "To call a tool:\n"
+    '  {"type":"tool_call","tool":"<name>","args":{<args>}}\n'
+    "To give your final answer:\n"
+    '  {"type":"final_answer","action":"retry|user_input|skip",'
+    '"result":{"status":"completed|partial|undetermined",'
+    '"errors":[{"object_id":"...","error":"...","cause":"...","analysis":"..."}],'
+    '"resolutions":[{"recommendation":"...","affected_objects":["..."]}]}}\n'
+    "- action: retry (re-run the step), skip (skip it), or user_input "
+    "(operator must intervene).\n"
+    "- You may make at most {{max_tool_calls}} tool calls; when every reported "
+    "object is covered, output the final_answer immediately.\n"
+    "If a tool returns status=error, correct the arguments and call it again."
+)
+
+
 def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
-    _tool_schema_cache: list[dict] | None = None
-
     async def _call_tool(name: str, args: dict) -> dict:
-        """Generic MCP dispatcher — routes any tool call by name, no hardcoding."""
+        """Dispatch an MCP tool by name. Read-only diagnostic tools are auto-allowed;
+        only the mutating tools in MUTATING_TOOLS are refused (an unknown name simply
+        errors at the MCP boundary and the model self-corrects)."""
+        if name in MUTATING_TOOLS:
+            return {"status": "error", "messages": [{"TYPE": "E", "MESSAGE": (
+                f"Tool '{name}' cannot be used during diagnosis — it modifies SAP. "
+                "Use a read-only diagnostic tool instead.")}], "data": {}}
         r = await session.call_tool(name, arguments=args)
         return _parse_tool_result(r)
-
-    async def _get_tool_schema() -> list[dict]:
-        """Fetch tool list from MCP once and cache for the process lifetime."""
-        nonlocal _tool_schema_cache
-        if _tool_schema_cache is None:
-            resp = await session.list_tools()
-            _tool_schema_cache = [
-                {
-                    "name": t.name,
-                    "description": t.description or "",
-                    "args": t.inputSchema.get("properties", {}),
-                }
-                for t in resp.tools
-            ]
-        return _tool_schema_cache
 
     async def _run_text_react(
         llm: ChatOpenAI,
         call_tool: Callable[[str, dict], Awaitable[dict]],
-        tool_schema: list[dict],
         system_prompt: str,
         prior_messages: list,
         emit: Callable,
@@ -1067,40 +1147,15 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
           {"type":"final_answer","action":"retry|user_input|skip",
            "result":{"status":...,"errors":[...],"resolutions":[...]}}
 
+        ``system_prompt`` is the fully-assembled prompt (tools + response format
+        included) built by ``_build_diagnose_system_prompt`` — this loop adds no
+        prose of its own, so every text section stays settings-owned.
+
         Tool errors are fed back as HumanMessages so the model can self-correct.
         Returns (new_messages_added, tool_names_used, budget_exhausted) where
         budget_exhausted is True when ``max_steps`` ran out before a final_answer.
         """
-        tools_block = json.dumps(tool_schema, ensure_ascii=False, indent=2)
-        full_system = (
-            f"{system_prompt}\n\n"
-            "=== AVAILABLE TOOLS ===\n"
-            f"{tools_block}\n\n"
-            "=== RESPONSE FORMAT (strict) ===\n"
-            "Every response MUST be a single JSON object — no other text.\n"
-            "To call a tool:\n"
-            '  {"type":"tool_call","tool":"<name>","args":{<args>}}\n'
-            "To give your final answer:\n"
-            '  {"type":"final_answer","action":"retry|user_input|skip",'
-            '"result":{"status":"completed|partial|undetermined",'
-            '"errors":[{"object_id":"...","error":"...","cause":"...","analysis":"..."}],'
-            '"resolutions":[{"recommendation":"...","affected_objects":["..."]}]}}\n'
-            "- action: retry (re-run the step), skip (skip it), or user_input "
-            "(operator must intervene).\n"
-            "- Group identical fixes under one resolution to avoid duplicates; "
-            "list every object a resolution covers in its affected_objects.\n"
-            "- Each error's \"analysis\" field is REQUIRED: a short summary of the "
-            "concrete facts you read from the tools for THAT object (statuses, "
-            "flags, percentages, amounts, or that a table returned no rows). "
-            "Fill it whenever you called any tool.\n"
-            "- status: completed (all diagnosed), partial (some unresolved), "
-            "undetermined (no root cause found).\n"
-            f"- You may make at most {max_steps} tool calls. When every reported "
-            "object is covered, output the final_answer immediately.\n"
-            "If a tool returns status=error, correct the arguments and call it again."
-        )
-
-        conv: list = [SystemMessage(content=full_system)] + list(prior_messages)
+        conv: list = [SystemMessage(content=system_prompt)] + list(prior_messages)
         new_msgs: list = []
         tools_used: list[str] = []
         budget_exhausted = True
@@ -1186,17 +1241,37 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
     def _ctx_text(ec: dict) -> str:
         """Render the uniform ErrorContext into a prompt-ready block for either depth."""
         parts: list[str] = []
-        if ec.get("summary"):
-            parts.append(str(ec["summary"]))
+        errors_json = (json.dumps(ec["errors"][:50], ensure_ascii=False)
+                       if ec.get("errors") else "")
+        summary = str(ec["summary"]) if ec.get("summary") else ""
+        # Skip the standalone summary when it is just the errors rendered again
+        # (the llm-validate path sets summary=reasoning, which for some steps is
+        # the raw errors JSON) — the `Errors:` block below already carries it.
+        if summary and summary.strip() not in (
+                errors_json.strip(),
+                json.dumps(ec.get("errors"), ensure_ascii=False).strip()):
+            parts.append(summary)
         if ec.get("error_count"):
             parts.append(f"error_count={ec['error_count']}")
-        if ec.get("errors"):
-            parts.append("Errors:\n" + json.dumps(ec["errors"][:50], ensure_ascii=False))
+        if errors_json:
+            parts.append("Errors:\n" + errors_json)
         if ec.get("rows"):
             parts.append("Offending rows (the condition that must be resolved):\n"
                          + json.dumps(ec["rows"][:50], ensure_ascii=False))
-        if ec.get("spool_text"):
-            parts.append(f"Spool (first 2000 chars):\n{ec['spool_text'][:2000]}")
+        spool = (ec.get("spool_text") or "")[:2000]
+        if spool:
+            if errors_json:
+                # Structured `errors` already carry the per-object failures; don't
+                # re-send the whole spool. Keep only its leading header/summary
+                # (report title, controlling area/period, selection counts) — that
+                # grounds the diagnosis and is NOT in the Errors block above.
+                header = "\n".join(spool.splitlines()[:6]).strip()
+                if header:
+                    parts.append("Spool header:\n" + header)
+            else:
+                # No structured errors (e.g. keyword-mode validation) — the spool
+                # is the only error signal, so include it in full (capped).
+                parts.append(f"Spool (first 2000 chars):\n{spool}")
         if ec.get("messages"):
             msgs = " ".join(m.get("MESSAGE", m.get("text", "")) for m in ec["messages"])
             if msgs.strip():
@@ -1257,33 +1332,65 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         defs = _defaults(state)
         default_budget = int(ad.get("max_tool_calls", 8) or 8)
         an   = oe.get("analysis")
+        # Technical failure (job abort / transport error) → the step's business
+        # `instructions` do not apply; swap in the source-aware technical playbook.
+        technical = ec.get("source") in TECHNICAL_FAILURE_SOURCES
 
         if isinstance(an, dict) and an:
             def sec(key: str) -> str:
                 return an.get(key) or ad.get(key) or ""
 
+            def instructions_text() -> str:
+                if technical:
+                    return (an.get("tech_instructions") or ad.get("tech_instructions")
+                            or TECH_DIAGNOSIS_PLAYBOOK)
+                return sec("instructions")
+
+            max_tool_calls = int(an.get("max_tool_calls", default_budget) or default_budget)
+
             parts: list[str] = []
             role = sec("role")
             if role:
                 parts.append(_resolve(role, ctx))
+            # The system prompt describes the step statically; the runtime error
+            # data (errors + spool + rows) is carried once by the Human task
+            # message in _analyse_diagnose, not injected here.
             ctmpl = sec("context_template")
-            context = (_resolve(ctmpl, {**ctx, "errors": _ctx_text(ec)})
-                       if ctmpl else _ctx_text(ec))
-            parts.append("## Context\n" + context)
+            if ctmpl:
+                # errors="" neutralises a leftover {{errors}} in an un-migrated
+                # template so it never leaks as a literal placeholder.
+                parts.append("## Context\n" + _resolve(ctmpl, {**ctx, "errors": ""}))
             for label, key in (("Goal", "goal"), ("Tools", "tools"),
-                               ("Instructions", "instructions"),
-                               ("Output Format", "output_format"), ("Rules", "rules")):
-                val = sec(key)
+                               ("Instructions", "instructions")):
+                val = instructions_text() if key == "instructions" else sec(key)
                 if val:
                     parts.append(f"## {label}\n" + _resolve(val, ctx))
-            system_prompt  = "\n\n".join(parts)
-            max_tool_calls = int(an.get("max_tool_calls", default_budget) or default_budget)
+            # Output/response formats are code-owned (see OUTPUT_FORMAT /
+            # RESPONSE_FORMAT) — appended here, not read from settings, so they
+            # always match the graph's result parser.
+            parts.append("## Output Format\n" + OUTPUT_FORMAT)
+            parts.append("## Response Format\n" + _resolve(
+                RESPONSE_FORMAT, {"max_tool_calls": str(max_tool_calls)}))
+            rules = sec("rules")
+            if rules:
+                parts.append("## Rules\n" + _resolve(rules, ctx))
+            # Normalise trailing whitespace per section so the join yields exactly
+            # one blank line between sections (YAML block scalars otherwise leave
+            # stray trailing \n that stack with the join separator).
+            system_prompt  = "\n\n".join(p.rstrip() for p in parts)
             return system_prompt, max_tool_calls
 
-        # Legacy path — single guidance blob
+        # Legacy path — single guidance blob. The blob is business-specific, so on
+        # a technical failure append the generic job-abort playbook (overridable via
+        # Base analysis_defaults.tech_instructions) after it.
         guidance = oe.get("analysis_guidance", "")
         retry    = state.get("retry_count", 0)
         max_ret  = step.get("max_retries", defs.get("max_retries", 3))
+        if technical:
+            playbook = ad.get("tech_instructions") or TECH_DIAGNOSIS_PLAYBOOK
+            guidance = (f"{guidance}\n\n"
+                        "When the background job aborted or the call failed, follow "
+                        f"this procedure:\n{playbook}").strip()
         system_prompt = (
             f"You are an SAP period-close error analyst.\n"
             f"Step: {step['step_id']} | {step.get('action_type')}/{step.get('object_name')}\n"
@@ -1291,6 +1398,18 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             f"Retry: {retry}/{max_ret}\n\nDomain guidance:\n{guidance}"
         )
         return system_prompt, default_budget
+
+    def _missing_analysis_sections(state: PeriodCloseState, step: dict) -> list[str]:
+        """Required analysis sections that resolve to nothing (step ⊕ analysis_defaults).
+
+        Only applies to the section-based path; legacy analysis_guidance steps are
+        exempt. Base is the single source, so an empty required section is a config
+        gap the operator should be told about rather than a silent fallback."""
+        an = (step.get("on_error", {}) or {}).get("analysis")
+        if not (isinstance(an, dict) and an):
+            return []
+        ad = state.get("analysis_defaults", {}) or {}
+        return [k for k in REQUIRED_ANALYSIS_SECTIONS if not (an.get(k) or ad.get(k))]
 
     async def _analyse_diagnose(state: PeriodCloseState, ec: dict, step: dict) -> dict:
         step_id = step["step_id"]
@@ -1301,7 +1420,23 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         await _emit({"type": "action_start", "step_id": step_id, "action": "analysis",
                      "message": f"Analysing error (attempt {retry + 1}/{max_ret})…"})
 
-        error_ctx = _ctx_text(ec)
+        missing = _missing_analysis_sections(state, step)
+        if missing:
+            diagnosis = ("Analysis settings are incomplete — these Base analysis "
+                         "settings are empty: " + ", ".join(missing) + ". Fill them "
+                         "in Settings → Company Base (or the step's on_error.analysis) "
+                         "and retry.")
+            logger.warning("analysis step=%s config incomplete: missing=%s",
+                           step_id, missing)
+            await _emit({"type": "action_end", "step_id": step_id, "action": "analysis",
+                         "status": "user_input", "message": diagnosis[:200]})
+            return {"current_analysis": {
+                "step_id": step_id, "action": "user_input", "corrected_params": None,
+                "diagnosis": diagnosis,
+                "user_instructions": "Complete the analysis settings, then retry the step.",
+                "tools_used": [], "status": "undetermined", "result": None,
+            }}
+
         system_prompt, max_tool_calls = _build_diagnose_system_prompt(state, step, ec)
 
         llm   = llms["analysis"]
@@ -1309,12 +1444,17 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         new_messages: list = []
         tools_used: list[str] = []
         try:
-            input_msgs   = prior + [HumanMessage(content=f"Error context:\n{error_ctx}")]
-            tool_schema  = await _get_tool_schema()
+            # The error data rides in a single Human task message. On retries the
+            # context is already in `prior` (analysis_messages), so append it only
+            # on the first attempt to avoid re-sending the whole spool each round.
+            input_msgs = list(prior)
+            if retry == 0 or not prior:
+                input_msgs = input_msgs + [
+                    HumanMessage(content=f"Error context:\n{_ctx_text(ec)}")]
             await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
                          "message": "Sending request to LLM…"})
             new_messages, tools_used, budget_exhausted = await _run_text_react(
-                llm, _call_tool, tool_schema, system_prompt,
+                llm, _call_tool, system_prompt,
                 input_msgs, _emit, step_id, max_tool_calls,
             )
             last_msg = new_messages[-1] if new_messages else None

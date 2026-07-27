@@ -310,7 +310,7 @@ def test_form_descriptor_object_name_has_action_type_path():
 def test_tool_catalog_merges_defaults_with_globals():
     # Defaults first, admin-added names appended, de-duplicated, order-stable.
     cat = config_settings.tool_catalog({"tools": ["TOOL_NEW", "TOOL_READ_TABLE", " "]})
-    assert cat[:3] == config_settings.DEFAULT_TOOLS
+    assert cat[:len(config_settings.DEFAULT_TOOLS)] == config_settings.DEFAULT_TOOLS
     assert cat[-1] == "TOOL_NEW"
     assert cat.count("TOOL_READ_TABLE") == 1
     assert "" not in cat

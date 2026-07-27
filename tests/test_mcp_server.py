@@ -11,7 +11,7 @@ import json
 import pytest
 
 import mcp_server
-from sap_connection_manager import HAS_PYRFC
+from sap_connection_manager import HAS_PYRFC, _StubConnection
 
 
 def test_running_in_stub_mode():
@@ -67,7 +67,8 @@ def test_submit_inline_returns_spool():
     spool = out["data"]["spool"]
     assert spool["available"] is True
     assert spool["line_count"] > 0
-    assert "settled successfully" in spool["text"]
+    # RKO7KO8G is the KO8G error fixture (settlement-rule KD205 failures).
+    assert "Settlement completed with errors." in spool["text"]
 
 
 def test_execute_fm_sync_ok():
@@ -99,13 +100,16 @@ def test_job_status_finished():
 # ---------------------------------------------------------------------------
 
 def test_read_spool_full():
+    # Full read (generous max_lines) returns every stub line, no truncation. Derive
+    # the expected count from the stub fixture so it tracks edits to the canned spool.
+    expected = len(_StubConnection._SPOOL_TEXT["RKO7KO8G"])
     out = mcp_server.sap_read_spool("STUB_RKO7KO8G", "00000001", max_lines=500)
     _assert_envelope(out)
     assert out["meta"]["truncated"] is False
-    assert out["meta"]["line_count"] == 6
+    assert out["meta"]["line_count"] == expected
     spool = out["data"]["spool"]
-    assert spool["line_count"] == 6
-    assert "settled successfully" in spool["text"]
+    assert spool["line_count"] == expected
+    assert "KD205" in spool["text"]
 
 
 def test_read_spool_truncates():

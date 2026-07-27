@@ -2529,6 +2529,7 @@ async function loadCompanySettings(code) {
   settingsState.runContext = data.run_context || {};
   settingsState.runOverride = {...settingsState.runContext};
   settingsState.override = data.override || {};   // the stored delta, edited in place
+  settingsState.analysisDefaults = data.analysis_defaults || {};   // for add-field prefill
   settingsState.savedOverride = JSON.parse(JSON.stringify(settingsState.override));
   settingsState.savedRunOverride = JSON.parse(JSON.stringify(settingsState.runOverride));
   settingsState.selectedStep = data.steps[0] ? data.steps[0].step_id : '__run_context__';
@@ -2659,15 +2660,14 @@ const FIELD_HELP = {
   'validate.keyword.source':  'What to scan: spool text / table rows / RFC messages',
   'validate.keyword.ok_patterns':    'Comma-separated substrings that indicate success',
   'validate.keyword.error_patterns': 'Comma-separated substrings that indicate failure',
-  'on_error.mode':             'How deep the AI analysis goes after a failure:\n• explain — cheap, read-only summary\n• diagnose — full ReAct investigation with SAP tools\nLeave as default to diagnose everything, or pick "Custom per failure type" to set a different depth for pre-check / execute / poll / validate failures.',
+  'on_error.mode':             'How deep the AI analysis goes after a failure:\n• explain — cheap, read-only summary\n• diagnose — full ReAct investigation with SAP tools\nLeave as default to use the sensible depth per stage (pre-check & execute → explain, poll & validate → diagnose), or pick "Custom per failure type" to override the depth for pre-check / execute / poll / validate failures.',
   'on_error.explain_prompt':   'Prompt used for the cheap "explain" depth — a short LLM summary of the finding shown to the operator (no SAP tool calls)',
-  'on_error.analysis.role':    'Persona/role the AI takes during full "diagnose" analysis, e.g. "You are an SAP FI consultant…"',
-  'on_error.analysis.context_template': 'Template describing the failure for the AI.\nSupports {{company_code}}, {{period}}, {{fiscal_year}} and {{errors}} placeholders — {{errors}} is replaced with the formatted error context',
+  'on_error.analysis.role':    'Inherited from Base → Analysis defaults unless added here. Persona/role the AI takes during "diagnose", e.g. "You are an SAP FI consultant…"',
+  'on_error.analysis.context_template': 'Static description of what this step does, shown to the AI as ## Context.\nSupports {{company_code}}, {{period}}, {{fiscal_year}}. The runtime errors/spool are sent separately, so no {{errors}} placeholder is needed.',
   'on_error.analysis.goal':    'What the AI should determine or achieve during the investigation',
-  'on_error.analysis.tools':   'Description of the diagnostic tools available to the AI (sap_read_table, sap_read_spool, sap_job_status, sap_check_period)',
+  'on_error.analysis.tools':   'Inherited from Base → Analysis defaults unless added here. Add to give THIS step its own tool list (e.g. trim the Base list to the tools relevant for this step).',
   'on_error.analysis.instructions': 'Step-by-step guidance for how the AI should investigate the failure',
-  'on_error.analysis.output_format': 'Required structure for the AI\'s final diagnosis, e.g. JSON with root_cause / action / params',
-  'on_error.analysis.rules':   'Constraints the AI must follow while diagnosing, e.g. "never post documents, only read data"',
+  'on_error.analysis.rules':   'Inherited from Base → Analysis defaults unless added here. Constraints the AI must follow, e.g. "never post documents, only read data".',
   'on_error.analysis.max_tool_calls': 'Maximum diagnostic tool calls the AI may make before it must conclude (overrides the global default)',
   'rollback.enabled':         'Enable a rollback action if the operator chooses to undo this step',
   'rollback.action_type':     'SAP operation type for the rollback call',
@@ -2689,9 +2689,9 @@ const GLOBAL_FIELD_HELP = {
   'llm_profiles.validation.temperature': 'Sampling temperature for the validation model (leave empty for the provider default)',
   'analysis_defaults.max_tool_calls':  'Default diagnostic tool-call budget for a step\'s on_error.analysis (a step can override this)',
   'analysis_defaults.role':            'Default persona/role used when a step\'s on_error.analysis.role is not set',
-  'analysis_defaults.tools':           'Default description of diagnostic tools used when a step\'s on_error.analysis.tools is not set',
-  'analysis_defaults.output_format':   'Default diagnosis output format used when a step\'s on_error.analysis.output_format is not set',
-  'analysis_defaults.rules':           'Default diagnosis constraints used when a step\'s on_error.analysis.rules is not set',
+  'analysis_defaults.tools':           'Default list of diagnostic tools for every step\'s analysis. A step can override (and trim) this in On error → Analysis → Tools.',
+  'analysis_defaults.tech_instructions': 'Diagnosis procedure used for technical failures — a job that aborted/timed out (poll) or an execute call that failed — instead of the step\'s business instructions. Leave unset to use the built-in job-abort playbook; a step can override in On error → Analysis → Technical playbook.',
+  'analysis_defaults.rules':           'Default diagnosis constraints for every step\'s analysis. A step can override this in On error → Analysis → Rules.',
 };
 
 function autoResizeTextareas(container) {
@@ -3471,7 +3471,7 @@ const ON_ERROR_MODE_SOURCES = [
   ['validate',  'Validate failure'],
 ];
 const ON_ERROR_MODE_OPTS = [
-  ['', '(default — diagnose)'],
+  ['', '(default — per stage)'],
   ['explain', 'explain — cheap read-only summary'],
   ['diagnose', 'diagnose — full AI investigation with SAP tools'],
 ];
@@ -3516,11 +3516,29 @@ function markFieldOverridden(path) {
   if (btn) btn.disabled = !on;
 }
 
+// Analysis sections that live globally in Base → Analysis defaults. When one is
+// added as a step override, seed it with the Base value (the same text the step
+// inherits at runtime) so the admin edits/trims a copy rather than starting blank.
+const INHERIT_ANALYSIS_DEFAULT = {
+  'on_error.analysis.role':  'role',
+  'on_error.analysis.tools': 'tools',
+  'on_error.analysis.rules': 'rules',
+};
+function baseAnalysisDefaults() {
+  if (settingsState.mode === 'base')
+    return (settingsState.globals && settingsState.globals.analysis_defaults) || {};
+  return settingsState.analysisDefaults || {};
+}
 function addFormField(path) {
   const ctx = formCtx(); if (!ctx) return;
   const f = findDescField(path);
-  const def = f.widget === 'bool' ? true : f.widget === 'list' ? []
+  let def = f.widget === 'bool' ? true : f.widget === 'list' ? []
     : f.widget === 'number' ? 0 : f.widget === 'select' ? (f.enum || [''])[0] : '';
+  const adKey = INHERIT_ANALYSIS_DEFAULT[path];
+  if (adKey) {
+    const bv = baseAnalysisDefaults()[adKey];
+    if (bv != null && bv !== '') def = bv;
+  }
   if (ctx.mode === 'base') { dotSet(ctx.model, path, def); markBaseDirty(); }
   else setLeaf(stepDelta(ctx.sid), path, def);
   renderSettingsFields();
@@ -3811,8 +3829,21 @@ function moveBaseStep(i, dir) {
 function renderGlobalsFields(box) {
   let html = '';
   (settingsState.descriptor.globals || []).forEach(g => {
-    let inner = `<div class="set-section-header">${esc(g.title)}</div>`;
-    g.fields.forEach(f => { inner += globalFieldHTML(f); });
+    // auto fields always show; optional (auto:false) fields only once they have a
+    // value — until then they live in the section's "+ Add field" menu.
+    const visible    = g.fields.filter(f => f.auto || dotGet(settingsState.globals, f.path) !== undefined);
+    const candidates = g.fields.filter(f => !f.auto && dotGet(settingsState.globals, f.path) === undefined);
+    let addMenu = '';
+    if (candidates.length) {
+      const menuId = 'gafm-' + g.key;
+      addMenu = `<div class="add-field-wrap">
+        <button class="add-field-btn" onclick="toggleAddFieldMenu('${menuId}')">＋ Add field</button>
+        <div class="add-field-menu" id="${menuId}">
+          ${candidates.map(f => `<button onclick="addGlobalField('${esc(f.path)}');event.stopPropagation()">${esc(f.label)}</button>`).join('')}
+        </div></div>`;
+    }
+    let inner = `<div class="set-section-header">${esc(g.title)}${addMenu}</div>`;
+    visible.forEach(f => { inner += globalFieldHTML(f); });
     html += `<div class="set-section">${inner}</div>`;
   });
   box.innerHTML = html;
@@ -3835,9 +3866,31 @@ function globalFieldHTML(f) {
   const help = GLOBAL_FIELD_HELP[f.path] || '';
   const tip = help ? `<span class="tip-icon">ⓘ<span class="tip-text">${esc(help)}</span></span>` : '';
   const pf = f.widget === 'textarea' ? ' prompt-field' : '';
-  return `<div class="set-field${pf}"><label>${esc(f.label)}${tip}</label><div class="ctl">${ctl}</div><span></span></div>`;
+  // Optional (auto:false) fields, once added, can be removed again.
+  const trail = (!f.auto && dotGet(settingsState.globals, f.path) !== undefined)
+    ? `<button class="del-field-btn" title="Remove field" onclick="removeGlobalField('${P}')">✕</button>`
+    : `<span></span>`;
+  return `<div class="set-field${pf}"><label>${esc(f.label)}${tip}</label><div class="ctl">${ctl}</div>${trail}</div>`;
 }
 function onGlobalEdit(path, value) { dotSet(settingsState.globals, path, value); markBaseDirty(); }
+function findGlobalField(path) {
+  for (const g of (settingsState.descriptor.globals || []))
+    for (const f of g.fields) if (f.path === path) return f;
+  return {widget: 'text'};
+}
+function addGlobalField(path) {
+  const f = findGlobalField(path);
+  const def = f.widget === 'bool' ? true : f.widget === 'list' ? []
+    : f.widget === 'number' ? 0 : f.widget === 'select' ? (f.enum || [''])[0] : '';
+  dotSet(settingsState.globals, path, def);
+  markBaseDirty();
+  renderGlobalsFields(document.getElementById('settings-fields'));
+}
+function removeGlobalField(path) {
+  dotDel(settingsState.globals, path);
+  markBaseDirty();
+  renderGlobalsFields(document.getElementById('settings-fields'));
+}
 
 // ═══════════════════════════════════════════════════════════
 //  Prompt (Markdown) editor — vendored CodeMirror + live preview
