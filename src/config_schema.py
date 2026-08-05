@@ -73,8 +73,35 @@ class ActionBlock(_Strict):
     """A runnable action used by pre_check and validate.run."""
     action_type: ActionType = "TOOLS"
     object_name: Optional[str] = None
+    connector: str = Field("sap_rfc", json_schema_extra={"label": "Connector", "widget": "text"})
     async_: bool = Field(False, alias="async")
     params: Optional[ParamsField] = None
+
+
+class Check(_Strict):
+    """One validation check (a "tab" in the UI).
+
+    Each check independently obtains an output — either by running its own action
+    (action_type/object_name/params, e.g. a table read) or, when it declares no
+    action, by inspecting the executed step's own spool/rows — and judges it against
+    its own condition (`mode`). A check emits a pass/fail; the step's final verdict
+    combines the *required* checks per `Validate.combine`. `required: false` makes a
+    check evidence-only (its output is gathered for analysis but does not gate).
+    Later checks may reference an earlier check's output via `{{<name>.rows_text}}` /
+    `{{<name>.spool_text}}` placeholders in their params.
+    """
+    name: Optional[str] = None
+    required: bool = True
+    action_type: Optional[ActionType] = None
+    object_name: Optional[str] = None
+    connector: str = Field("sap_rfc", json_schema_extra={"label": "Connector", "widget": "text"})
+    async_: bool = Field(False, alias="async")
+    test_run: Optional[bool] = None
+    params: Optional[ParamsField] = None
+    mode: Literal["keyword", "llm", "comparison"] = "keyword"
+    keyword: Optional[KeywordCheck] = None
+    llm: Optional[LlmCheck] = None
+    comparison: Optional[Comparison] = None
 
 
 class PreCheck(_Strict):
@@ -82,6 +109,7 @@ class PreCheck(_Strict):
     mode: Literal["skip", "comparison", "llm"] = "skip"
     action_type: Optional[ActionType] = None
     object_name: Optional[str] = None
+    connector: str = Field("sap_rfc", json_schema_extra={"label": "Connector", "widget": "text"})
     async_: bool = Field(False, alias="async")
     params: Optional[ParamsField] = None
     comparison: Optional[Comparison] = None
@@ -89,8 +117,13 @@ class PreCheck(_Strict):
 
 
 class Validate(_Strict):
+    # Legacy single-verdict fields (mode/run/keyword/llm) still supported. When
+    # `checks` is present it takes over: a list of independent checks combined by
+    # `combine` (all_pass = AND, any_pass = OR over the required checks).
     mode: Literal["keyword", "llm"] = "keyword"
+    combine: Literal["all_pass", "any_pass"] = "all_pass"
     run: Optional[ActionBlock] = None
+    checks: Optional[list[Check]] = None
     keyword: Optional[KeywordCheck] = None
     llm: Optional[LlmCheck] = None
 
@@ -99,6 +132,7 @@ class Rollback(_Strict):
     enabled: bool = False
     action_type: Optional[ActionType] = None
     object_name: Optional[str] = None
+    connector: str = Field("sap_rfc", json_schema_extra={"label": "Connector", "widget": "text"})
     async_: bool = Field(False, alias="async")
     test_run: Optional[bool] = None
     poll_timeout_sec: Optional[int] = None
@@ -130,6 +164,7 @@ class Step(_Strict):
     group: Optional[str] = Field(None, json_schema_extra={"group": "step"})
     action_type: ActionType = Field("SUBMIT", json_schema_extra={"group": "step"})
     object_name: Optional[str] = Field(None, json_schema_extra={"group": "step"})
+    connector: str = Field("sap_rfc", json_schema_extra={"group": "step", "label": "Connector", "widget": "text"})
     async_: bool = Field(True, alias="async", json_schema_extra={"group": "step"})
     test_run: Optional[bool] = Field(None, json_schema_extra={"group": "step"})
     poll_timeout_sec: Optional[int] = Field(None, json_schema_extra={"group": "step"})

@@ -240,6 +240,7 @@
     .an-sub-lbl { color: var(--text); font-family: var(--mono); word-break: break-word; }
     .an-sub-ok  { color: var(--ok); }
     .an-sub-x   { color: var(--failed); }
+    .an-sub-retry { color: var(--warn); }
     .det-pre {
       font-family: var(--mono); font-size: 11px; color: var(--text-dim);
       white-space: pre-wrap; word-break: break-all;
@@ -269,25 +270,36 @@
       align-items: center; justify-content: center;
     }
     #modal-overlay.visible { display: flex; }
+    /* Window hugs its content but never exceeds 90% of the viewport in either
+       axis. Header (h2) and footer (actions) stay fixed; the middle scrolls. */
     #modal {
       background: #252526; border: 1px solid #555; border-radius: 6px;
-      width: fit-content; min-width: 560px; max-width: calc(100vw - 40px);
-      max-height: 90vh; overflow-y: auto; padding: 20px 24px;
+      width: fit-content; min-width: 560px; max-width: 90vw;
+      max-height: 90vh; padding: 20px 24px;
+      display: flex; flex-direction: column; overflow: hidden;
     }
-    #modal h2 { font-size: 14px; font-weight: 600; color: var(--failed); margin-bottom: 14px; }
+    #modal h2 { font-size: 14px; font-weight: 600; color: var(--failed); margin-bottom: 14px; flex: 0 0 auto; }
+    #modal-body { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+    #modal-actions { flex: 0 0 auto; }
+    /* Each result table scrolls on its own so a long one (e.g. 20 rows) can't push
+       the window past its max height; the header row stays pinned while scrolling. */
+    #modal-errors, #modal-analysis, #modal-resolutions { max-height: 34vh; overflow: auto; }
+    #modal .det-table thead th { position: sticky; top: 0; z-index: 1; }
     .modal-section { margin-bottom: 14px; }
     .modal-section label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-dim); margin-bottom: 5px; }
+    .analysis-label { font-size: 11px; letter-spacing: .5px; color: var(--text-dim); text-transform: none; margin-left: 24px; }
     .modal-section .value { font-size: 12px; color: var(--text-bright); background: #1e1e1e; border-radius: 4px; padding: 8px 10px; white-space: pre-wrap; }
     .status-badge { font-size: 10px; text-transform: uppercase; letter-spacing: .5px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
     .status-badge.completed   { background: #1e3a2a; color: var(--ok); }
     .status-badge.partial     { background: #3c2a00; color: var(--warn); }
     .status-badge.undetermined{ background: #3a1e1e; color: var(--failed); }
-    /* Modal tables: window hugs content; every column except the last sizes to
-       its own content, and the last column absorbs the remaining window width. */
+    /* Every column wraps so long error / analysis / recommendation text never
+       overflows horizontally. Auto layout keeps short key columns (Object, ids)
+       compact while the free-text columns take the remaining width and wrap. */
     #modal .det-table { width: 100%; table-layout: auto; }
-    #modal .det-table th, #modal .det-table td { white-space: nowrap; }
-    #modal .det-table th:last-child, #modal .det-table td:last-child {
-      width: 100%; white-space: pre-wrap; word-break: break-word;
+    #modal .det-table th, #modal .det-table td {
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+      vertical-align: top;
     }
     #modal-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
     .modal-btn { padding: 6px 14px; border-radius: 4px; border: none; cursor: pointer; font-size: 12px; font-weight: 500; transition: opacity .15s; }
@@ -296,15 +308,6 @@
     .btn-execute { background: #3d5a80; color: #fff; }
     .btn-skip    { background: #4a4a4a; color: var(--text); }
     .btn-abort   { background: #6b2121; color: #fff; }
-    #param-override-wrap { margin-top: 10px; display: none; }
-    #param-override-wrap.visible { display: block; }
-    #param-override-wrap label { font-size: 11px; color: var(--text-dim); display: block; margin-bottom: 5px; }
-    #param-override {
-      width: 100%; height: 80px; background: #1e1e1e; color: var(--text);
-      border: 1px solid var(--border); border-radius: 4px;
-      padding: 6px; font-family: var(--mono); font-size: 12px; resize: vertical;
-    }
-    #param-override:focus { outline: 1px solid var(--accent); }
 
     /* rollback button — shown on hover over done (ok/skipped) steps */
     .step-rollback-btn {
@@ -618,24 +621,22 @@
 <div id="modal-overlay">
   <div id="modal">
     <h2>⚠ Operator Intervention Required</h2>
+    <div id="modal-body">
     <div class="modal-section"><label>Step</label>
-      <div class="value"><span id="modal-step"></span> <span id="modal-status-badge" class="status-badge" style="display:none"></span></div>
+      <div class="value"><span id="modal-step"></span> <span id="modal-analysis-label" class="analysis-label" style="display:none">Analysis:</span> <span id="modal-status-badge" class="status-badge" style="display:none"></span></div>
     </div>
     <div class="modal-section" id="modal-errors-wrap" style="display:none"><label>Errors</label><div id="modal-errors"></div></div>
     <div class="modal-section" id="modal-analysis-wrap" style="display:none"><label>Analysis result</label><div id="modal-analysis"></div></div>
     <div class="modal-section" id="modal-resolutions-wrap" style="display:none"><label>Recommendations</label><div id="modal-resolutions"></div></div>
     <div class="modal-section" id="modal-diagnosis-wrap"><label>Diagnosis</label><div id="modal-diagnosis" class="value"></div></div>
     <div class="modal-section" id="modal-instructions-wrap"><label>Instructions</label><div id="modal-instructions" class="value"></div></div>
-    <div id="param-override-wrap">
-      <label>Parameter overrides (JSON array, optional)</label>
-      <textarea id="param-override" placeholder='[{"name":"BUKRS","value":"RU06"}]'></textarea>
     </div>
     <div id="modal-actions">
       <button class="modal-btn btn-retry"   onclick="sendDecision('retry_from_precheck')">↺ Retry from Pre-check</button>
       <button class="modal-btn btn-execute" onclick="sendDecision('retry_from_execute')">▶ Retry Execute</button>
       <button class="modal-btn btn-skip"    onclick="sendDecision('skip_step')">⏭ Skip Step</button>
       <button class="modal-btn btn-abort"   onclick="sendDecision('abort')">✕ Abort Run</button>
-      <button class="modal-btn" style="background:#6b3a00;color:#ffb347;" onclick="openRollbackFromModal()">↩ Roll Back…</button>
+      <button id="modal-rollback-btn" class="modal-btn" style="background:#6b3a00;color:#ffb347;" onclick="openRollbackFromModal()">↩ Roll Back…</button>
     </div>
   </div>
 </div>
@@ -815,7 +816,7 @@
     border-radius:10px; padding:28px 28px 20px; width:340px;
     box-shadow:0 8px 32px rgba(0,0,0,.55);
   }
-  #settings-confirm-box h4 { margin:0 0 10px; font-size:14px; color:var(--text-bright,#e8edf5); }
+  #settings-confirm-box h4 { margin:0 0 10px; font-size:14px; color:#ff6b6b; }
   #settings-confirm-box p  { margin:0 0 22px; font-size:13px; color:var(--text,#c3cad6); line-height:1.5; }
   #settings-confirm-box .actions { display:flex; justify-content:flex-end; gap:8px; }
   #settings-confirm-box .actions button { padding:7px 18px; border-radius:6px; font-size:13px; cursor:pointer; }
@@ -885,6 +886,20 @@
   /* ── Schema-driven form: highlighted sticky section headers ── */
   .set-section { margin-top: 48px; }
   .set-section:first-child { margin-top: 2px; }
+
+  /* ── Step editor: top-level sections as tabs (non-scrolling bar above the fields) ── */
+  #settings-fields-col { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #settings-tabbar {
+    display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+    padding: 12px 18px 0; background: var(--panel, #1b1f27); border-bottom: 1px solid #2c313c;
+  }
+  #settings-tabbar:empty { display: none; }
+  #settings-tabbar .chk-tab {           /* folder tab, colored like the "Manage companies" button */
+    padding: 5px 11px; font-size: 12px; background: #222732; border-color: #2c313c;
+  }
+  #settings-tabbar .chk-tab:hover { color: #e8edf5; }
+  #settings-tabbar .chk-tab.active { background: #22314a; border-color: #34507a; color: #dbe7f7; }
+  /* Section header still used by the globals / run-context views (not tabbed). */
   .set-section-header {
     position: sticky; top: 0; z-index: 5;
     display:flex; align-items:center; gap:8px;
@@ -893,17 +908,23 @@
     font-size: 11px; text-transform: uppercase; letter-spacing:.6px;
     color: #a9b7cc; font-weight: 600;
   }
-  .set-section-header .add-field-wrap { margin-left:auto; position:relative; }
-  .set-section-header .add-field-btn {
-    background:#2b3346; border:1px solid #3a4256; color:#c3cad6;
-    border-radius:5px; padding:2px 8px; font-size:11px; cursor:pointer; text-transform:none; letter-spacing:0;
+  /* Per-section footer toolbar (＋ Add field / ＋ Add check) — moved out of the header. */
+  .set-section-footer {
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    margin-top:20px; padding-top:12px; border-top:1px solid #2c313c;
   }
-  .set-section-header .add-field-btn:hover { background:#333c52; color:#fff; }
+  .add-field-wrap { position:relative; margin-left:auto; }
+  .add-field-btn {
+    background:#2b3346; border:1px solid #3a4256; color:#c3cad6;
+    border-radius:5px; padding:3px 10px; font-size:11.5px; cursor:pointer; text-transform:none; letter-spacing:0;
+  }
+  .add-field-btn:hover { background:#333c52; color:#fff; }
   .add-field-menu {
     display:none; position:absolute; right:0; top:calc(100% + 4px); z-index:30;
     background:#1e2330; border:1px solid #3c4252; border-radius:6px; padding:4px;
     max-height:240px; overflow-y:auto; min-width:200px; box-shadow:0 6px 20px rgba(0,0,0,.5);
   }
+  .add-field-menu.up { top:auto; bottom:calc(100% + 4px); }
   .add-field-menu.open { display:block; }
   .add-field-menu button {
     display:block; width:100%; text-align:left; background:none; border:none; color:#c3cad6;
@@ -911,8 +932,11 @@
   }
   .add-field-menu button:hover { background:#2b3346; color:#fff; }
   .add-field-menu .empty { color:#6b7488; font-size:11.5px; padding:6px 9px; font-style:italic; }
-  .set-field .del-field-btn { background:none;border:none;color:#7b8494;cursor:pointer;font-size:13px;padding:6px 4px; }
-  .set-field .del-field-btn:hover { color:#e06c75; }
+  /* '−' remove-optional-field button: the inverse of ＋ Add field, NOT a destructive ✕.
+     Neutral colour + hover (never red) so it reads as "unset field", not "delete row". */
+  .set-field .del-field-btn { background:none;border:none;color:#7b8494;cursor:pointer;
+                              font-size:18px;line-height:1;font-weight:600;padding:2px 9px;border-radius:4px; }
+  .set-field .del-field-btn:hover { color:#c3cad6;background:rgba(255,255,255,.06); }
   /* Writable combobox (object_name under a TOOLS action) */
   .combo { position:relative; }
   .combo .combo-input { padding-right:26px !important; }
@@ -933,12 +957,12 @@
   .set-subheader {
     display: flex; align-items: center; gap: 10px;
     font-size: 11px; text-transform: uppercase; letter-spacing:.5px;
-    color: #6b7488; margin: 14px 0 8px; padding: 0;
+    color: #6b7488; margin: 32px 0 18px; padding: 0;
   }
   .set-subheader::before, .set-subheader::after {
     content: ""; flex: 1 1 auto; border-top: 1px solid #3a4152;
   }
-  .set-divider { border-top: 1px solid #6b7488; margin: 10px 8px 14px; }
+  .set-divider { border-top: 1px solid #6b7488; margin: 23px 8px 32px; }
 
   /* ── Param rows editor ── */
   .param-rows { display:flex; flex-direction:column; gap:6px; }
@@ -966,6 +990,30 @@
     width:100%; background:#11141a; color:#e8edf5; border:1px solid #2c313c;
     border-radius:6px; padding:6px 8px; font-size:12.5px; font-family:monospace; box-sizing:border-box; min-height:52px;
   }
+
+  /* ── Section tabs (folder-tab shape; colors set under #settings-tabbar) ── */
+  .chk-tab {
+    display:inline-flex; align-items:center; gap:6px; background:#1a2130;
+    border:1px solid #2c313c; color:#9aa4b4; border-radius:7px 7px 0 0; padding:6px 10px; font-size:12px; cursor:pointer;
+  }
+  .chk-fail-flag { color:#e0a24a; font-size:11px; }
+
+  /* ── Validate checks as top-right links (styled like the VERSION link) ── */
+  .chk-links {
+    display:flex; flex-wrap:wrap; gap:16px; align-items:center; justify-content:flex-end;
+    margin-bottom:10px;
+  }
+  .chk-link {
+    display:inline-flex; align-items:center; gap:5px;
+    background:none; border:none; cursor:pointer; padding:0 0 1px;
+    font-size:10px; text-transform:uppercase; letter-spacing:.4px;
+    color:#6b7488; border-bottom:1px dashed #6b7488;
+  }
+  .chk-link:hover { color:var(--text,#c3cad6); border-bottom-color:var(--text,#c3cad6); }
+  .chk-link.active { color:#9dc0ef; border-bottom-color:#9dc0ef; }
+  .chk-link.notreq { font-style:italic; opacity:.85; }
+  .chk-link .chk-x { font-size:11px; line-height:1; }
+  .chk-link .chk-x:hover { color:#e06c75; }
 
   /* ── Base-mode step list controls ── */
   .set-step .step-tools { margin-left:auto; display:none; gap:2px; }
@@ -1090,7 +1138,10 @@
     </div>
     <div id="settings-body">
       <div id="settings-steps"></div>
-      <div id="settings-fields"></div>
+      <div id="settings-fields-col">
+        <div id="settings-tabbar"></div>
+        <div id="settings-fields"></div>
+      </div>
     </div>
     <div id="settings-foot">
       <span class="msg">
@@ -1240,6 +1291,23 @@ function showDashboard() {
   setStatus('Ready');
   renderTabs();
   if (wsDashboard && wsDashboard.readyState !== WebSocket.OPEN) connectDashboardWS();
+  // Re-sync from the authoritative server status (same source as a full reload).
+  // Live WS events can be missed (e.g. a run that ended while viewing a detail
+  // tab), so refresh on every navigation to the dashboard.
+  refreshCompanies();
+}
+
+async function refreshCompanies() {
+  try {
+    const r = await fetch('/api/companies');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (Array.isArray(data)) {
+      appState.companies = data;
+      renderDashboard();
+      renderTabs();
+    }
+  } catch { /* keep last-known status on network error */ }
 }
 function showDetail(company) {
   appState.currentCompany = company;
@@ -1649,13 +1717,12 @@ function onRunInit(e) {
 
   appState.steps.forEach(s => {
     const saved = savedStatus[s.step_id];
-    if (saved === 'ok' || saved === 'skipped') {
-      appState.stepStatus[s.step_id]  = saved;
-      appState.stepActions[s.step_id] = savedActions[s.step_id] || [];
-    } else {
-      appState.stepStatus[s.step_id]  = 'pending';
-      appState.stepActions[s.step_id] = [];
-    }
+    const isDone = saved === 'ok' || saved === 'skipped';
+    appState.stepStatus[s.step_id] = isDone ? saved : 'pending';
+    // Preserve any prior action history — including the interrupted step being
+    // rolled back — so it stays visible above the Rollback ✓ / ↺ Restart marker
+    // instead of being wiped. onStepStart inserts the divider when it re-runs.
+    appState.stepActions[s.step_id] = savedActions[s.step_id] || [];
   });
 
   // Recompute nextEligibleStepIndex from any preserved statuses.
@@ -1840,6 +1907,7 @@ function onInterrupt(e) {
     badge.textContent = status;
     badge.className = 'status-badge ' + status;
     badge.style.display = '';
+    document.getElementById('modal-analysis-label').style.display = '';
 
     document.getElementById('modal-errors').innerHTML = renderErrorsTable(result.errors || []);
     document.getElementById('modal-analysis').innerHTML = renderAnalysisTable(result.analysis || []);
@@ -1852,6 +1920,7 @@ function onInterrupt(e) {
   } else {
     // Legacy text view
     badge.style.display = 'none';
+    document.getElementById('modal-analysis-label').style.display = 'none';
     errWrap.style.display = 'none';
     anWrap.style.display = 'none';
     resWrap.style.display = 'none';
@@ -1861,8 +1930,12 @@ function onInterrupt(e) {
     document.getElementById('modal-instructions').textContent = e.user_instructions || '';
   }
 
+  // Show "Roll Back…" only when this step defines an enabled rollback action.
+  const curStep = appState.steps.find(s => s.step_id === e.step_id);
+  document.getElementById('modal-rollback-btn').style.display =
+    (curStep && curStep.rollback_enabled) ? '' : 'none';
+
   document.getElementById('modal-overlay').classList.add('visible');
-  document.getElementById('param-override').value = '';
   setStatus(`⚠ Waiting for decision on ${e.step_id}`);
 }
 
@@ -2041,23 +2114,19 @@ function onRollbackEnd(e) {
 // ═══════════════════════════════════════════════════════════
 
 function showRollbackDialog(stepId) {
-  // Find all steps from stepId onwards that have status "ok" or "skipped"
+  // The restart target itself is always rolled back (it may have partially
+  // executed — e.g. an interrupted step that settled some objects), followed by
+  // any later steps that completed ("ok"/"skipped").
   const idx = appState.steps.findIndex(s => s.step_id === stepId);
   if (idx < 0) return;
   const stepsToRollback = appState.steps
     .slice(idx)
-    .filter(s => {
+    .filter((s, i) => {
+      if (i === 0) return true;
       const st = appState.stepStatus[s.step_id];
       return st === 'ok' || st === 'skipped';
     })
     .map(s => s.step_id);
-
-  if (stepsToRollback.length === 0) {
-    // Nothing actually completed at or after this step — just start from here
-    wsSend({type: 'start', ...(idx > 0 ? {start_from_step: stepId} : {})});
-    document.getElementById('btn-start').disabled = true;
-    return;
-  }
 
   appState.rollbackTargetStep = stepId;
   document.getElementById('rb-target-step').textContent = stepId;
@@ -2119,20 +2188,10 @@ function updateAllStepLockState() {
 // ═══════════════════════════════════════════════════════════
 
 function sendDecision(action) {
-  const raw = document.getElementById('param-override').value.trim();
-  let overrides = null;
-  if (raw) { try { overrides = JSON.parse(raw); } catch { alert('Invalid JSON in overrides'); return; } }
-  wsSend({type: 'decision', action, param_overrides: overrides});
+  wsSend({type: 'decision', action});
   document.getElementById('modal-overlay').classList.remove('visible');
   setStatus(`Decision sent: ${action}`);
 }
-
-document.querySelectorAll('.btn-retry, .btn-execute').forEach(btn => {
-  btn.addEventListener('click', () => document.getElementById('param-override-wrap').classList.add('visible'), true);
-});
-document.querySelectorAll('.btn-skip, .btn-abort').forEach(btn => {
-  btn.addEventListener('click', () => document.getElementById('param-override-wrap').classList.remove('visible'), true);
-});
 
 // ═══════════════════════════════════════════════════════════
 //  Start button
@@ -2174,13 +2233,17 @@ function renderSidebar() {
     item.className = 'step-item';
     item.dataset.stepId = s.step_id;
     item.dataset.status = 'pending';
+    // Rollback-on-hover button only exists for steps that define an enabled rollback.
+    const rbBtnHtml = s.rollback_enabled
+      ? `<button class="step-rollback-btn" title="Roll back and restart from this step">↩</button>`
+      : '';
     item.innerHTML = `
       <div class="step-icon">${statusIcon('pending')}</div>
       <div class="step-meta">
         <div class="step-id">${s.step_id}</div>
         <div class="step-desc">${s.description || ''}</div>
       </div>
-      <button class="step-rollback-btn" title="Roll back and restart from this step">↩</button>`;
+      ${rbBtnHtml}`;
 
     item.addEventListener('click', (e) => {
       if (e.target.classList.contains('step-rollback-btn')) return;
@@ -2193,7 +2256,8 @@ function renderSidebar() {
       }
       selectStep(s.step_id);
     });
-    item.querySelector('.step-rollback-btn').addEventListener('click', (e) => {
+    const rbBtn = item.querySelector('.step-rollback-btn');
+    if (rbBtn) rbBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (appState.running && !appState.interrupted) {
         showToast('Cannot roll back while a run is in progress');
@@ -2303,6 +2367,7 @@ function renderAnalysisSubsteps(substeps, status) {
   const rows = substeps.map(s => {
     const ic = s.status === 'running' ? '<span class="spinner"></span>'
              : s.status === 'error'   ? '<span class="an-sub-x">✗</span>'
+             : s.status === 'retry'   ? '<span class="an-sub-retry">↻</span>'
              : '<span class="an-sub-ok">✓</span>';
     const kind = s.kind === 'tool' ? '🔧' : '🧠';
     return `<div class="an-substep"><span class="an-sub-ic">${ic}</span>` +
@@ -2353,6 +2418,17 @@ function renderDetail(action, detail) {
     const errCount = detail.error_count ?? 0;
     const errIcon = errCount > 0 ? ' <span style="color:var(--failed)">✗</span>' : '';
     parts.push(`<div class="det-row"><span class="det-lbl">Verdict:</span> <span class="${vcls}"><b>${esc((detail.verdict || '').toUpperCase())}</b></span> &nbsp;·&nbsp; <span class="det-lbl">Errors:</span> ${errCount}${errIcon}</div>`);
+    if (Array.isArray(detail.checks) && detail.checks.length > 0) {
+      const rows = detail.checks.map(c => {
+        const pass = c.passed;
+        const cls = pass ? 'det-pass' : (c.verdict === 'escalate' ? 'det-fail' : 'det-warn');
+        const req = c.required === false ? ' <span class="det-lbl">(evidence)</span>' : '';
+        return `<tr><td>${esc(c.name)}${req}</td>` +
+               `<td><span class="${cls}">${pass ? '✓' : '✗'} ${esc((c.verdict||'').toUpperCase())}</span></td>` +
+               `<td>${esc(c.reasoning || '')}</td></tr>`;
+      }).join('');
+      parts.push(`<table class="det-table"><tr><th>Check</th><th>Verdict</th><th>Reasoning</th></tr>${rows}</table>`);
+    }
     const errList = (detail.errors && detail.errors.length > 0) ? detail.errors
       : (() => { try { const p = JSON.parse(detail.reasoning || ''); return Array.isArray(p) ? p : null; } catch { return null; } })();
     if (errList && errList.length > 0) {
@@ -2606,12 +2682,17 @@ function renderBaseRail(box) {
 
 function selectSettingsStep(sid) {
   settingsState.selectedStep = sid;
+  settingsState.activeCheckTab = 0;   // validate checks: reset the open tab per step
+  settingsState.activeFormSection = null;   // section tabs: reopen at the first section per step
   renderSettingsSteps();
   renderSettingsFields();
 }
 
 // ── Right pane ───────────────────────────────────────────────
 function renderSettingsFields() {
+  // Only the step editor uses the section tab bar; clear it for globals / run-context views.
+  const tb = document.getElementById('settings-tabbar');
+  if (tb) tb.innerHTML = '';
   return settingsState.mode === 'base' ? renderBaseFields() : renderCompanyFields();
 }
 
@@ -3268,12 +3349,34 @@ function baseValueOf(ctx, path) {
 }
 
 function renderStepForm(box) {
+  const tabbar = document.getElementById('settings-tabbar');
   const ctx = formCtx();
-  if (!ctx) { box.innerHTML = '<div class="diff-empty" style="padding:20px">Select a step, or add one.</div>'; return; }
-  let html = '';
-  settingsState.descriptor.sections.forEach(sec => { html += renderFormSection(ctx, sec); });
-  box.innerHTML = html;
+  if (!ctx) {
+    if (tabbar) tabbar.innerHTML = '';
+    box.innerHTML = '<div class="diff-empty" style="padding:20px">Select a step, or add one.</div>';
+    return;
+  }
+  const sections = settingsState.descriptor.sections;
+  // Sections are shown one at a time behind a tab bar (order preserved from the descriptor).
+  // The tab bar lives in its own non-scrolling row (#settings-tabbar) above the fields, so
+  // content never slides under or over it.
+  let active = settingsState.activeFormSection;
+  if (!active || !sections.some(s => s.key === active)) active = sections[0].key;
+  settingsState.activeFormSection = active;
+
+  if (tabbar) tabbar.innerHTML = sections.map(sec => {
+    const title = esc(SECTION_TITLES[sec.key] || sec.key);
+    return `<div class="chk-tab${sec.key === active ? ' active' : ''}" onclick="selectFormSection('${esc(sec.key)}')">
+              <span>${title}</span></div>`;
+  }).join('');
+
+  box.innerHTML = renderFormSection(ctx, sections.find(s => s.key === active));
   autoResizeTextareas(box);
+}
+
+function selectFormSection(key) {
+  settingsState.activeFormSection = key;
+  renderStepForm(document.getElementById('settings-fields'));
 }
 
 // ── writable combobox (object_name under a TOOLS action) ──
@@ -3329,6 +3432,13 @@ function renderBaseFields() {
 const STATIC_WIDGETS = new Set(['label', 'divider']);
 
 function renderFormSection(ctx, sec) {
+  // The Validate section has a bespoke multi-check ("tabs") editor rather than the flat
+  // path-driven fields, so it owns its own renderer. Everything else is generic.
+  if (sec.key === 'validate') return renderValidateSection(ctx);
+  return renderGenericSection(ctx, sec);
+}
+
+function renderGenericSection(ctx, sec) {
   // fields to show: auto fields whenever their show_when matches (even if a stale value
   // lingers from before the condition changed — a value alone never keeps an auto field
   // visible); optional fields additionally need a value, since they're only ever shown
@@ -3343,22 +3453,376 @@ function renderFormSection(ctx, sec) {
     f.widget !== 'params' && !STATIC_WIDGETS.has(f.widget) && !f.auto &&
     showWhenMatches(ctx.model, f.show_when) && dotGet(ctx.model, f.path) === undefined);
 
-  let addMenu = '';
+  // The section title now lives in the tab; only its ＋ Add field control remains,
+  // relocated to a footer toolbar at the very end of the section (menu opens upward).
+  let footer = '';
   if (candidates.length) {
     const menuId = 'afm-' + sec.key;
-    addMenu = `<div class="add-field-wrap">
+    footer = `<div class="set-section-footer"><div class="add-field-wrap">
       <button class="add-field-btn" onclick="toggleAddFieldMenu('${menuId}')">＋ Add field</button>
-      <div class="add-field-menu" id="${menuId}">
+      <div class="add-field-menu up" id="${menuId}">
         ${candidates.map(f => `<button onclick="addFormField('${esc(f.path)}');event.stopPropagation()">${esc(f.label)}</button>`).join('')}
-      </div></div>`;
+      </div></div></div>`;
   }
-  let html = `<div class="set-section-header">${esc(SECTION_TITLES[sec.key] || sec.key)}${addMenu}</div>`;
+  let html = '';
   visible.forEach(f => {
     if (f.widget === 'label') html += `<div class="set-subheader">${esc(f.label)}</div>`;
     else if (f.widget === 'divider') html += `<div class="set-divider"></div>`;
     else html += f.widget === 'params' ? renderParamsEditor(ctx, f) : formFieldHTML(ctx, f);
   });
-  return `<div class="set-section">${html}</div>`;
+  return `<div class="set-section">${html}${footer}</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Validate section — multi-check ("tabs") editor
+//
+//  A step's validate can be either the legacy single verdict (validate.run + mode)
+//  or a list of independent checks (validate.checks) combined by validate.combine.
+//  Each check is a tab: its own action + mode + condition, judged independently; the
+//  final verdict combines the *required* checks (all_pass = AND, any_pass = OR).
+//  The array is edited directly (the dot-path engine can't address array indices):
+//  base mode mutates the step; company mode overrides the whole checks list as one
+//  delta leaf (mergeStep replaces arrays wholesale).
+// ═══════════════════════════════════════════════════════════
+
+const CHECK_MODES  = ['keyword', 'llm', 'comparison'];
+const CMP_SELECT   = ['first', 'last', 'empty', 'non_empty'];
+const CMP_OPERATOR = ['eq', 'ne', 'gt', 'lt', 'ge', 'le', 'contains'];
+const KW_SOURCE    = ['spool', 'rows', 'messages'];
+const ACTION_OPTS  = ['', 'SUBMIT', 'FM', 'BAPI', 'BDC', 'TOOLS'];   // '' = inspect step output
+
+function validateChecks(ctx) {
+  const v = dotGet(ctx.model, 'validate') || {};
+  return Array.isArray(v.checks) ? v.checks : [];
+}
+function activeCheckIdx(ctx) {
+  const n = validateChecks(ctx).length;
+  let i = settingsState.activeCheckTab || 0;
+  if (i >= n) i = 0;
+  return i;
+}
+
+/** Run `fn(checks)` against a writable checks array, persist it, and re-render.
+ *  Pass rerender:false for per-keystroke text edits so the focused input survives. */
+function mutateChecks(ctx, fn, rerender = true) {
+  let checks;
+  if (ctx.mode === 'base') {
+    if (!ctx.model.validate || typeof ctx.model.validate !== 'object') ctx.model.validate = {};
+    if (!Array.isArray(ctx.model.validate.checks)) ctx.model.validate.checks = [];
+    checks = ctx.model.validate.checks;
+    fn(checks);
+    markBaseDirty();
+  } else {
+    // Seed the delta override from the effective list on first edit, then edit in place.
+    const delta = stepDelta(ctx.sid);
+    let arr = leafGet(delta, 'validate.checks');
+    if (!Array.isArray(arr)) {
+      arr = JSON.parse(JSON.stringify(validateChecks(ctx)));
+      setLeaf(delta, 'validate.checks', arr);
+    }
+    checks = arr;
+    fn(checks);
+  }
+  if (rerender) renderSettingsFields();
+  renderSettingsSteps();
+}
+
+function setCombine(value) {
+  const ctx = formCtx(); if (!ctx) return;
+  if (ctx.mode === 'base') {
+    if (!ctx.model.validate) ctx.model.validate = {};
+    ctx.model.validate.combine = value;
+    markBaseDirty();
+  } else {
+    setLeaf(stepDelta(ctx.sid), 'validate.combine', value);
+  }
+  renderSettingsSteps();
+}
+
+function addCheck() {
+  const ctx = formCtx(); if (!ctx) return;
+  mutateChecks(ctx, checks => {
+    // Names are auto-assigned and non-editable, so pick the first check_N not already in use.
+    const used = new Set(checks.map(c => c.name));
+    let n = checks.length + 1; while (used.has('check_' + n)) n++;
+    checks.push({name: 'check_' + n, required: true, mode: 'keyword',
+                 keyword: {source: 'spool', error_patterns: []}});
+    settingsState.activeCheckTab = checks.length - 1;
+  });
+}
+
+function removeCheck(idx) {
+  const ctx = formCtx(); if (!ctx) return;
+  const name = (validateChecks(ctx)[idx] || {}).name || ('check_' + (idx + 1));
+  showConfirm('Delete check', 'Delete check "' + name + '"? This cannot be undone.', 'Delete', () => {
+    mutateChecks(ctx, checks => {
+      checks.splice(idx, 1);
+      if (settingsState.activeCheckTab >= checks.length)
+        settingsState.activeCheckTab = Math.max(0, checks.length - 1);
+    }, false);
+    // Removing the last check drops the empty checks/combine structure so Validate reverts
+    // cleanly to single-verdict (no lingering empty array). Base mode owns the whole document.
+    if (ctx.mode === 'base' && !validateChecks(ctx).length) {
+      const v = dotGet(ctx.model, 'validate') || {};
+      delete v.checks; delete v.combine;
+    }
+    renderSettingsFields(); renderSettingsSteps();
+  });
+}
+
+function selectCheckTab(idx) {
+  settingsState.activeCheckTab = idx;
+  renderSettingsFields();
+}
+
+// Convert a legacy single-verdict validate into one equivalent check (base mode only).
+function convertValidateToChecks() {
+  const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
+  const v = dotGet(ctx.model, 'validate') || {};
+  const chk = {name: 'check_1', required: true, mode: v.mode || 'keyword'};
+  if (v.run) { chk.action_type = v.run.action_type; chk.object_name = v.run.object_name;
+               if (v.run.async) chk.async = true; if (v.run.params) chk.params = v.run.params; }
+  if (v.keyword) chk.keyword = v.keyword;
+  if (v.llm) chk.llm = v.llm;
+  if (!ctx.model.validate) ctx.model.validate = {};
+  ctx.model.validate = {combine: 'all_pass', checks: [chk]};
+  settingsState.activeCheckTab = 0;
+  markBaseDirty();
+  renderSettingsFields(); renderSettingsSteps();
+}
+
+// ── per-check field setters (operate on the active check) ──
+function setCheckField(idx, path, value, rerender) {
+  const ctx = formCtx(); if (!ctx) return;
+  mutateChecks(ctx, checks => {
+    const chk = checks[idx]; if (!chk) return;
+    const segs = path.split('.');
+    let node = chk;
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (node[segs[i]] == null || typeof node[segs[i]] !== 'object') node[segs[i]] = {};
+      node = node[segs[i]];
+    }
+    const leaf = segs[segs.length - 1];
+    if (value === undefined || value === null || value === '') delete node[leaf];
+    else node[leaf] = value;
+  }, rerender);
+}
+function setCheckBool(idx, path, value) {   // booleans are meaningful even when false
+  const ctx = formCtx(); if (!ctx) return;
+  mutateChecks(ctx, checks => { if (checks[idx]) checks[idx][path] = value; });
+}
+function setCheckList(idx, path, raw) {      // comma-separated → string[]
+  const arr = raw.split(',').map(s => s.trim()).filter(Boolean);
+  setCheckField(idx, path, arr.length ? arr : undefined, false);
+}
+function editCheckPrompt(idx, path, label) {
+  const ctx = formCtx(); if (!ctx) return;
+  const chk = validateChecks(ctx)[idx] || {};
+  openPromptEditor(label, String(dotGet(chk, path) || ''), text => {
+    setCheckField(idx, path, text || undefined, true);
+  });
+}
+// When action_type changes, clear the now-irrelevant siblings (TOOLS never polls).
+function setCheckAction(idx, value) {
+  const ctx = formCtx(); if (!ctx) return;
+  mutateChecks(ctx, checks => {
+    const chk = checks[idx]; if (!chk) return;
+    if (!value) { delete chk.action_type; delete chk.object_name; delete chk.params; delete chk.async; }
+    else { chk.action_type = value; if (value === 'TOOLS') delete chk.async; }
+  });
+}
+function setCheckMode(idx, value) {
+  setCheckField(idx, 'mode', value, true);
+}
+
+// ── check TOOLS/param dict editing (key→value grid) ──
+function checkParamDict(ctx, idx) {
+  const chk = validateChecks(ctx)[idx] || {};
+  return (chk.params && !Array.isArray(chk.params)) ? chk.params : {};
+}
+function setCheckParamVal(idx, key, value) {
+  setCheckField(idx, 'params.' + key, value, false);
+}
+function setCheckParamKey(idx, oldKey, newKey) {
+  newKey = (newKey || '').trim();
+  const ctx = formCtx(); if (!ctx || newKey === oldKey) return;
+  mutateChecks(ctx, checks => {
+    const chk = checks[idx]; if (!chk || !chk.params) return;
+    if (!newKey) { delete chk.params[oldKey]; return; }
+    const rebuilt = {};
+    Object.keys(chk.params).forEach(k => { rebuilt[k === oldKey ? newKey : k] = chk.params[k]; });
+    chk.params = rebuilt;
+  });
+}
+function addCheckParamRow(idx) {
+  const ctx = formCtx(); if (!ctx) return;
+  mutateChecks(ctx, checks => {
+    const chk = checks[idx]; if (!chk) return;
+    if (!chk.params || Array.isArray(chk.params)) chk.params = {};
+    let n = 1, key = 'param'; while (chk.params[key] !== undefined) key = 'param' + (++n);
+    chk.params[key] = '';
+  });
+}
+function removeCheckParam(idx, key) {
+  const ctx = formCtx(); if (!ctx) return;
+  showConfirm('Delete parameter', 'Delete parameter "' + key + '"?', 'Delete', () => {
+    mutateChecks(ctx, checks => { if (checks[idx] && checks[idx].params) delete checks[idx].params[key]; });
+  });
+}
+
+function renderValidateSection(ctx) {
+  const checks = validateChecks(ctx);
+  if (!checks.length) {
+    // No checks yet: single-verdict fields, ending with a ＋ Add check link (base only).
+    // Adding the first check switches to multi-check; removing the last reverts here.
+    const sec = settingsState.descriptor.sections.find(s => s.key === 'validate');
+    const base = renderGenericSection(ctx, sec);
+    if (ctx.mode !== 'base') return base;
+    const add = `<div class="chk-links"><button class="param-add-btn"
+                   onclick="convertValidateToChecks()">＋ Add check</button></div>`;
+    return base.replace('<div class="set-section">', '<div class="set-section">' + add);
+  }
+  return renderChecksEditor(ctx, checks);
+}
+
+function renderChecksEditor(ctx, checks) {
+  const combine = (dotGet(ctx.model, 'validate.combine')) || 'all_pass';
+  const active = activeCheckIdx(ctx);
+  const company = ctx.mode === 'company';
+  const overridden = company && leafExists(stepDelta(ctx.sid), 'validate.checks');
+
+  // Checks are top-right links; the active check's editor fills the body below.
+  const body = checks[active] ? renderCheckEditor(ctx, checks[active], active) : '';
+
+  const links = checks.map((c, i) => {
+    const label = esc(c.name || ('check_' + (i + 1)));
+    const req = c.required === false ? ' notreq' : '';
+    const flag = c.required === false ? '<span class="chk-fail-flag" title="Evidence only — does not gate">◇</span>' : '';
+    return `<button class="chk-link${i === active ? ' active' : ''}${req}" onclick="selectCheckTab(${i})">
+              ${flag}<span>${label}</span>
+              <span class="chk-x" title="Remove check"
+                    onclick="event.stopPropagation();removeCheck(${i})">✕</span></button>`;
+  }).join('');
+
+  let resetMark = '';
+  if (company) resetMark = overridden
+      ? `<button class="reset-btn" title="Revert checks to base" onclick="unsetLeaf(stepDelta('${esc(ctx.sid)}'),'validate.checks');pruneDelta();renderSettingsFields();renderSettingsSteps()">↺ reset</button>`
+      : `<span class="inherited-tag" style="font-size:11px;color:#6b7488">(inherited)</span>`;
+
+  const linksRow = `<div class="chk-links">${links}
+      <button class="param-add-btn" onclick="addCheck()">＋ Add check</button>${resetMark}</div>`;
+
+  // Combine only matters once two or more required checks exist; shown as a labelled field
+  // (Mode style) under its own subheader, at the end of the section.
+  const requiredCount = checks.filter(c => c.required !== false).length;
+  const combineBlock = requiredCount >= 2 ? `
+      <div class="set-subheader">Verdict</div>
+      <div class="set-field">
+        <label>Combine <span class="tip-icon">ⓘ<span class="tip-text">How the required checks combine into the step verdict.</span></span></label>
+        <div class="ctl">
+          <select onchange="setCombine(this.value)">
+            <option value="all_pass" ${combine==='all_pass'?'selected':''}>all must pass (AND)</option>
+            <option value="any_pass" ${combine==='any_pass'?'selected':''}>any may pass (OR)</option>
+          </select>
+        </div>
+      </div>` : '';
+
+  return `<div class="set-section">${linksRow}${body}${combineBlock}</div>`;
+}
+
+function renderCheckEditor(ctx, chk, idx) {
+  const company = ctx.mode === 'company';
+  const at = chk.action_type || '';
+  const mode = chk.mode || 'keyword';
+  const sel = (val, opts) => opts.map(o =>
+    `<option value="${esc(o)}" ${o===val?'selected':''}>${esc(o||'(step output)')}</option>`).join('');
+
+  const field = (label, ctl, help) =>
+    `<div class="set-field"><label>${esc(label)}${help?` <span class="tip-icon">ⓘ<span class="tip-text">${esc(help)}</span></span>`:''}</label>
+       <div class="ctl">${ctl}</div><span></span></div>`;
+
+  let html = '';
+  // Name is auto-assigned (check_1, check_2, …) and shown as the tab label / reference key,
+  // so it is not editable here — other checks reference this one's output via {{check_N.rows_text}}.
+  html += field('Required', `<input type="checkbox" ${chk.required!==false?'checked':''}
+      onchange="setCheckBool(${idx},'required',this.checked)">`,
+      'On = this check gates the step verdict. Off = evidence only (gathered for analysis, never fails the step).');
+  html += field('Action type', `<select onchange="setCheckAction(${idx},this.value)">${sel(at, ACTION_OPTS)}</select>`,
+      'What produces this check\'s output. (step output) reuses the executed step\'s own spool/rows; otherwise run a dedicated action.');
+
+  if (at) {
+    // Object name — combobox with the tool catalog when TOOLS, plain text otherwise.
+    if (at === 'TOOLS') {
+      const tools = settingsState.descriptor.tools || [];
+      const opts = tools.map(t => `<div class="combo-opt" onmousedown="comboPick(this, '${esc(t)}')">${esc(t)}</div>`).join('');
+      html += field('Object name',
+        `<div class="combo"><input type="text" class="combo-input" data-path="__check_obj_${idx}" autocomplete="off"
+             value="${esc(chk.object_name||'')}"
+             oninput="setCheckField(${idx},'object_name',this.value,false); comboFilter(this)"
+             onfocus="comboShow(this)" onkeydown="comboKey(event, this)">
+           <button type="button" class="combo-caret" tabindex="-1" onmousedown="event.preventDefault()" onclick="comboToggle(this)">▾</button>
+           <div class="combo-menu">${opts}</div></div>`);
+    } else {
+      html += field('Object name', `<input type="text" value="${esc(chk.object_name||'')}"
+          oninput="setCheckField(${idx},'object_name',this.value,false)">`);
+      html += field('Async', `<input type="checkbox" ${chk.async?'checked':''}
+          onchange="setCheckBool(${idx},'async',this.checked)">`, 'Run as a background job and poll (false = wait inline).');
+    }
+    // Params (key→value grid — same shape as TOOLS params elsewhere)
+    html += `<div class="set-subheader">Params</div>`;
+    const d = checkParamDict(ctx, idx);
+    const rows = Object.keys(d).map(k =>
+      `<div class="param-row param-kv">
+        <input class="param-key" value="${esc(k)}" placeholder="Param"
+               onchange="setCheckParamKey(${idx},'${esc(k)}',this.value)">
+        <input class="param-val" value="${esc(d[k]==null?'':d[k])}" placeholder="Value"
+               oninput="setCheckParamVal(${idx},'${esc(k)}',this.value)">
+        <button class="rm" title="Remove" onclick="removeCheckParam(${idx},'${esc(k)}')">✕</button>
+      </div>`).join('');
+    html += `<div class="param-rows">${rows}</div>
+      <button class="param-add-btn" onclick="addCheckParamRow(${idx})">＋ Add parameter</button>`;
+  }
+
+  html += `<div class="set-subheader">Condition</div>`;
+  html += field('Mode', `<select onchange="setCheckMode(${idx},this.value)">${sel(mode, CHECK_MODES)}</select>`,
+      'How to judge this check\'s output:\n• keyword — scan for ok/error patterns\n• llm — AI verdict\n• comparison — mechanical row/value test');
+
+  if (mode === 'keyword') {
+    const kw = chk.keyword || {};
+    html += field('Source', `<select onchange="setCheckField(${idx},'keyword.source',this.value)">${sel(kw.source||'spool', KW_SOURCE)}</select>`);
+    html += field('OK patterns', `<input type="text" value="${esc((kw.ok_patterns||[]).join(', '))}"
+        oninput="setCheckList(${idx},'keyword.ok_patterns',this.value)">`, 'Comma-separated; presence means success.');
+    html += field('Error patterns', `<input type="text" value="${esc((kw.error_patterns||[]).join(', '))}"
+        oninput="setCheckList(${idx},'keyword.error_patterns',this.value)">`, 'Comma-separated; presence means failure.');
+  } else if (mode === 'llm') {
+    const lc = chk.llm || {};
+    const preview = s => { const t = String(s||'').trim(); return t ? esc(t.slice(0,400)) : '(empty)'; };
+    html += `<div class="set-field prompt-field"><label>LLM · system prompt</label><div class="ctl">
+        <div class="prompt-preview ${(lc.system_prompt||'').trim()?'':'empty'}">${preview(lc.system_prompt)}</div>
+        <button class="prompt-expand-btn" onclick="editCheckPrompt(${idx},'llm.system_prompt','LLM · system prompt')">✎ Edit</button>
+      </div><span></span></div>`;
+    html += `<div class="set-field prompt-field"><label>LLM · prompt</label><div class="ctl">
+        <div class="prompt-preview ${(lc.prompt||'').trim()?'':'empty'}">${preview(lc.prompt)}</div>
+        <button class="prompt-expand-btn" onclick="editCheckPrompt(${idx},'llm.prompt','LLM · prompt')">✎ Edit</button>
+      </div><span></span></div>`;
+    html += field('LLM · pass values', `<input type="text" value="${esc((lc.pass_values||[]).join(', '))}"
+        oninput="setCheckList(${idx},'llm.pass_values',this.value)">`, 'Optional: single-word verdicts that count as pass (e.g. yes, ok). Leave blank for JSON-verdict mode.');
+    html += field('LLM · max spool lines', `<input type="text" value="${esc(lc.max_spool_lines==null?'':lc.max_spool_lines)}"
+        oninput="setCheckField(${idx},'llm.max_spool_lines',numOrNull(this.value),false)">`);
+  } else {
+    const cm = chk.comparison || {};
+    html += field('Select', `<select onchange="setCheckField(${idx},'comparison.select',this.value)">${sel(cm.select||'first', CMP_SELECT)}</select>`,
+        'empty / non_empty test the row count; first / last pick a row for a field comparison.');
+    const rowCmp = (cm.select === 'empty' || cm.select === 'non_empty') ? false : true;
+    if (rowCmp) {
+      html += field('Field', `<input type="text" value="${esc(cm.field||'')}"
+          oninput="setCheckField(${idx},'comparison.field',this.value,false)">`, 'Column in the selected row to test.');
+      html += field('Operator', `<select onchange="setCheckField(${idx},'comparison.operator',this.value)">${sel(cm.operator||'eq', CMP_OPERATOR)}</select>`);
+      html += field('Value', `<input type="text" value="${esc(cm.value==null?'':cm.value)}"
+          oninput="setCheckField(${idx},'comparison.value',this.value,false)">`);
+    }
+  }
+  return html;
 }
 
 function formFieldHTML(ctx, f) {
@@ -3421,7 +3885,7 @@ function formFieldHTML(ctx, f) {
                      onclick="resetFormField('${P}')">↺ reset</button>`;
   } else {
     trail = (!f.auto && val !== undefined)
-      ? `<button class="del-field-btn" title="Remove field" onclick="removeFormField('${P}')">✕</button>`
+      ? `<button class="del-field-btn" title="Hide" onclick="removeFormField('${P}')">−</button>`
       : `<span></span>`;
   }
   const pf = f.widget === 'textarea' ? ' prompt-field' : '';
@@ -3691,17 +4155,20 @@ function addParam(path) {
 
 function removeParam(path, i) {
   const ctx = formCtx(); if (!ctx) return;
-  if (ctx.mode === 'base') {
-    const list = ensureParamList(ctx.model, path);
-    list.splice(i, 1); if (!list.length) dotDel(ctx.model, path);
-    markBaseDirty();
-  } else {
-    // company mode only offers ✕ on delta-only rows; base rows reset instead
-    const row = (dotGet(ctx.model, path) || [])[i];
-    if (row) resetParam(path, row.selname);
-    return;
-  }
-  renderSettingsFields(); renderSettingsSteps();
+  const row = (dotGet(ctx.model, path) || [])[i];
+  const nm = row ? (row.selname || '') : '';
+  showConfirm('Delete parameter', 'Delete parameter' + (nm ? ' "' + nm + '"' : '') + '?', 'Delete', () => {
+    if (ctx.mode === 'base') {
+      const list = ensureParamList(ctx.model, path);
+      list.splice(i, 1); if (!list.length) dotDel(ctx.model, path);
+      markBaseDirty();
+    } else {
+      // company mode only offers ✕ on delta-only rows; base rows reset instead
+      if (row) resetParam(path, row.selname);
+      return;
+    }
+    renderSettingsFields(); renderSettingsSteps();
+  });
 }
 
 /** Drop one param's override so the base parameter applies again. */
@@ -3753,10 +4220,12 @@ function onParamDictKeyEdit(path, oldKey, newKey) {
 /** Base mode: remove a TOOLS param key outright. */
 function removeParamDict(path, key) {
   const ctx = formCtx(); if (!ctx || ctx.mode !== 'base') return;
-  const d = dotGet(ctx.model, path);
-  if (d && !Array.isArray(d)) delete d[key];
-  markBaseDirty();
-  renderSettingsFields(); renderSettingsSteps();
+  showConfirm('Delete parameter', 'Delete parameter "' + key + '"?', 'Delete', () => {
+    const d = dotGet(ctx.model, path);
+    if (d && !Array.isArray(d)) delete d[key];
+    markBaseDirty();
+    renderSettingsFields(); renderSettingsSteps();
+  });
 }
 
 /** Base mode: add an empty TOOLS param row inline (Param + Value editable in place). The
@@ -3868,7 +4337,7 @@ function globalFieldHTML(f) {
   const pf = f.widget === 'textarea' ? ' prompt-field' : '';
   // Optional (auto:false) fields, once added, can be removed again.
   const trail = (!f.auto && dotGet(settingsState.globals, f.path) !== undefined)
-    ? `<button class="del-field-btn" title="Remove field" onclick="removeGlobalField('${P}')">✕</button>`
+    ? `<button class="del-field-btn" title="Hide" onclick="removeGlobalField('${P}')">−</button>`
     : `<span></span>`;
   return `<div class="set-field${pf}"><label>${esc(f.label)}${tip}</label><div class="ctl">${ctl}</div>${trail}</div>`;
 }

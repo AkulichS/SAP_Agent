@@ -7,12 +7,13 @@ globals:
     reset_each_run: true
   llm_profiles:
     analysis:
-      provider: openrouter
-      model: meta-llama/llama-3.3-70b-instruct
-      temperature: 0
-    validation:
       provider: groq
       model: openai/gpt-oss-120b
+      temperature: 0
+      tool_mode: native
+    validation:
+      provider: openrouter
+      model: meta-llama/llama-3.3-70b-instruct
       temperature: 0
   analysis_defaults:
     max_tool_calls: 8
@@ -184,25 +185,46 @@ steps:
       pass_values:
       - 'yes'
   validate:
-    mode: llm
-    llm:
-      max_spool_lines: 300
-      system_prompt: You are an SAP job-log analyser. Respond ONLY with the JSON object
-        requested. No prose.
-      prompt: "Respond strictly in the specified format:\n\n{\n  \"error_count\":\
-        \ integer,\n  \"errors\": [\n    {\n      \"sender\": string|null,\n     \
-        \ \"msg_type\": \"E\"|\"A\"|\"X\",\n      \"msg_num\": string|null,\n    \
-        \  \"message\": string\n    }\n  ]\n}\n\nRules:\n- Only messages of types\
-        \ E, A, X count as errors.\n- \"sender\" extracted from a row like \"Sender:\
-        \ ...\".\n- \"msg_num\" has the format 2 letters + 3 digits, e.g. KB101.\n\
-        - \"message\" is located in the \"Message text\" column.\n- If there are no\
-        \ errors, return {\"error_count\": 0, \"errors\": []}\n\nText:\n\n{{spool_text}}\n"
-    run:
+    combine: all_pass
+    checks:
+    # Check 1 — read the settlement job's spool and have the LLM count E/A/X errors.
+    - name: check_1
+      required: true
       action_type: TOOLS
       object_name: TOOL_READ_JOB_SPOOL
       params:
         jobname: '{{job_name}}'
         jobcount: '{{job_id}}'
+      mode: llm
+      llm:
+        max_spool_lines: 300
+        system_prompt: You are an SAP job-log analyser. Respond ONLY with the JSON
+          object requested. No prose.
+        prompt: "Respond strictly in the specified format:\n\n{\n  \"error_count\":\
+          \ integer,\n  \"errors\": [\n    {\n      \"sender\": string|null,\n     \
+          \ \"msg_type\": \"E\"|\"A\"|\"X\",\n      \"msg_num\": string|null,\n    \
+          \  \"message\": string\n    }\n  ]\n}\n\nRules:\n- Only messages of types\
+          \ E, A, X count as errors.\n- \"sender\" extracted from a row like \"Sender:\
+          \ ...\".\n- \"msg_num\" has the format 2 letters + 3 digits, e.g. KB101.\n\
+          - \"message\" is located in the \"Message text\" column.\n- If there are\
+          \ no errors, return {\"error_count\": 0, \"errors\": []}\n\nText:\n\n{{spool_text}}\n"
+    # Check 2 — confirm every settled order now carries a zero balance. Reads the CO
+    # totals table for any order line with a non-zero value; comparison passes only
+    # when that read is EMPTY. NOTE: adjust `table`/`fields`/`where` to your system's
+    # settlement object (COSS/COSP totals, the relevant value type/period selection).
+    - name: check_2
+      required: true
+      action_type: TOOLS
+      object_name: TOOL_READ_TABLE
+      params:
+        table: COSS
+        fields: OBJNR,WRTTP,PERBL,WKG001
+        where: KOKRS = '{{controlling_area}}' AND GJAHR = '{{fiscal_year}}' AND WRTTP
+          = '04' AND WKG001 <> 0
+        max_rows: '999'
+      mode: comparison
+      comparison:
+        select: empty
   rollback:
     enabled: true
     action_type: SUBMIT
@@ -252,22 +274,24 @@ steps:
       instructions: "## Diagnostic Procedure (follow steps in order; do NOT skip to\
         \ assumptions)\n\n### Step 1: Retrieve order master data\nUse sap_read_table\
         \ on table AUFK, fields:\n  AUFNR, PHAS0, PHAS1, PHAS2, PHAS3, LOEKZ\nWHERE\
-        \ AUFNR IN (<failed order numbers from the Errors list>).\nOrder-number formatting:\n\
-        - Digits only → pad with leading zeros to 12 chars (\"20001\" → \"000000020001\"\
-        ).\n- Contains any letter → use exactly as provided (\"F0K01023\" → \"F0K01023\"\
-        ).\n  \n### Step 2: Check order status (most common cause)\n| PHAS1 | PHAS2\
-        \ | PHAS3 | LOEKZ | System Status | Settlement allowed? |\n|-------|-------|-------|-------|---------------|---------------------|\n\
+        \ AUFNR IN (<the failed order numbers from the Errors list>).\n\nOrder-number\
+        \ formatting (apply to each order taken ONLY from the \"Errors:\" block):\n\
+        - If digits only → left-pad with zeros to 12 characters (e.g. a 5-digit id\
+        \ ddddd becomes 0000000ddddd).\n- If contains any letter → use exactly as\
+        \ provided, unchanged.\n  \n### Step 2: Check order status (most common cause)\n\
+        | PHAS1 | PHAS2 | PHAS3 | LOEKZ | System Status | Settlement allowed? |\n\
+        |-------|-------|-------|-------|---------------|---------------------|\n\
         | 1 | 0 | 0 | (empty) | REL (Released / ТЗКР)            | YES |\n| 0 | 0\
         \ | 0 | (empty) | CRTD (Created / ТЗАК)            | NO — not yet released\
         \ |\n| 1 | 1 | 0 | (empty) | TECO (Technically closed / ТКЗК) | NO — technically\
         \ closed |\n| any | any | 1 | (empty) | CLSD (Closed / ЗАКР)          | NO\
         \ — order is closed |\n| any | any | any | X   | DLFL (Deletion flag / УДАЛ)\
         \      | NO — marked for deletion |\nAlso: PHAS0 = 'X' - means order status\
-        \ Open → cannot be settled yet.\n\n### Step 3: Check settlement rule existence\n\
-        Use sap_read_table on table COBRB, fields OBJNR, PROZS\nWHERE OBJNR IN (<\"\
-        OR\" + AUFNR as stored in AUFK>).\n- No records → settlement rule missing\
-        \ → fix in KO02 (Settlement Rule tab).\n- Records found but PROZS does not\
-        \ sum to 100 → settlement rule incomplete.\n\n### Step 4: Cross-reference\
+        \ Open → NO — cannot be settled yet.\n\n### Step 3: Check settlement rule\
+        \ existence\nUse sap_read_table on table COBRB, fields OBJNR, PROZS\nWHERE\
+        \ OBJNR IN (<\"OR\" + AUFNR as stored in AUFK>).\n- No records → settlement\
+        \ rule missing → fix in KO02 (Settlement Rule tab).\n- Records found but PROZS\
+        \ does not sum to 100 → settlement rule incomplete.\n\n### Step 4: Cross-reference\
         \ with error messages\nMatch findings against the KO8G error messages in the\
         \ task message to confirm the root cause for each order, then group orders\
         \ that share the same fix.\n"

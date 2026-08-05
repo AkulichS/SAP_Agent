@@ -28,6 +28,13 @@
           "default": null,
           "title": "Object Name"
         },
+        "connector": {
+          "default": "sap_rfc",
+          "label": "Connector",
+          "title": "Connector",
+          "type": "string",
+          "widget": "text"
+        },
         "async": {
           "default": false,
           "title": "Async",
@@ -101,6 +108,148 @@
         }
       },
       "title": "Analysis",
+      "type": "object"
+    },
+    "Check": {
+      "additionalProperties": false,
+      "description": "One validation check (a \"tab\" in the UI).\n\nEach check independently obtains an output \u2014 either by running its own action\n(action_type/object_name/params, e.g. a table read) or, when it declares no\naction, by inspecting the executed step's own spool/rows \u2014 and judges it against\nits own condition (`mode`). A check emits a pass/fail; the step's final verdict\ncombines the *required* checks per `Validate.combine`. `required: false` makes a\ncheck evidence-only (its output is gathered for analysis but does not gate).\nLater checks may reference an earlier check's output via `{{<name>.rows_text}}` /\n`{{<name>.spool_text}}` placeholders in their params.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "action_type": {
+          "anyOf": [
+            {
+              "enum": [
+                "SUBMIT",
+                "FM",
+                "BAPI",
+                "BDC",
+                "TOOLS"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Action Type"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Object Name"
+        },
+        "connector": {
+          "default": "sap_rfc",
+          "label": "Connector",
+          "title": "Connector",
+          "type": "string",
+          "widget": "text"
+        },
+        "async": {
+          "default": false,
+          "title": "Async",
+          "type": "boolean"
+        },
+        "test_run": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Run"
+        },
+        "params": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Param"
+              },
+              "type": "array"
+            },
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Params"
+        },
+        "mode": {
+          "default": "keyword",
+          "enum": [
+            "keyword",
+            "llm",
+            "comparison"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "keyword": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeywordCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "llm": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LlmCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "comparison": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Comparison"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "Check",
       "type": "object"
     },
     "Comparison": {
@@ -406,6 +555,13 @@
           "default": null,
           "title": "Object Name"
         },
+        "connector": {
+          "default": "sap_rfc",
+          "label": "Connector",
+          "title": "Connector",
+          "type": "string",
+          "widget": "text"
+        },
         "async": {
           "default": false,
           "title": "Async",
@@ -495,6 +651,13 @@
           "default": null,
           "title": "Object Name"
         },
+        "connector": {
+          "default": "sap_rfc",
+          "label": "Connector",
+          "title": "Connector",
+          "type": "string",
+          "widget": "text"
+        },
         "async": {
           "default": false,
           "title": "Async",
@@ -559,6 +722,15 @@
           "title": "Mode",
           "type": "string"
         },
+        "combine": {
+          "default": "all_pass",
+          "enum": [
+            "all_pass",
+            "any_pass"
+          ],
+          "title": "Combine",
+          "type": "string"
+        },
         "run": {
           "anyOf": [
             {
@@ -569,6 +741,21 @@
             }
           ],
           "default": null
+        },
+        "checks": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Check"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Checks"
         },
         "keyword": {
           "anyOf": [
@@ -654,6 +841,14 @@
       "default": null,
       "group": "step",
       "title": "Object Name"
+    },
+    "connector": {
+      "default": "sap_rfc",
+      "group": "step",
+      "label": "Connector",
+      "title": "Connector",
+      "type": "string",
+      "widget": "text"
     },
     "async": {
       "default": true,

@@ -42,11 +42,16 @@ def _exec_env(*, data=None, messages=None, status="ok",
             "data": data or {}}
 
 
-def _spool_data(text, *, available=True, lines=None):
-    """data payload carrying a normalised spool {available, line_count, text}."""
-    return {"spool": {"available": available,
-                      "line_count": lines if lines is not None else len(text.splitlines()),
-                      "text": text}}
+def _text_data(text, *, available=True, lines=None):
+    """Neutral data payload: {text: {available, line_count, text}}.
+
+    This is the canonical connector-envelope shape — the SAP RFC emits its output
+    on the neutral ``text`` channel natively (no connector translation), so use
+    this both when injecting ``current_execute`` directly and when faking what
+    ``sap_execute_step`` returns."""
+    return {"text": {"available": available,
+                     "line_count": lines if lines is not None else len(text.splitlines()),
+                     "text": text}}
 
 
 def _job(state):
@@ -142,10 +147,10 @@ def _submit_result(*, status="ok", spool_rows=None, spool_text="", spool_status=
     spool_status "S" = the report ran and its spool was read (available=True); anything
     else (e.g. "E") = job finished but spool unreadable → available=False.
     """
-    data = {"status": "completed"}
+    data: dict = {}
     if spool_rows is not None:
-        data["spool"] = {"available": spool_status == "S",
-                         "line_count": spool_rows, "text": spool_text}
+        data["text"] = {"available": spool_status == "S",
+                        "line_count": spool_rows, "text": spool_text}
     return _exec_env(status=status, data=data)
 
 
@@ -237,14 +242,18 @@ async def test_execute_submit_async(make_session, make_state):
 
 
 async def test_execute_submit_inline(make_session, make_state):
+    # The RFC emits its inline-wait output on the neutral "text" channel; the
+    # connector forwards it untouched (no spool→text translation anymore).
     session = make_session(sap_execute_step=_exec_env(
-        job_name="J", job_id="7", data=_spool_data("ok line")))
+        job_name="J", job_id="7",
+        data={"text": {"available": True, "line_count": 1, "text": "ok line"}}))
     node = make_execute_node(session)
     step = {"step_id": "A", "action_type": "SUBMIT", "object_name": "RKO", "async": False}
     out = await node(make_state([step]))
     ex = out["current_execute"]
     assert ex["status"] == "ok" and ex["meta"]["requires_poll"] is False
-    assert ex["data"]["spool"]["text"] == "ok line"
+    assert "spool" not in ex["data"]
+    assert ex["data"]["text"]["text"] == "ok line"
 
 
 async def test_execute_fm_error(make_session, make_state):
@@ -316,7 +325,7 @@ async def test_validate_keyword_spool_ok(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "spool", "ok_patterns": ["done"], "error_patterns": ["FATAL"]}})
-    state = make_state([step], current_execute=_exec_env(data=_spool_data("operation done")))
+    state = make_state([step], current_execute=_exec_env(data=_text_data("operation done")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
 
@@ -325,7 +334,7 @@ async def test_validate_keyword_spool_error_retries(make_session, make_llms, mak
     node = make_validate_node(make_session(), make_llms())
     step = _vstep({"mode": "keyword", "keyword": {
         "source": "spool", "ok_patterns": ["done"], "error_patterns": ["error"]}})
-    state = make_state([step], current_execute=_exec_env(data=_spool_data("bad error here")))
+    state = make_state([step], current_execute=_exec_env(data=_text_data("bad error here")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "retry"
     assert out["current_validate"]["error_count"] == 1
@@ -353,7 +362,7 @@ async def test_validate_llm_ok(make_session, make_llms, make_state):
     llms = make_llms(validation='{"verdict":"ok","error_count":0,"reasoning":"fine"}')
     node = make_validate_node(make_session(), llms)
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
+    state = make_state([step], current_execute=_exec_env(data=_text_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "ok"
     assert out["current_validate"]["error_count"] == 0
@@ -363,7 +372,7 @@ async def test_validate_llm_retry(make_session, make_llms, make_state):
     llms = make_llms(validation='{"verdict":"retry","error_count":2,"reasoning":"bad"}')
     node = make_validate_node(make_session(), llms)
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
+    state = make_state([step], current_execute=_exec_env(data=_text_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "retry"
     assert out["current_validate"]["error_count"] == 2
@@ -374,7 +383,7 @@ async def test_validate_llm_retry(make_session, make_llms, make_state):
 async def test_validate_llm_non_json_escalates(make_session, make_llms, make_state):
     node = make_validate_node(make_session(), make_llms(validation="totally not json"))
     step = _vstep({"mode": "llm", "llm": {"prompt": "ok?"}})
-    state = make_state([step], current_execute=_exec_env(data=_spool_data("x")))
+    state = make_state([step], current_execute=_exec_env(data=_text_data("x")))
     out = await node(state)
     assert out["current_validate"]["verdict"] == "escalate"
 
@@ -384,7 +393,7 @@ async def test_validate_run_verification_action(make_session, make_llms, make_st
     session = make_session(sap_run_tool=_table_result([{"KOKRS": "X500"}]))
     node = make_validate_node(session, make_llms())
     step = _vstep({"mode": "keyword",
-                   "run": {"action_type": "TOOLS", "object_name": "COKP",
+                   "run": {"action_type": "TOOLS", "object_name": "TOOL_READ_TABLE",
                            "params": {"table": "COKP"}},
                    "keyword": {"source": "rows", "ok_patterns": ["x500"],
                                "error_patterns": ["FATAL"]}})
@@ -399,7 +408,7 @@ async def test_validate_run_job_spool_resolves_placeholders(make_session, make_l
     # validate.run calls an explicit tool (TOOL_READ_JOB_SPOOL) and resolves this step's
     # job id from the poll result into the {{job_name}}/{{job_id}} param placeholders.
     spool_env = {"status": "ok", "messages": [], "meta": {"object_name": "TOOL_READ_JOB_SPOOL"},
-                 "data": {"spool": {"available": True, "line_count": 1, "text": "settlement done"}}}
+                 "data": {"text": {"available": True, "line_count": 1, "text": "settlement done"}}}
     session = make_session(sap_run_tool=spool_env)
     node = make_validate_node(session, make_llms())
     step = _vstep({"mode": "keyword",
@@ -417,6 +426,109 @@ async def test_validate_run_job_spool_resolves_placeholders(make_session, make_l
                              "test_run": True}) in session.calls
 
 
+# --- multi-check validate (validate.checks[] + combine) ---
+
+async def test_validate_checks_all_pass(make_session, make_llms, make_state):
+    # spool keyword (own output) + balance table comparison (empty) — both pass.
+    session = make_session(sap_run_tool=_table_result([]))
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"combine": "all_pass", "checks": [
+        {"name": "spool", "mode": "keyword",
+         "keyword": {"source": "spool", "error_patterns": ["FATAL"]}},
+        {"name": "balances", "action_type": "TOOLS", "object_name": "TOOL_READ_TABLE",
+         "params": {"table": "COSS", "where": "WKGBTR <> 0"},
+         "mode": "comparison", "comparison": {"select": "empty"}},
+    ]})
+    state = make_state([step], current_execute=_exec_env(data=_text_data("settlement done")))
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "ok"
+    assert "current_error_context" not in out
+
+
+async def test_validate_checks_one_fails_aggregates(make_session, make_llms, make_state):
+    # balance table has a non-zero row → comparison empty fails → retry, with the
+    # offending rows folded into one ErrorContext for analysis.
+    session = make_session(sap_run_tool=_table_result([{"OBJNR": "OR1", "WKGBTR": "100"}]))
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"combine": "all_pass", "checks": [
+        {"name": "spool", "mode": "keyword",
+         "keyword": {"source": "spool", "error_patterns": ["FATAL"]}},
+        {"name": "balances", "action_type": "TOOLS", "object_name": "TOOL_READ_TABLE",
+         "params": {"table": "COSS"}, "mode": "comparison", "comparison": {"select": "empty"}},
+    ]})
+    state = make_state([step], current_execute=_exec_env(data=_text_data("done")))
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "retry"
+    ec = out["current_error_context"]
+    assert ec["source"] == "validate" and ec["default_depth"] == "diagnose"
+    assert ec["rows"] and ec["rows"][0]["OBJNR"] == "OR1"
+
+
+async def test_validate_checks_any_pass(make_session, make_llms, make_state):
+    # combine any_pass: the balance check fails but the spool check passes → ok.
+    session = make_session(sap_run_tool=_table_result([{"WKGBTR": "100"}]))
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"combine": "any_pass", "checks": [
+        {"name": "spool", "mode": "keyword",
+         "keyword": {"source": "spool", "ok_patterns": ["done"], "error_patterns": ["FATAL"]}},
+        {"name": "balances", "action_type": "TOOLS", "object_name": "TOOL_READ_TABLE",
+         "params": {"table": "COSS"}, "mode": "comparison", "comparison": {"select": "empty"}},
+    ]})
+    state = make_state([step], current_execute=_exec_env(data=_text_data("done")))
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "ok"
+
+
+async def test_validate_checks_evidence_only_does_not_gate(make_session, make_llms, make_state):
+    # The spool check is required:false and would fail ('done' matches an error pattern),
+    # but only the required balance check gates the step → ok.
+    session = make_session(sap_run_tool=_table_result([]))
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"checks": [
+        {"name": "spool", "required": False, "mode": "keyword",
+         "keyword": {"source": "spool", "error_patterns": ["done"]}},
+        {"name": "balances", "action_type": "TOOLS", "object_name": "TOOL_READ_TABLE",
+         "params": {"table": "COSS"}, "mode": "comparison", "comparison": {"select": "empty"}},
+    ]})
+    state = make_state([step], current_execute=_exec_env(data=_text_data("done")))
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "ok"
+
+
+async def test_validate_checks_resolve_job_placeholders(make_session, make_llms, make_state):
+    # A check that runs its own tool resolves this step's {{job_name}}/{{job_id}}.
+    spool_env = {"status": "ok", "messages": [], "meta": {},
+                 "data": {"text": {"available": True, "line_count": 1, "text": "settlement done"}}}
+    session = make_session(sap_run_tool=spool_env)
+    node = make_validate_node(session, make_llms())
+    step = _vstep({"checks": [
+        {"name": "spool", "action_type": "TOOLS", "object_name": "TOOL_READ_JOB_SPOOL",
+         "params": {"jobname": "{{job_name}}", "jobcount": "{{job_id}}"},
+         "mode": "keyword",
+         "keyword": {"source": "spool", "ok_patterns": ["done"], "error_patterns": ["FATAL"]}},
+    ]})
+    state = make_state([step],
+                       current_execute=_exec_env(requires_poll=True, job_name="J", job_id="42"),
+                       current_poll={"job_name": "J", "job_id": "42", "sap_status": "FINISHED"})
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "ok"
+    assert ("sap_run_tool", {"object_name": "TOOL_READ_JOB_SPOOL",
+                             "params_json": json.dumps({"jobname": "J", "jobcount": "42"}),
+                             "test_run": True}) in session.calls
+
+
+async def test_validate_checks_llm_mode(make_session, make_llms, make_state):
+    llms = make_llms(validation='{"verdict":"retry","error_count":3,"reasoning":"nonzero"}')
+    node = make_validate_node(make_session(), llms)
+    step = _vstep({"checks": [
+        {"name": "spool", "mode": "llm", "llm": {"prompt": "count errors {{spool_text}}"}},
+    ]})
+    state = make_state([step], current_execute=_exec_env(data=_text_data("x")))
+    out = await node(state)
+    assert out["current_validate"]["verdict"] == "retry"
+    assert out["current_validate"]["error_count"] == 3
+
+
 # ===========================================================================
 # analysis_node  (source-aware dispatcher: explain vs diagnose)
 # ===========================================================================
@@ -426,23 +538,20 @@ _DIAGNOSE_CTX = {"source": "validate", "summary": "bad", "spool_text": "boom",
                  "error_count": 1, "default_depth": "diagnose"}
 
 
-async def test_analysis_retry_decision(make_session, make_llms, make_state, patch_react_agent):
-    patch_react_agent('{"action":"retry","corrected_params":null,'
-                      '"diagnosis":"transient","user_instructions":null}')
-    node = make_analysis_node(make_session(), make_llms())
-    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
-    out = await node(state)
-    assert out["current_analysis"]["action"] == "retry"
-    assert out["retry_count"] == 1
-
-
-async def test_analysis_skip_decision(make_session, make_llms, make_state, patch_react_agent):
-    patch_react_agent('{"action":"skip","corrected_params":null,'
-                      '"diagnosis":"benign","user_instructions":null}')
-    node = make_analysis_node(make_session(), make_llms())
-    state = make_state([{"step_id": "A"}], retry_count=0, current_error_context=_DIAGNOSE_CTX)
-    out = await node(state)
-    assert out["current_analysis"]["action"] == "skip"
+async def test_analysis_diagnose_always_user_input(make_session, make_llms, make_state,
+                                                   patch_react_agent):
+    # The diagnose analyst produces evidence only; the graph always escalates to the
+    # operator, who decides retry/skip/abort by button. So even when the model's reply
+    # suggests retry or skip, the node forces action=user_input (and keeps the diagnosis).
+    for suggested in ("retry", "skip"):
+        patch_react_agent(f'{{"action":"{suggested}","result":{{"status":"completed",'
+                          '"errors":[],"resolutions":[]},"diagnosis":"x"}')
+        node = make_analysis_node(make_session(), make_llms())
+        state = make_state([{"step_id": "A"}], retry_count=0,
+                           current_error_context=_DIAGNOSE_CTX)
+        out = await node(state)
+        assert out["current_analysis"]["action"] == "user_input"
+        assert out["retry_count"] == 1
 
 
 async def test_analysis_non_json_requires_user_input(make_session, make_llms, make_state,
@@ -570,6 +679,205 @@ async def test_analysis_diagnose_section_prompt_assembled(make_session, make_llm
     assert "boom" not in sysmsg                     # spool_text from _DIAGNOSE_CTX
     assert "Error context:" in captured["human"] and "boom" in captured["human"]
     assert out["current_analysis"]["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# Native tool-calling mode (llm_profiles.analysis.tool_mode == "native")
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from langchain_core.messages import AIMessage
+
+
+class _NativeFakeLLM:
+    """Fake ChatOpenAI that supports native function-calling: ``bind_tools`` records
+    the schemas and returns self; ``ainvoke`` replays a scripted list of AIMessages
+    (a tool-call turn, then a final-answer turn). A scripted item that is an Exception
+    is raised instead of returned — used to simulate a provider rejecting a tool call."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.bound_schemas = None
+        self.calls = []
+
+    def bind_tools(self, schemas):
+        self.bound_schemas = schemas
+        return self
+
+    async def ainvoke(self, messages):
+        self.calls.append(messages)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _native_session(make_session):
+    """FakeMCPSession that also advertises read-only + one mutating tool schema."""
+    session = make_session(sap_read_table={"status": "ok", "messages": [],
+                                            "data": {"rows": [{"AUFNR": "FK01"}]}})
+
+    async def _list_tools():
+        return SimpleNamespace(tools=[
+            SimpleNamespace(name="sap_read_table", description="Read an SAP table",
+                            inputSchema={"type": "object",
+                                         "properties": {"table": {"type": "string"}}}),
+            SimpleNamespace(name="sap_run_tool", description="mutating",
+                            inputSchema={"type": "object"}),
+        ])
+
+    session.list_tools = _list_tools
+    return session
+
+
+_NATIVE_STATE_KW = dict(
+    retry_count=0, current_error_context=_DIAGNOSE_CTX,
+    llm_profiles={"analysis": {"tool_mode": "native"}},
+    analysis_defaults={"role": "analyst", "tools": "sap_read_table",
+                       "goal": "diagnose", "rules": "be honest"},
+)
+_NATIVE_STEP = {"step_id": "KO8G",
+                "on_error": {"analysis": {"instructions": "read AUFK",
+                                          "max_tool_calls": 4}}}
+
+
+async def test_analysis_native_mode_calls_tool_then_json_final(make_session, make_llms,
+                                                               make_state):
+    # native mode: the model makes a REAL tool call (AIMessage.tool_calls), the loop
+    # executes it via the MCP session, then the model closes with the SAME
+    # {status,errors,resolutions} final_answer JSON the text loop uses.
+    final = json.dumps({"type": "final_answer", "action": "user_input",
+                        "result": {"status": "completed",
+                                   "errors": [{"object_id": "FK01", "error": "KD205",
+                                               "cause": "settlement rule missing",
+                                               "analysis": "AUFK returned the order"}],
+                                   "resolutions": [{"recommendation": "Maintain rule in KO02",
+                                                    "affected_objects": ["FK01"]}]}})
+    script = [
+        AIMessage(content="", tool_calls=[{"name": "sap_read_table",
+                                           "args": {"table": "AUFK"}, "id": "c1"}]),
+        AIMessage(content=final),
+    ]
+    session = _native_session(make_session)
+    llms = make_llms()
+    llms["analysis"] = _NativeFakeLLM(script)
+    node = make_analysis_node(session, llms)
+    state = make_state([_NATIVE_STEP], **_NATIVE_STATE_KW)
+
+    out = await node(state)
+    an = out["current_analysis"]
+
+    assert an["status"] == "completed"
+    assert an["action"] == "user_input"
+    assert "FK01" in an["diagnosis"] and "KO02" in an["user_instructions"]
+    assert "sap_read_table" in an["tools_used"]
+    # the tool actually ran against the MCP session
+    assert ("sap_read_table", {"table": "AUFK"}) in session.calls
+    # native prompt advertises function-calling, not the text tool_call protocol
+    sysmsg = llms["analysis"].calls[0][0].content
+    assert "function-calling interface" in sysmsg
+    assert '"type":"tool_call"' not in sysmsg
+    # mutating tools are never bound
+    bound_names = {s["function"]["name"] for s in llms["analysis"].bound_schemas}
+    assert bound_names == {"sap_read_table"}
+
+
+async def test_analysis_native_mode_budget_exhausted_is_partial(make_session, make_llms,
+                                                                make_state):
+    # The model only ever calls tools (never a final answer) → budget runs out →
+    # the trailing ToolMessage must NOT be mistaken for a final answer → partial.
+    call = AIMessage(content="", tool_calls=[{"name": "sap_read_table",
+                                              "args": {"table": "AUFK"}, "id": "c1"}])
+    session = _native_session(make_session)
+    llms = make_llms()
+    # max_tool_calls=4 → replay the tool-call turn more than enough times
+    llms["analysis"] = _NativeFakeLLM([call] * 10)
+    node = make_analysis_node(session, llms)
+    state = make_state([_NATIVE_STEP], **_NATIVE_STATE_KW)
+
+    out = await node(state)
+    an = out["current_analysis"]
+
+    assert an["status"] == "partial"
+    assert an["action"] == "user_input"
+
+
+async def test_analysis_native_mode_salvages_after_tool_call_rejected(make_session, make_llms,
+                                                                      make_state):
+    # A tool-bound call is rejected by the provider mid-run. The loop withholds tools
+    # and retries once for the final answer, salvaging the AUFK evidence already read →
+    # the analysis still concludes (completed). Model-agnostic: any error triggers it.
+    final = json.dumps({"type": "final_answer",
+                        "result": {"status": "completed",
+                                   "errors": [{"object_id": "FK01", "error": "KD205",
+                                               "cause": "rule missing",
+                                               "analysis": "AUFK returned the order"}],
+                                   "resolutions": [{"recommendation": "Maintain rule in KO02",
+                                                    "affected_objects": ["FK01"]}]}})
+    script = [
+        AIMessage(content="", tool_calls=[{"name": "sap_read_table",
+                                           "args": {"table": "AUFK"}, "id": "c1"}]),
+        RuntimeError("400 tool call validation failed: tool 'json' not in request.tools"),
+        AIMessage(content=final),
+    ]
+    session = _native_session(make_session)
+    llms = make_llms()
+    llms["analysis"] = _NativeFakeLLM(script)
+    node = make_analysis_node(session, llms)
+    state = make_state([_NATIVE_STEP], **_NATIVE_STATE_KW)
+
+    out = await node(state)
+    an = out["current_analysis"]
+
+    assert an["status"] == "completed"
+    assert an["action"] == "user_input"
+    assert "sap_read_table" in an["tools_used"]
+    assert "FK01" in an["diagnosis"]
+
+
+async def test_analysis_native_mode_partial_when_conclude_also_fails(make_session, make_llms,
+                                                                     make_state):
+    # Tool read succeeds, then BOTH the tool-bound call and the tool-free retry fail.
+    # Evidence was gathered, so the result is an honest partial (not a flat failure)
+    # and still escalates to the operator.
+    script = [
+        AIMessage(content="", tool_calls=[{"name": "sap_read_table",
+                                           "args": {"table": "AUFK"}, "id": "c1"}]),
+        RuntimeError("provider rejected the tool call"),
+        RuntimeError("still failing"),
+    ]
+    session = _native_session(make_session)
+    llms = make_llms()
+    llms["analysis"] = _NativeFakeLLM(script)
+    node = make_analysis_node(session, llms)
+    state = make_state([_NATIVE_STEP], **_NATIVE_STATE_KW)
+
+    out = await node(state)
+    an = out["current_analysis"]
+
+    assert an["status"] == "partial"
+    assert an["action"] == "user_input"
+    assert "sap_read_table" in an["tools_used"]
+
+
+async def test_analysis_native_mode_total_failure_is_undetermined(make_session, make_llms,
+                                                                  make_state):
+    # No tool ever ran (the first call fails and the retry fails too) → nothing was
+    # gathered → undetermined "LLM not available", still escalated to the operator.
+    script = [RuntimeError("boom"), RuntimeError("still boom")]
+    session = _native_session(make_session)
+    llms = make_llms()
+    llms["analysis"] = _NativeFakeLLM(script)
+    node = make_analysis_node(session, llms)
+    state = make_state([_NATIVE_STEP], **_NATIVE_STATE_KW)
+
+    out = await node(state)
+    an = out["current_analysis"]
+
+    assert an["status"] == "undetermined"
+    assert an["action"] == "user_input"
+    assert not an["tools_used"]
 
 
 _POLL_CTX = {"source": "poll", "summary": "Job ZAI_KO8G/123 aborted",

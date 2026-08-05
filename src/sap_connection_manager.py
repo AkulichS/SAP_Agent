@@ -187,11 +187,13 @@ class _StubConnection:
     """
     Mimics pyrfc.Connection for local dev / CI without SAP libs.
 
-    All calls go through ZFI_AI_PERIOD_CLOSE_RFC and must return the three
+    All calls go through ZFI_AI_PERIOD_CLOSE_RFC and must return the four
     export parameters that _rfc() in mcp_server.py reads:
-        EV_STATUS       — "S" | "E" | "W"
-        EV_RESULT_JSON  — JSON string
+        EV_STATUS       — "S" | "E" | "W" | "A"
+        EV_RESULT_DATA  — business payload JSON string (rows / spool / scalars)
+        EV_META         — control JSON string (mode, job ids, state, counts)
         ET_MESSAGES     — list of {TYPE, MESSAGE} dicts
+    Mirrors the real RFC's standardized {status, data, meta, messages} split.
     """
 
     # Realistic per-table stub rows — add more as steps are tested
@@ -301,7 +303,8 @@ class _StubConnection:
                     fm_name, action, obj, async_, test)
 
         if fm_name != "ZFI_AI_PERIOD_CLOSE_RFC":
-            return {"EV_STATUS": "S", "EV_RESULT_JSON": "{}", "ET_MESSAGES": []}
+            return {"EV_STATUS": "S", "EV_RESULT_DATA": "{}", "EV_META": "{}",
+                    "ET_MESSAGES": []}
 
         # ── SUBMIT ──────────────────────────────────────────────────────────
         # SUBMIT always runs as a background job. async → EV_STATUS 'A' + job ids
@@ -315,18 +318,22 @@ class _StubConnection:
             if async_:
                 return {
                     "EV_STATUS":      "A",
-                    "EV_RESULT_JSON": _json.dumps({"status": "submitted", "mode": "async",
+                    # Control → EV_META; async submit has no payload yet.
+                    "EV_META":        _json.dumps({"mode": "async",
                                                    "jobname": job_name, "jobcount": job_id}),
+                    "EV_RESULT_DATA": "{}",
                     "ET_MESSAGES":    [{"TYPE": "S",
                                         "MESSAGE": f"Job {job_name}/{job_id} submitted{suffix}"}],
                 }
             lines = self._SPOOL_TEXT.get(obj, self._SPOOL_TEXT["default"])
-            spool = {"status": "S", "text": "\n".join(lines)}
+            spool = {"available": True, "line_count": len(lines), "text": "\n".join(lines)}
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"status": "completed", "mode": "sync_wait",
-                                               "jobname": job_name, "jobcount": job_id,
-                                               "spool": spool}),
+                # Job identity + mode → EV_META; the report output is the payload,
+                # on the neutral "text" channel → EV_RESULT_DATA.
+                "EV_META":        _json.dumps({"mode": "sync_wait",
+                                               "jobname": job_name, "jobcount": job_id}),
+                "EV_RESULT_DATA": _json.dumps({"text": spool}),
                 "ET_MESSAGES":    [{"TYPE": "S",
                                     "MESSAGE": f"Job {job_name}/{job_id} completed inline{suffix}"}],
             }
@@ -335,7 +342,8 @@ class _StubConnection:
         if action in ("FM", "BAPI", "BDC"):
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": "{}",
+                "EV_RESULT_DATA": "{}",
+                "EV_META":        "{}",
                 "ET_MESSAGES":    [{"TYPE": "S",
                                     "MESSAGE": f"STUB: {action}/{obj} executed OK"}],
             }
@@ -344,7 +352,7 @@ class _StubConnection:
         if action == "TOOLS":
             return self._handle_tool(obj, kwargs)
 
-        return {"EV_STATUS": "E", "EV_RESULT_JSON": "{}",
+        return {"EV_STATUS": "E", "EV_RESULT_DATA": "{}", "EV_META": "{}",
                 "ET_MESSAGES": [{"TYPE": "E",
                                  "MESSAGE": f"STUB: unknown action_type {action!r}"}]}
 
@@ -367,7 +375,9 @@ class _StubConnection:
                 rows = [{f: r.get(f, "") for f in fields} for r in rows]
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"data": rows}),
+                # Rows are the payload; table name + count are control.
+                "EV_RESULT_DATA": _json.dumps({"rows": rows}),
+                "EV_META":        _json.dumps({"table": table, "count": len(rows)}),
                 "ET_MESSAGES":    [{"TYPE": "S",
                                     "MESSAGE": f"STUB: {len(rows)} rows from {table}"}],
             }
@@ -376,7 +386,11 @@ class _StubConnection:
         if tool_name == "TOOL_JOB_STATUS":
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"state": "FINISHED"}),
+                # State is a poll-control signal → EV_META; no business payload.
+                "EV_RESULT_DATA": "{}",
+                "EV_META":        _json.dumps({"jobname": params.get("jobname", ""),
+                                               "jobcount": params.get("jobcount", ""),
+                                               "state": "FINISHED"}),
                 "ET_MESSAGES":    [],
             }
 
@@ -388,13 +402,17 @@ class _StubConnection:
             lines    = self._SPOOL_TEXT.get(obj_key, self._SPOOL_TEXT["default"])
             return {
                 "EV_STATUS":      "S",
-                "EV_RESULT_JSON": _json.dumps({"status": "S", "text": "\n".join(lines)}),
+                # The spool text {available,line_count,text} IS the payload; no control.
+                "EV_RESULT_DATA": _json.dumps({"available": True, "line_count": len(lines),
+                                               "text": "\n".join(lines)}),
+                "EV_META":        "{}",
                 "ET_MESSAGES":    [],
             }
 
         return {
             "EV_STATUS":      "S",
-            "EV_RESULT_JSON": "{}",
+            "EV_RESULT_DATA": "{}",
+            "EV_META":        "{}",
             "ET_MESSAGES":    [{"TYPE": "S", "MESSAGE": f"STUB: {tool_name} OK"}],
         }
 

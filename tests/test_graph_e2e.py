@@ -28,13 +28,13 @@ _SPOOL_VALIDATE = {"mode": "keyword", "keyword": {
 
 
 def _submit_env(spool_text):
-    """A sap_execute_step inline-wait envelope carrying a normalised spool."""
+    """A sap_execute_step inline-wait envelope carrying its output on data.text."""
     return {"status": "ok", "messages": [],
             "meta": {"action_type": "SUBMIT", "requires_poll": False,
                      "job_name": "J", "job_id": "1"},
-            "data": {"spool": {"available": True,
-                               "line_count": len(spool_text.splitlines()),
-                               "text": spool_text}}}
+            "data": {"text": {"available": True,
+                              "line_count": len(spool_text.splitlines()),
+                              "text": spool_text}}}
 
 
 # ---------------------------------------------------------------------------
@@ -53,12 +53,15 @@ async def test_happy_path(stub_session, make_llms):
 
 
 # ---------------------------------------------------------------------------
-# 2. Validation failure → analysis → retry → success
+# 2. Validation failure → analysis → operator retry → success
 # ---------------------------------------------------------------------------
 
-async def test_validation_failure_then_retry_succeeds(make_session, make_llms, patch_react_agent):
-    patch_react_agent('{"action":"retry","corrected_params":null,'
-                      '"diagnosis":"transient","user_instructions":null}')
+async def test_validation_failure_then_operator_retry_succeeds(make_session, make_llms,
+                                                               patch_react_agent):
+    # Diagnose analysis never auto-retries: it escalates to the operator, who chooses
+    # retry_from_execute. The second (clean) execute then validates ok and finalizes.
+    patch_react_agent('{"action":"user_input","result":{"status":"completed",'
+                      '"errors":[],"resolutions":[]},"diagnosis":"transient"}')
     session = make_session(sap_execute_step=[
         _submit_env("bad error here"),
         _submit_env("all done clean"),
@@ -67,21 +70,25 @@ async def test_validation_failure_then_retry_succeeds(make_session, make_llms, p
               "validate": {"mode": "keyword", "keyword": {
                   "source": "spool", "ok_patterns": ["done"], "error_patterns": ["error"]}}}]
     graph = build_graph(session, make_llms(), InMemorySaver())
-    final = await graph.ainvoke(_initial(steps), _run_cfg("t-retry"))
+    cfg = _run_cfg("t-retry")
 
+    paused = await graph.ainvoke(_initial(steps), cfg)
+    assert "__interrupt__" in paused          # analysis escalated to the operator
+
+    final = await graph.ainvoke(Command(resume={"action": "retry_from_execute"}), cfg)
     assert len(final["step_records"]) == 1
     assert final["step_records"][0]["final_status"] == "ok"
-    # Step executed twice: original attempt + one retry.
+    # Step executed twice: original attempt + operator-driven retry.
     assert sum(1 for c in session.calls if c[0] == "sap_execute_step") == 2
 
 
 # ---------------------------------------------------------------------------
-# 3. Retry budget exhausted → escalation → user interrupt → resume abort
+# 3. Validation failure → escalation → user interrupt → resume abort
 # ---------------------------------------------------------------------------
 
 async def test_escalation_interrupt_then_abort(make_session, make_llms, patch_react_agent):
-    patch_react_agent('{"action":"retry","corrected_params":null,'
-                      '"diagnosis":"stuck","user_instructions":"fix manually"}')
+    patch_react_agent('{"action":"user_input","result":{"status":"undetermined",'
+                      '"errors":[],"resolutions":[]},"diagnosis":"stuck"}')
     session = make_session(sap_execute_step=lambda _a: _submit_env("bad error here"))
     steps = [{"step_id": "S1", "action_type": "SUBMIT", "object_name": "RKO", "async": False,
               "max_retries": 1,

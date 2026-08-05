@@ -43,17 +43,29 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
 *"     VALUE(IV_TEST_RUN) TYPE  CHAR1 OPTIONAL
 *"  EXPORTING
 *"     VALUE(EV_STATUS) TYPE  CHAR1
-*"     VALUE(EV_RESULT_JSON) TYPE  STRING
-*"     VALUE(EV_MESSAGE) TYPE  STRING
+*"     VALUE(EV_RESULT_DATA) TYPE  STRING
+*"     VALUE(EV_META) TYPE  STRING
 *"  CHANGING
 *"     VALUE(ET_MESSAGES) TYPE  BAPIRET2_T
+*"----------------------------------------------------------------------
+*" Standardized envelope (mirrors the MCP {status, messages, meta, data}):
+*"   EV_STATUS      — outcome of THIS call: S | E | W | A
+*"   ET_MESSAGES    — SAP messages (standard BAPIRET2)
+*"   EV_META        — control / descriptive JSON: job identifiers, mode,
+*"                    state, table name, row/message counts. Never payload.
+*"   EV_RESULT_DATA — business payload ONLY: table rows, spool/log text,
+*"                    FM scalar outputs. No control fields mixed in.
+*" Each handler sets EV_RESULT_DATA (payload) and EV_META (control)
+*" independently; either may be an empty object '{}' when it has nothing.
 *"----------------------------------------------------------------------
 
   DATA: lv_action      TYPE string,
         lv_object_name TYPE sy-repid,
         lv_msg         TYPE string.
 
-  CLEAR: ev_status, ev_result_json.
+  CLEAR: ev_status, ev_result_data, ev_meta.
+  ev_result_data = '{}'.
+  ev_meta        = '{}'.
   REFRESH et_messages.
 
   lv_action = to_upper( iv_action_type ).
@@ -68,7 +80,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
                  iv_params_json
                  iv_test_run
         CHANGING ev_status
-                 ev_result_json
+                 ev_result_data
+                 ev_meta
                  et_messages.
 
     WHEN 'SUBMIT'.
@@ -78,7 +91,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
                  iv_async
                  iv_test_run
         CHANGING ev_status
-                 ev_result_json
+                 ev_result_data
+                 ev_meta
                  et_messages.
 
     WHEN 'BDC'.
@@ -87,7 +101,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
                  iv_params_json
                  iv_test_run
         CHANGING ev_status
-                 ev_result_json
+                 ev_result_data
+                 ev_meta
                  et_messages.
 
     WHEN 'TOOLS'.
@@ -95,7 +110,8 @@ FUNCTION ZFI_AI_PERIOD_CLOSE_RFC.
         USING    lv_object_name
                  iv_params_json
         CHANGING ev_status
-                 ev_result_json
+                 ev_result_data
+                 ev_meta
                  et_messages.
 
     WHEN OTHERS.
@@ -130,7 +146,8 @@ FORM z_execute_fm
            iv_params_json TYPE string
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   "--- RTTI metadata tables from FUNCTION_IMPORT_INTERFACE ---
@@ -315,7 +332,7 @@ FORM z_execute_fm
     ENDIF.
   ENDIF.
 
-  PERFORM z_build_json USING lt_result CHANGING ev_result_json.
+  PERFORM z_build_json USING lt_result CHANGING ev_result_data.
 
 ENDFORM.
 
@@ -330,10 +347,11 @@ ENDFORM.
 *  GUI-less RFC context, and their output is always captured to spool.
 *
 *  IV_ASYNC = 'X' : return immediately (EV_STATUS = lc_async) with
-*                   jobname/jobcount; the caller polls via TOOL_JOB_STATUS.
+*                   jobname/jobcount in EV_META; the caller polls via TOOL_JOB_STATUS.
 *  IV_ASYNC = ''  : wait inline until the job finishes (guarded by
-*                   lc_sync_wait_timeout), then fetch the spool and return
-*                   it in EV_RESULT_JSON {"...,"spool":[..lines..]}.
+*                   lc_sync_wait_timeout), then fetch the spool and return it in
+*                   EV_RESULT_DATA under "text":{available,line_count,text} (the
+*                   backend-neutral text channel), with job identity + mode in EV_META.
 *
 *  JSON format for IV_PARAMS_JSON (array of selection params):
 *    [
@@ -349,7 +367,8 @@ FORM z_execute_submit
            iv_async       TYPE abap_bool
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   DATA: lt_selopts        TYPE ty_zai_selparam_tab,
@@ -470,11 +489,13 @@ FORM z_execute_submit
   "============================================================
   IF iv_async = abap_true.
     ev_status  = lc_async.  "Async — job submitted, result pending
-    ev_result_json = '{"status":"submitted"' &&
-                     ',"mode":"async"' &&
+    " Control fields → EV_META (job identity + mode the caller polls on); an
+    " async submit has produced no business payload yet, so EV_RESULT_DATA stays '{}'.
+    ev_meta        = '{"mode":"async"' &&
                      ',"program":"'  && iv_progname && '"' &&
                      ',"jobname":"'  && lv_jobname  && '"' &&
                      ',"jobcount":"' && lv_jobcount && '"}'.
+    ev_result_data = '{}'.
     lv_msg = 'Job submitted: ' && lv_jobname && ' / ' && lv_jobcount.
     PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
     RETURN.
@@ -498,12 +519,14 @@ FORM z_execute_submit
 
   IF lv_state <> 'FINISHED'.
     ev_status = lc_error.
-    ev_result_json = '{"status":"error"' &&
-                     ',"mode":"sync_wait"' &&
+    " Control fields (incl. the last polled state) → EV_META; no spool was
+    " produced, so EV_RESULT_DATA stays '{}'.
+    ev_meta        = '{"mode":"sync_wait"' &&
                      ',"program":"'  && iv_progname && '"' &&
                      ',"jobname":"'  && lv_jobname  && '"' &&
                      ',"jobcount":"' && lv_jobcount && '"' &&
                      ',"state":"'    && lv_state    && '"}'.
+    ev_result_data = '{}'.
     lv_msg = 'Job ' && lv_jobname && ' did not finish (state=' && lv_state && ')'.
     PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
     RETURN.
@@ -514,7 +537,8 @@ FORM z_execute_submit
                         CHANGING lt_lines lv_subrc lv_spoolmsg.
 
   IF lv_subrc <> 0.
-    lv_spooljson = '{"status":"' && lc_error && '","text":""}'.
+    " Uniform text sub-shape {available, line_count, text}; unavailable spool.
+    lv_spooljson = '{"available":false,"line_count":0,"text":""}'.
     lv_msg = 'Job finished, spool unavailable: ' && lv_spoolmsg.
     PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
   ELSE.
@@ -526,18 +550,24 @@ FORM z_execute_submit
     CATCH cx_root.
       lv_spool_context = '""'.
     ENDTRY.
-    lv_spooljson = '{"status":"' && lc_success && '","text":' && lv_spool_context && '}'.
+    " Uniform text sub-shape {available, line_count, text} — same object every
+    " handler emits for readable text output.
+    lv_spooljson = '{"available":true,"line_count":' && |{ lv_spool_rows }| &&
+                   ',"text":' && lv_spool_context && '}'.
     lv_msg = 'Program ' && iv_progname && ' completed (inline-wait); spool lines=' && lv_spool_rows.
     PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
   ENDIF.
 
   ev_status = lc_success.
-  ev_result_json = '{"status":"completed"' &&
-                   ',"mode":"sync_wait"' &&
+  " Split: job identity + mode are control (EV_META); the report output is the
+  " business payload (EV_RESULT_DATA). It rides the backend-neutral "text" channel
+  " under the uniform {available,line_count,text} sub-shape — the connector layer
+  " no longer renames it, so ABAP emits the neutral key name directly.
+  ev_meta        = '{"mode":"sync_wait"' &&
                    ',"program":"'  && iv_progname && '"' &&
                    ',"jobname":"'  && lv_jobname  && '"' &&
-                   ',"jobcount":"' && lv_jobcount && '"' &&
-                   ',"spool":'     && lv_spooljson && '}'.
+                   ',"jobcount":"' && lv_jobcount && '"}'.
+  ev_result_data = '{"text":' && lv_spooljson && '}'.
 
 ENDFORM.
 
@@ -579,7 +609,8 @@ FORM z_execute_bdc
            iv_params_json TYPE string
            iv_test_run    TYPE abap_bool
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   DATA: lt_screens TYPE ty_zai_bdc_screen_tab,
@@ -678,9 +709,11 @@ FORM z_execute_bdc
   ENDIF.
 
   lv_message_count = lines( et_messages ).
-  ev_result_json = '{"status":"' && ev_status && '"' &&
-                   ',"tcode":"' && iv_tcode && '"' &&
+  " BDC produces no business payload — the tcode echo and message count are
+  " descriptive control fields (EV_META); EV_RESULT_DATA stays '{}'.
+  ev_meta        = '{"tcode":"' && iv_tcode && '"' &&
                    ',"message_count":"' && lv_message_count && '"}'.
+  ev_result_data = '{}'.
 
 ENDFORM.
 
@@ -689,7 +722,8 @@ FORM z_execute_tool
   USING    iv_toolname    TYPE sy-repid
            iv_params_json TYPE string
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
    CASE iv_toolname.
@@ -698,28 +732,32 @@ FORM z_execute_tool
         PERFORM ztool_read_table
           USING    iv_params_json
           CHANGING ev_status
-                   ev_result_json
+                   ev_result_data
+                   ev_meta
                    et_messages.
 
       WHEN 'TOOL_JOB_STATUS'.
         PERFORM ztool_job_status
           USING    iv_params_json
           CHANGING ev_status
-                   ev_result_json
+                   ev_result_data
+                   ev_meta
                    et_messages.
 
       WHEN 'TOOL_READ_JOB_SPOOL'.
         PERFORM ztool_read_job_spool
           USING    iv_params_json
           CHANGING ev_status
-                   ev_result_json
+                   ev_result_data
+                   ev_meta
                    et_messages.
 
       WHEN 'TOOL_READ_JOB_LOG'.
         PERFORM ztool_read_job_log
           USING    iv_params_json
           CHANGING ev_status
-                   ev_result_json
+                   ev_result_data
+                   ev_meta
                    et_messages.
 
       WHEN OTHERS.
@@ -763,7 +801,8 @@ ENDFORM.
 FORM ztool_read_table
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   DATA: ls_params   TYPE ty_zai_check_params,
@@ -887,8 +926,8 @@ FORM ztool_read_table
       ev_status = lc_warning.
       lv_msg = 'Table ' && ls_params-table && ' is empty for given criteria'.
       PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
-      ev_result_json = '{"table":"' && ls_params-table &&
-                       '","data":[],"count":0}'.
+      ev_meta        = '{"table":"' && ls_params-table && '","count":0}'.
+      ev_result_data = '{"rows":[]}'.
       RETURN.
     WHEN OTHERS.
       ev_status = lc_error.
@@ -941,9 +980,11 @@ FORM ztool_read_table
   lv_msg = |Read { lv_cnt } row(s) from { ls_params-table }|.
   PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
 
-  ev_result_json = '{"table":"' && ls_params-table && '"' &&
-                   ',"count":' && lv_cnt &&
-                   ',"data":' && lv_rows_j && '}'.
+  " Split: table name + row count are descriptive control (EV_META); the rows
+  " themselves are the business payload (EV_RESULT_DATA) under "rows".
+  ev_meta        = '{"table":"' && ls_params-table && '"' &&
+                   ',"count":' && lv_cnt && '}'.
+  ev_result_data = '{"rows":' && lv_rows_j && '}'.
 
 ENDFORM.
 
@@ -966,7 +1007,8 @@ ENDFORM.
 FORM ztool_job_status
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   DATA: ls_job   TYPE ty_zai_job_params,
@@ -998,10 +1040,13 @@ FORM ztool_job_status
   lv_msg = 'Job ' && ls_job-jobname && ': ' && lv_state.
   PERFORM z_add_msg USING ev_status lv_msg CHANGING et_messages.
 
-  ev_result_json = '{"jobname":"'  && ls_job-jobname  && '"' &&
+  " Control only: job identity + the poll signal (state) travel in EV_META; the
+  " Python layer maps state onto the normalized running|finished|aborted lifecycle.
+  " A status check carries no business payload, so EV_RESULT_DATA stays '{}'.
+  ev_meta        = '{"jobname":"'  && ls_job-jobname  && '"' &&
                    ',"jobcount":"' && ls_job-jobcount && '"' &&
-                   ',"state":"'    && lv_state        && '"' &&
-                   ',"status":"'   && ev_status       && '"}'.
+                   ',"state":"'    && lv_state        && '"}'.
+  ev_result_data = '{}'.
 
 ENDFORM.
 
@@ -1009,15 +1054,16 @@ ENDFORM.
 FORM ztool_read_job_spool
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
-  DATA: ls_job                TYPE ty_zai_job_params,
-        lv_message            TYPE string,
-        lv_subrc              TYPE i,
-        lt_lines              TYPE stringtab,
-        lv_spool_text         TYPE string,
-        lv_spool_context_json TYPE string.
+  DATA: ls_job        TYPE ty_zai_job_params,
+        lv_message    TYPE string,
+        lv_subrc      TYPE i,
+        lt_lines      TYPE stringtab,
+        lv_spool_text TYPE string,
+        lv_spool_json TYPE string.
 
   "------------------------------------------------------------
   " 1. Deserialize input JSON
@@ -1027,7 +1073,7 @@ FORM ztool_read_job_spool
                                CHANGING data = ls_job ).
   CATCH cx_root INTO DATA(lx_json).
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     lv_message = 'JSON deserialize error: ' && lx_json->get_text( ).
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
@@ -1041,29 +1087,31 @@ FORM ztool_read_job_spool
 
   IF lv_subrc <> 0.
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDIF.
 
   "------------------------------------------------------------
-  " 3. Serialise result to JSON ({status, text}) — same shape as
-  "    z_execute_submit's inline-wait spool object, so both callers parse it alike.
+  " 3. Serialise result to JSON ({available, line_count, text}) — same uniform text
+  "    sub-shape as z_execute_submit's inline-wait spool object, so both callers parse alike.
   "------------------------------------------------------------
   CONCATENATE LINES OF lt_lines INTO lv_spool_text
     SEPARATED BY cl_abap_char_utilities=>newline.
   TRY.
-    lv_spool_context_json = /ui2/cl_json=>serialize( data = lv_spool_text ).
+    lv_spool_json = /ui2/cl_json=>serialize( data = lv_spool_text ).
   CATCH cx_root INTO DATA(lx_json_ser).
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDTRY.
 
   DATA(lv_spool_rows) = lines( lt_lines ).
-  ev_result_json = '{"status":"' && lc_success && '","text":' && lv_spool_context_json && '}'.
+  " Uniform text sub-shape {available, line_count, text}; status is EV_STATUS.
+  ev_result_data = '{"available":true,"line_count":' && |{ lv_spool_rows }| &&
+                   ',"text":' && lv_spool_json && '}'.
 
   ev_status  = lc_success.
   lv_message = |Spool read successfully. Lines={ lv_spool_rows }|.
@@ -1087,16 +1135,17 @@ ENDFORM.
 *  JSON format for IV_PARAMS_JSON (same shape as TOOL_READ_JOB_SPOOL):
 *    { "jobname": "ZAI_KO8G_...", "jobcount": "12345678" }
 *
-*  Result JSON: { "status": "S"|"E", "text": "<newline-joined log>" }
-*  — deliberately the same {status,text} shape as TOOL_READ_JOB_SPOOL so
-*  the Python side normalises both with the same helper. An empty log is
-*  a success with empty text (a job may legitimately log nothing).
+*  Result JSON: { "available": true|false, "line_count": N, "text": "<log>" }
+*  — deliberately the same {available, line_count, text} shape as TOOL_READ_JOB_SPOOL
+*  so the Python side normalises both with the same helper. An empty log is a
+*  success with empty text (a job may legitimately log nothing).
 *&============================================================*
 
 FORM ztool_read_job_log
   USING    iv_params_json TYPE string
   CHANGING ev_status      TYPE c
-           ev_result_json TYPE string
+           ev_result_data TYPE string
+           ev_meta        TYPE string
            et_messages    TYPE bapiret2_t.
 
   DATA: ls_job              TYPE ty_zai_job_params,
@@ -1115,7 +1164,7 @@ FORM ztool_read_job_log
                                CHANGING data = ls_job ).
   CATCH cx_root INTO DATA(lx_json).
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     lv_message = 'JSON deserialize error: ' && lx_json->get_text( ).
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
@@ -1145,7 +1194,7 @@ FORM ztool_read_job_log
   " a successful, empty result so the caller can fall back to the spool.
   IF sy-subrc <> 0 AND sy-subrc <> 3 AND sy-subrc <> 4.
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     CASE sy-subrc.
       WHEN 1. lv_message = |Cannot read job log for { ls_job-jobname }/{ ls_job-jobcount }|.
       WHEN 2. lv_message = |Jobcount missing for { ls_job-jobname }|.
@@ -1171,20 +1220,22 @@ FORM ztool_read_job_log
     SEPARATED BY cl_abap_char_utilities=>newline.
 
   "------------------------------------------------------------
-  " 4. Serialise result to JSON ({status, text}) — same shape as spool
+  " 4. Serialise result to JSON ({available, line_count, text}) — same shape as spool
   "------------------------------------------------------------
   TRY.
     lv_log_json = /ui2/cl_json=>serialize( data = lv_log_text ).
   CATCH cx_root INTO DATA(lx_json_ser).
     ev_status  = lc_error.
-    ev_result_json = '{"status":"' && lc_error && '","text":""}'.
+    ev_result_data = '{"available":false,"line_count":0,"text":""}'.
     lv_message = |JSON serialize error: { lx_json_ser->get_text( ) }|.
     PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
     RETURN.
   ENDTRY.
 
   DATA(lv_log_rows) = lines( lt_lines ).
-  ev_result_json = '{"status":"' && lc_success && '","text":' && lv_log_json && '}'.
+  " Uniform text sub-shape {available, line_count, text}; status is EV_STATUS.
+  ev_result_data = '{"available":true,"line_count":' && |{ lv_log_rows }| &&
+                   ',"text":' && lv_log_json && '}'.
 
   ev_status  = lc_success.
   lv_message = |Job log read successfully. Lines={ lv_log_rows }|.

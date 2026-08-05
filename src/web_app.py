@@ -569,10 +569,15 @@ async def ws_dashboard(ws: WebSocket):
         async def _pump(code: str, q: asyncio.Queue):
             while True:
                 event = await q.get()
+                # Do NOT stop on _sentinel: the subscriber queue is reused
+                # across runs (rollback+restart, or a fresh run in test mode).
+                # Mirror the company WS, which keeps its relay alive across
+                # sentinels — otherwise the dashboard freezes a company's card
+                # after its first run ends and only F5 refreshes it.
+                if event.get("type") == "_sentinel":
+                    continue
                 tagged = dict(event, company=code)
                 await merged.put(tagged)
-                if event.get("type") == "_sentinel":
-                    break
 
         pumps = [asyncio.create_task(_pump(code, q)) for code, q in subs.items()]
         try:

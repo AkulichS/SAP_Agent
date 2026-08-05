@@ -99,9 +99,10 @@ def _rfc(conn, action_type: str, object_name: str, params: dict,
         IV_TEST_RUN    = "X" if test_run else "",
     )
     return {
-        "status":      rfc_result.get("EV_STATUS", ""),
-        "result_json": json.loads(rfc_result.get("EV_RESULT_JSON", "{}")),
-        "messages":    rfc_result.get("ET_MESSAGES", []),
+        "status":   rfc_result.get("EV_STATUS", ""),
+        "data":     json.loads(rfc_result.get("EV_RESULT_DATA", "{}") or "{}"),
+        "meta":     json.loads(rfc_result.get("EV_META", "{}") or "{}"),
+        "messages": rfc_result.get("ET_MESSAGES", []),
     }
 
 
@@ -111,8 +112,15 @@ def _rfc(conn, action_type: str, object_name: str, params: dict,
 # Every MCP tool returns exactly four top-level keys:
 #   status   — outcome of THIS call: "ok" | "error" | "submitted"
 #   messages — SAP messages (BAPIRET-style: TYPE/MESSAGE/…)
-#   meta     — derived / control fields (job ids, requires_poll, echoes)
-#   data     — verbatim RFC EV_RESULT_JSON payload (spool/rows live here, once)
+#   meta     — control fields: the RFC's own EV_META (job ids, mode, state,
+#              table/row counts) merged with Python-derived control (requires_poll,
+#              request echoes). The envelope's meta mirrors the RFC's EV_META.
+#   data     — business payload only, from the RFC's EV_RESULT_DATA
+#              (spool/rows/scalars live here). No control fields mixed in.
+#
+# The RFC now hands back this split natively (EV_RESULT_DATA + EV_META); the
+# tools below no longer fish control values (jobname/jobcount/mode/state) out of
+# the data blob — they read them from meta.
 # ---------------------------------------------------------------------------
 
 def _envelope(status: str, messages: list | None = None,
@@ -127,18 +135,19 @@ def _envelope(status: str, messages: list | None = None,
 
 
 def _norm_spool(raw: Any) -> dict | None:
-    """Normalise an ABAP spool object to {available, line_count, text}.
+    """Coerce an ABAP text object to {available, line_count, text}, or None if absent.
 
-    ABAP returns {"status": "S"/"E", "text": "..."}. Returns None when no spool
-    object is present (e.g. async submit, FM/BAPI). ``available`` means the report
-    ran and its spool was readable (status == "S").
+    ABAP now emits this shape natively ({available, line_count, text} — see the
+    text handlers in ZFI_AI_PERIOD_CLOSE_RFC); this only applies defensive defaults
+    and a line_count fallback. Returns None when no text object is present (async
+    submit, FM/BAPI). ``available`` means the report ran and its spool was readable.
     """
     if not isinstance(raw, dict):
         return None
     text = raw.get("text", "")
     return {
-        "available":  raw.get("status") == "S",
-        "line_count": len(text.splitlines()),
+        "available":  bool(raw.get("available", False)),
+        "line_count": raw.get("line_count", len(text.splitlines())),
         "text":       text,
     }
 
@@ -181,8 +190,9 @@ def sap_check_period(
     return _envelope(
         status,
         messages = result["messages"],
-        meta     = {"action_type": action_type, "object_name": object_name},
-        data     = result["result_json"],
+        meta     = {"action_type": action_type, "object_name": object_name,
+                    **result["meta"]},
+        data     = result["data"],
     )
 
 
@@ -210,36 +220,41 @@ def sap_execute_step(
     The unified envelope {status, messages, meta, data} where
         status — "ok" | "error" | "submitted"
         meta   — {"action_type", "requires_poll", "job_name", "job_id"}
-        data   — raw RFC payload; for an inline-wait SUBMIT the spool is normalised
-                 in place as data["spool"] = {available, line_count, text}
+        data   — neutral payload; for an inline-wait SUBMIT the report output is
+                 normalised in place as data["text"] = {available, line_count, text}
     """
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
 
     result = _rfc(conn, action_type, object_name, params, async_mode=async_mode, test_run=test_run)
-    messages    = result["messages"]
-    result_json = result["result_json"]
+    messages  = result["messages"]
+    data      = result["data"]
+    rfc_meta  = result["meta"]
 
     logger.info("sap_execute_step action=%s object=%s async=%s test=%s",
                 action_type, object_name, async_mode, test_run)
 
     def _meta(requires_poll: bool = False, job_name: str = "", job_id: str = "") -> dict:
-        return {"action_type": action_type, "requires_poll": requires_poll,
+        # RFC's own EV_META (mode, program, …) plus Python-derived control fields.
+        return {**rfc_meta, "action_type": action_type, "requires_poll": requires_poll,
                 "job_name": job_name, "job_id": job_id}
 
     if action_type in ("FM", "BAPI", "BDC"):
         has_errors = any(m.get("TYPE") in ("E", "A") for m in messages)
-        return _envelope("error" if has_errors else "ok",
-                         messages=messages, meta=_meta(), data=result_json)
+        # FM/BAPI scalar exports aren't text or rows — they ride the neutral
+        # "raw" channel (the engine reads them opaquely, never by field name).
+        return _envelope("error" if has_errors else "ok", messages=messages,
+                         meta=_meta(), data=({"raw": data} if data else {}))
 
     if action_type == "SUBMIT":
-        job_name = result_json.get("jobname", "")
-        job_id   = result_json.get("jobcount", "")
+        # Job identity now travels in EV_META (rfc_meta), not smuggled in the payload.
+        job_name = rfc_meta.get("jobname", "")
+        job_id   = rfc_meta.get("jobcount", "")
 
         # ABAP runs SUBMIT as a background job either way. With async_mode=True it
         # returns EV_STATUS='A' (lc_async) and the caller polls. With async_mode=False
-        # it waits inline and returns EV_STATUS='S'/'E' plus the spool inline under
-        # result_json["spool"] (mode="sync_wait") — no separate sap_read_spool needed.
+        # it waits inline and returns EV_STATUS='S'/'E' plus the report output inline
+        # under data["text"] (meta.mode="sync_wait") — no separate sap_read_spool needed.
         is_async = (result["status"] == "A")
 
         if is_async:
@@ -253,12 +268,13 @@ def sap_execute_step(
                 "submitted",
                 messages=messages,
                 meta=_meta(requires_poll=True, job_name=job_name, job_id=job_id),
-                data=result_json)
+                data=data)
 
-        # Inline-wait outcome: normalise the spool in place inside data.
-        spool = _norm_spool(result_json.get("spool"))
+        # Inline-wait outcome: normalise the report output in place under data["text"]
+        # (the RFC emits it there natively — the uniform {available,line_count,text}).
+        spool = _norm_spool(data.get("text"))
         if spool is not None:
-            result_json["spool"] = spool
+            data["text"] = spool
         has_errors = (result["status"] == "E") or any(m.get("TYPE") in ("E", "A") for m in messages)
         logger.info("SUBMIT completed (inline-wait): job=%s/%s lines=%d status=%s",
                     job_name, job_id, (spool or {}).get("line_count", 0), result["status"])
@@ -266,7 +282,7 @@ def sap_execute_step(
             "error" if has_errors else "ok",
             messages=messages,
             meta=_meta(job_name=job_name, job_id=job_id),
-            data=result_json)
+            data=data)
 
     # Unknown action_type
     return _envelope(
@@ -289,37 +305,39 @@ def sap_run_tool(object_name: str, params_json: str, test_run: bool = False) -> 
     """
     Run any TOOLS-type SAP tool and normalise its result generically.
 
-    The raw RFC payload is normalised so downstream row/spool consumers work for
-    any tool without per-tool knowledge:
-        data.rows  — present when the tool returns {"data": [ ... ]}   (table-like)
-        data.spool — present when the tool returns {"status","text"}   (spool-like)
+    The RFC's EV_RESULT_DATA payload is normalised so downstream row/spool
+    consumers work for any tool without per-tool knowledge:
+        data.rows  — present when the tool returns {"rows": [ ... ]}    (table-like)
+        data.text  — present when the tool returns {available,line_count,text} (spool-like)
         data.raw   — the verbatim RFC payload, always (custom tools stay reachable)
 
     Returns the unified envelope {status, messages, meta, data} where
-        meta — {"object_name", "row_count"}
+        meta — {"object_name", "row_count"} merged with the RFC's own EV_META
+               (e.g. {"table","count"} for a table read, {"state"} for a status check)
     """
     conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else (params_json or {})
     result = _rfc(conn, "TOOLS", object_name, params, test_run=test_run)
-    raw = result["result_json"]
+    payload = result["data"]
 
-    data: dict = {"raw": raw}
-    if isinstance(raw, dict):
-        if isinstance(raw.get("data"), list):
-            data["rows"] = raw["data"]
-        if "text" in raw:
-            data["spool"] = _norm_spool(raw)
+    data: dict = {"raw": payload}
+    if isinstance(payload, dict):
+        if isinstance(payload.get("rows"), list):
+            data["rows"] = payload["rows"]
+        if "text" in payload:
+            data["text"] = _norm_spool(payload)
 
     has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"]) \
                  or result["status"] == "E"
-    logger.info("sap_run_tool object=%s status=%s rows=%d spool=%s",
+    logger.info("sap_run_tool object=%s status=%s rows=%d text=%s",
                 object_name, result["status"],
-                len(data.get("rows", [])), "spool" in data)
+                len(data.get("rows", [])), "text" in data)
     return _envelope(
         "error" if has_errors else "ok",
         messages = result["messages"],
         meta     = {"object_name": object_name,
-                    "row_count": len(data["rows"]) if "rows" in data else 0},
+                    "row_count": len(data["rows"]) if "rows" in data else 0,
+                    **result["meta"]},
         data     = data,
     )
 
@@ -347,7 +365,7 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
         "fields":   fields,
         "max_rows": max_rows,
     })
-    rows = result["result_json"].get("data", [])
+    rows = result["data"].get("rows", [])
     logger.info("sap_read_table table=%s rows=%d", table, len(rows))
     return _envelope(
         "error" if result["status"] == "E" else "ok",
@@ -384,7 +402,8 @@ def sap_job_status(job_name: str, job_id: str) -> dict:
         "jobname":  job_name,
         "jobcount": job_id,
     })
-    state = result["result_json"].get("state", "SCHEDULED")
+    # State is a poll-control signal → it now travels in EV_META, not the payload.
+    state = result["meta"].get("state", "SCHEDULED")
 
     logger.info("sap_job_status job=%s/%s state=%s", job_name, job_id, state)
     return _envelope(
@@ -414,7 +433,7 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
     -------
     The unified envelope {status, messages, meta, data} where
         meta — {"job_name", "job_id", "line_count", "truncated"}
-        data — {"spool": {available, line_count, text}}
+        data — {"text": {available, line_count, text}}   (neutral text channel)
     """
     conn = conn_mgr.get_connection()
     result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_SPOOL", {
@@ -422,9 +441,9 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         "jobcount": job_id,
     })
 
-    # ABAP (ztool_read_job_spool) returns {"status","text"} where text is the
-    # newline-joined spool text. Normalise it, then trim to max_lines.
-    spool = _norm_spool(result["result_json"]) or {"available": False, "line_count": 0, "text": ""}
+    # ABAP (ztool_read_job_spool) returns {available, line_count, text} where text is
+    # the newline-joined spool text. Coerce defensively, then trim to max_lines.
+    spool = _norm_spool(result["data"]) or {"available": False, "line_count": 0, "text": ""}
     lines     = spool["text"].splitlines()
     truncated = len(lines) > max_lines
     trimmed   = lines[:max_lines]
@@ -438,7 +457,7 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         messages = result["messages"],
         meta     = {"job_name": job_name, "job_id": job_id,
                     "line_count": len(trimmed), "truncated": truncated},
-        data     = {"spool": spool},
+        data     = {"text": spool},
     )
 
 
@@ -462,7 +481,7 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
     -------
     The unified envelope {status, messages, meta, data} where
         meta — {"job_name", "job_id", "line_count", "truncated"}
-        data — {"joblog": {available, line_count, text}}
+        data — {"text": {available, line_count, text}}   (neutral text channel)
     """
     conn = conn_mgr.get_connection()
     result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_LOG", {
@@ -470,9 +489,9 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         "jobcount": job_id,
     })
 
-    # ABAP (ztool_read_job_log) returns the same {"status","text"} shape as the
-    # spool handler, so it normalises identically. Then trim to max_lines.
-    joblog    = _norm_spool(result["result_json"]) or {"available": False, "line_count": 0, "text": ""}
+    # ABAP (ztool_read_job_log) returns the same {available, line_count, text} shape as
+    # the spool handler, so it coerces identically. Then trim to max_lines.
+    joblog    = _norm_spool(result["data"]) or {"available": False, "line_count": 0, "text": ""}
     lines     = joblog["text"].splitlines()
     truncated = len(lines) > max_lines
     trimmed   = lines[:max_lines]
@@ -486,7 +505,7 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         messages = result["messages"],
         meta     = {"job_name": job_name, "job_id": job_id,
                     "line_count": len(trimmed), "truncated": truncated},
-        data     = {"joblog": joblog},
+        data     = {"text": joblog},
     )
 
 

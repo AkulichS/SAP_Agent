@@ -255,6 +255,27 @@ def tool_catalog(globals_: dict | None = None) -> list[str]:
     return out
 
 
+def connector_catalog(globals_: dict | None = None) -> list[str]:
+    """Registered connector devices ⊕ admin-added `connectors` from base globals.
+
+    Surfaces the backend "ports" a step may target (default: the built-in
+    ``sap_rfc``). De-duplicated, order-stable. The default connector always
+    leads so existing steps map to it implicitly."""
+    try:
+        from connectors import DEFAULT_CONNECTOR, registered_connectors
+        registered = registered_connectors()
+    except Exception:                       # pragma: no cover — connectors always importable
+        DEFAULT_CONNECTOR, registered = "sap_rfc", ["sap_rfc"]
+    extra = (globals_ or {}).get("connectors") or []
+    seen, out = set(), []
+    for name in [DEFAULT_CONNECTOR, *registered, *extra]:
+        name = str(name).strip()
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 def _f(path, label, widget, *, enum=None, auto=False, show_when=None, action_type_path=None):
     d = {"path": path, "label": label, "widget": widget, "auto": auto}
     if enum is not None:
@@ -394,6 +415,7 @@ def form_descriptor(globals_: dict | None = None) -> dict:
     ]
     return {"sections": sections, "action_types": _ACTION,
             "tools": tool_catalog(globals_),
+            "connectors": connector_catalog(globals_),
             "globals": globals_descriptor()}
 
 
@@ -405,6 +427,10 @@ def globals_descriptor() -> list[dict]:
            enum=["groq", "openrouter"], auto=True),
         _f(f"llm_profiles.{p}.model", "Model", "text", auto=True),
         _f(f"llm_profiles.{p}.temperature", "Temperature", "number", auto=True),
+        # text = JSON-protocol ReAct (any model); native = provider function-calling
+        # (required by tool-native models like gpt-oss). Absent → text.
+        _f(f"llm_profiles.{p}.tool_mode", "Tool mode", "select",
+           enum=["text", "native"], auto=True),
     ]
     return [
         {"key": "defaults", "title": "Defaults", "fields": [

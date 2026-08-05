@@ -24,6 +24,7 @@ Event bus
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -35,7 +36,7 @@ from uuid import uuid4
 import yaml
 from dotenv import load_dotenv
 from langchain_core.messages import (
-    BaseMessage, HumanMessage, SystemMessage, RemoveMessage,
+    AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage,
 )
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -50,20 +51,31 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from config import (build_async_checkpointer, build_checkpointer, build_llms_from_config,
                     load_config, reset_each_run_enabled)
+from connectors import (DEFAULT_CONNECTOR, POLL_ABORTED, POLL_FINISHED,
+                        get_connector)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Event bus  (module-level; set once per run by run_period_close_web)
+# Event bus
 # ---------------------------------------------------------------------------
+# A ContextVar (not a plain module global) so concurrent company runs each get
+# their OWN queue. Each run's coroutine (RunManager.run.task) sets the var once;
+# the graph's node tasks, created within that run's context, inherit a copy and
+# emit into the right queue. A plain global would be reassigned by whichever run
+# started last, cross-wiring a paused run's later events (e.g. run_end after an
+# operator Skip) into another company's stream. The CLI leaves it unset (default
+# None), so _emit is a no-op there.
 
-_event_queue: asyncio.Queue | None = None
+_event_queue_var: contextvars.ContextVar[asyncio.Queue | None] = \
+    contextvars.ContextVar("period_close_event_queue", default=None)
 
 
 async def _emit(event: dict) -> None:
-    if _event_queue is not None:
-        await _event_queue.put(event)
+    q = _event_queue_var.get()
+    if q is not None:
+        await q.put(event)
 
 
 # ---------------------------------------------------------------------------
@@ -221,9 +233,10 @@ class ExecuteResult(TypedDict, total=False):
     data:     dict           # raw RFC payload (spool/rows live here, once)
 
 
-class PollStatus(TypedDict):
+class PollStatus(TypedDict, total=False):
     job_name: str; job_id: str; sap_status: str
     poll_count: int; elapsed_sec: float; timed_out: bool
+    handle: dict           # opaque connector-owned async handle (Phase 2)
 
 
 class ValidateResult(TypedDict):
@@ -252,7 +265,7 @@ def _merge_parallel(a: dict, b: dict) -> dict:
 
 class PeriodCloseState(TypedDict):
     company_config: dict; steps: list[dict]; global_defaults: dict
-    analysis_defaults: dict
+    analysis_defaults: dict; llm_profiles: dict
     step_index: int; current_group: str | None; parallel_step_ids: list[str]
     current_step_id: str
     current_pre_check: PreCheckResult | None
@@ -287,13 +300,18 @@ def _parse_tool_result(result: Any) -> dict:
 # Envelope accessors
 #
 # Every MCP tool / ExecuteResult carries the {status, messages, meta, data}
-# envelope. These read it; they never restructure it. ``data.spool`` is
-# legitimately None when a step produced no spool — guard for it once here.
+# envelope. These read it; they never restructure it. ``data.text`` is
+# legitimately None when a step produced no output — guard for it once here.
 # ---------------------------------------------------------------------------
 
-def _spool(env: dict) -> dict:
-    """Spool object {available, line_count, text} from an envelope, or {}."""
-    return (env.get("data") or {}).get("spool") or {}
+def _text(env: dict) -> dict:
+    """Text-output object {available, line_count, text} from an envelope, or {}.
+
+    Reads the backend-neutral ``data.text`` key. Every connector emits its
+    readable output under ``text`` (the SAP RFC now names it ``text`` natively),
+    so this accessor never needs to know backend-specific names."""
+    data = env.get("data") or {}
+    return data.get("text") or {}
 
 
 def _rows(env: dict) -> list:
@@ -350,34 +368,15 @@ def _compare(actual: Any, op: str, expected: Any) -> bool:
 
 
 async def _run_action(session: ClientSession, action_type: str, object_name: str,
-                      params: Any, async_mode: bool = False, test_run: bool = False) -> dict:
-    """Route one SAP action to the right MCP tool and return its result."""
-    
-    at = (action_type or "").upper()
-    if at == "TOOLS":
-        # Generic tool call: object_name selects the ABAP handler, params travel
-        # verbatim as iv_params_json. Legacy TOOLS steps set object_name to a *table*
-        # (the tool was always TOOL_READ_TABLE, hardcoded in sap_read_table) — keep
-        # them working by defaulting non-TOOL_* names to a TOOL_READ_TABLE read.
-        p = dict(params) if isinstance(params, dict) else {}
-        tool = (object_name or "").strip().upper()
-        if not tool.startswith("TOOL_"):
-            p.setdefault("table", object_name)
-            tool = "TOOL_READ_TABLE"
-        r = await session.call_tool("sap_run_tool", arguments={
-            "object_name": tool,
-            "params_json": json.dumps(p),
-            "test_run":    test_run,
-        })
-    else:
-        r = await session.call_tool("sap_execute_step", arguments={
-            "action_type": at,
-            "object_name": object_name,
-            "params_json": json.dumps(params),
-            "async_mode":  async_mode,
-            "test_run":    test_run,
-        })
-    return _parse_tool_result(r)
+                      params: Any, async_mode: bool = False, test_run: bool = False,
+                      connector: str = DEFAULT_CONNECTOR) -> dict:
+    """Route one action to its connector and return the unified envelope.
+
+    The engine stays backend-neutral: it resolves ``connector`` (default the
+    SAP-RFC device) and delegates. All action-type routing lives in the connector.
+    """
+    return await get_connector(session, connector).run(
+        action_type, object_name, params, async_mode=async_mode, test_run=test_run)
 
 
 def _analysis_depth(step: dict, ec: dict) -> str:
@@ -591,9 +590,10 @@ def make_pre_check_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         run = await _run_action(
             session, pc["action_type"], pc["object_name"], pc.get("params", {}),
             async_mode=pc.get("async", False), test_run=pc.get("test_run", True),
+            connector=pc.get("connector", DEFAULT_CONNECTOR),
         )
         rows            = _rows(run)
-        spool           = _spool(run)
+        spool           = _text(run)
         spool_text      = spool.get("text", "")
         spool_row_count = spool.get("line_count", 0)  # only consulted for SUBMIT (rows empty)
         # raw_data is what comparison/LLM/operator inspect: table rows when present,
@@ -759,6 +759,7 @@ def make_execute_node(session: ClientSession):
         env = await _run_action(
             session, step["action_type"], step["object_name"], params,
             async_mode=async_mode, test_run=test_run,
+            connector=step.get("connector", DEFAULT_CONNECTOR),
         )
         execute_result: ExecuteResult = {"step_id": step_id, **env}
         has_error = env["status"] == "error"
@@ -831,8 +832,16 @@ def make_poll_node(session: ClientSession):
         execute  = state["current_execute"]
         step     = _get_step(state)
         defs     = _defaults(state)
-        job_name      = _meta(execute, "job_name", "")
-        job_id        = _meta(execute, "job_id", "")
+        connector     = step.get("connector", DEFAULT_CONNECTOR)
+        # Opaque async handle published by the connector's run(); the engine passes
+        # it straight back to poll() without inspecting it. Fall back to the flat
+        # SAP-published fields for envelopes minted before handles existed.
+        handle        = _meta(execute, "handle") or {
+            "job_name": _meta(execute, "job_name", ""),
+            "job_id":   _meta(execute, "job_id", ""),
+        }
+        job_name      = handle.get("job_name", "")
+        job_id        = handle.get("job_id", "")
         poll_interval = step.get("poll_interval_sec", defs.get("poll_interval_sec", 30))
         poll_timeout  = step.get("poll_timeout_sec",  defs.get("poll_timeout_sec", 14400))
 
@@ -844,14 +853,12 @@ def make_poll_node(session: ClientSession):
             await _emit({"type": "action_start", "step_id": step["step_id"], "action": "poll",
                          "message": f"Polling {job_name}/{job_id}…"})
 
-        tool_result = await session.call_tool("sap_job_status",
-                                              arguments={"job_name": job_name, "job_id": job_id})
-        data      = _parse_tool_result(tool_result)
-        raw_st    = (data.get("data") or {}).get("state", "SCHEDULED")
+        poll_res  = await get_connector(session, connector).poll(handle)
+        state     = poll_res["state"]
 
-        if raw_st == "FINISHED":
+        if state == POLL_FINISHED:
             sap_status = "FINISHED"
-        elif raw_st == "ABORTED":
+        elif state == POLL_ABORTED:
             sap_status = "ABORTED"
         else:
             sap_status = "RUNNING"
@@ -875,6 +882,7 @@ def make_poll_node(session: ClientSession):
         out = {"current_poll": {
             "job_name": job_name, "job_id": job_id, "sap_status": final_st,
             "poll_count": poll_count, "elapsed_sec": elapsed, "timed_out": timed_out,
+            "handle": handle,   # opaque handle → validate hands it back to read_output
         }}
         # ABORTED / timed-out → route_after_poll sends us to analysis. Hand it a
         # uniform ErrorContext (heavy diagnose depth: the job log needs investigating).
@@ -895,6 +903,192 @@ def make_poll_node(session: ClientSession):
 # ---------------------------------------------------------------------------
 
 def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
+    def _keyword_verdict(kw: dict, spool_text: str, rows: list, messages: list) -> tuple:
+        """Keyword scan → (verdict, error_count, reasoning). Shared by the legacy
+        single-verdict path and each multi-check `mode: keyword`."""
+        ok_pats  = kw.get("ok_patterns", [])
+        err_pats = kw.get("error_patterns", ["error", "Error"])
+        src      = kw.get("source", "spool")
+        if src == "spool":
+            haystack = spool_text
+        elif src == "rows":
+            haystack = json.dumps(rows, ensure_ascii=False)
+        else:
+            haystack = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
+        haystack = haystack.lower()
+        hits = [p for p in err_pats if p.lower() in haystack]
+        if hits:
+            return "retry", len(hits), f"Error patterns matched: {hits}"
+        if ok_pats and any(p.lower() in haystack for p in ok_pats):
+            return "ok", 0, "OK patterns matched"
+        if not ok_pats:
+            return "ok", 0, "No error patterns found"
+        return "retry", 1, "No OK patterns matched"
+
+    def _comparison_verdict(cmp: dict, rows: list, spool_row_count: int) -> tuple:
+        """Row/spool comparison → (verdict, error_count, reasoning). Mirrors the
+        pre_check comparison logic; on_pass/on_fail are ignored here (the step's
+        `combine` decides the workflow), so a check only reports pass/fail."""
+        if not isinstance(rows, list):
+            rows = []
+        select = cmp.get("select", "first")
+        if select in ("empty", "non_empty"):
+            count  = spool_row_count if not rows else len(rows)
+            passed = (count == 0) if select == "empty" else (count > 0)
+            cond   = f"{count} row(s), expected {select.replace('_', '-')}"
+        else:
+            row    = rows[-1] if (select == "last" and rows) else (rows[0] if rows else {})
+            actual = row.get(cmp.get("field", ""), "") if row else ""
+            passed = _compare(actual, cmp.get("operator", "eq"), cmp.get("value", ""))
+            cond   = (f"{cmp.get('field', '')}={actual!r} "
+                      f"{cmp.get('operator', 'eq')} {cmp.get('value', '')!r}")
+        return ("ok" if passed else "retry", 0 if passed else 1,
+                f"{cond} {'✓' if passed else '✗'}")
+
+    async def _eval_check(chk: dict, spool_text: str, rows: list,
+                          messages: list, spool_row_count: int) -> dict:
+        """Judge one check's output against its own condition. Returns a uniform
+        {verdict, error_count, errors, reasoning} regardless of mode, so the combiner
+        never has to know how a check reached its verdict."""
+        cmode = chk.get("mode", "keyword")
+        if cmode == "comparison":
+            verdict, ecount, reason = _comparison_verdict(
+                chk.get("comparison", {}) or {}, rows, spool_row_count)
+            return {"verdict": verdict, "error_count": ecount, "errors": [], "reasoning": reason}
+        if cmode == "llm":
+            lcfg = chk.get("llm", {}) or {}
+            v = await _llm_verdict(
+                llms["validation"],
+                prompt=lcfg.get("prompt", "Was this SAP step successful?"),
+                system_prompt=lcfg.get("system_prompt"),
+                spool_text=spool_text, rows=rows, messages=messages,
+                pass_values=lcfg.get("pass_values"),
+            )
+            return {"verdict": v["verdict"], "error_count": v["error_count"],
+                    "errors": v["errors"], "reasoning": v["reasoning"]}
+        verdict, ecount, reason = _keyword_verdict(
+            chk.get("keyword", {}) or {}, spool_text, rows, messages)
+        return {"verdict": verdict, "error_count": ecount, "errors": [], "reasoning": reason}
+
+    async def _run_validate_checks(state, step, step_id, vcfg, checks,
+                                   job_ctx, own_output, poll) -> dict:
+        """Multi-check validation: run each check, combine the required ones per
+        `vcfg.combine` (all_pass = AND, any_pass = OR), and — on failure — hand ONE
+        aggregated ErrorContext (every failing check's spool/rows/errors) to analysis.
+
+        Each check obtains its output from its own action (action_type/object_name)
+        or, when it declares none, from the executed step's own spool/rows. A check's
+        output is published back into `chain_ctx` as {{<name>.spool_text}} /
+        {{<name>.rows_text}} so a later check's params can reference it."""
+        combine = vcfg.get("combine", "all_pass")
+        await _emit({"type": "action_start", "step_id": step_id, "action": "validate",
+                     "message": f"Validating result ({len(checks)} check(s), {combine})…"})
+
+        chain_ctx = dict(job_ctx)          # job ids ⊕ each prior check's named output
+        results: list[dict] = []
+        for i, chk in enumerate(checks):
+            name     = chk.get("name") or f"check_{i + 1}"
+            required = chk.get("required", True)
+            at       = chk.get("action_type")
+            obj      = chk.get("object_name")
+            max_lines = (chk.get("llm") or {}).get("max_spool_lines", 500)
+
+            if at:
+                await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
+                             "message": f"[{name}] running {at}/{obj}…"})
+                params = _resolve(chk.get("params", {}) or {}, chain_ctx)
+                run = await _run_action(session, at, obj, params,
+                                        async_mode=chk.get("async", False),
+                                        test_run=chk.get("test_run", True),
+                                        connector=chk.get("connector", DEFAULT_CONNECTOR))
+                spool      = _text(run)
+                spool_text = spool.get("text", "")
+                spool_rc   = spool.get("line_count", 0)
+                rows       = _rows(run)
+                messages   = run["messages"] or []
+            else:
+                await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
+                             "message": f"[{name}] checking step output…"})
+                spool_text, spool_rc, rows, messages = await own_output(max_lines)
+
+            ev = await _eval_check(chk, spool_text, rows, messages, spool_rc)
+            results.append({
+                "name": name, "required": required,
+                "passed": ev["verdict"] == "ok", **ev,
+                "spool_text": spool_text, "rows": rows, "messages": messages,
+            })
+            chain_ctx[f"{name}.spool_text"] = spool_text
+            chain_ctx[f"{name}.text"]       = spool_text
+            chain_ctx[f"{name}.rows_text"]  = json.dumps(rows, ensure_ascii=False) if rows else ""
+
+        # Combine only the *required* checks; evidence-only (required:false) checks never gate.
+        gating = [r for r in results if r["required"]]
+        failed = [r for r in gating if not r["passed"]]
+        if not gating:
+            verdict = "ok"
+        elif combine == "any_pass":
+            verdict = "ok" if any(r["passed"] for r in gating) else "retry"
+        else:
+            verdict = "ok" if not failed else "retry"
+        # If every failing required check merely escalated (e.g. LLM unavailable), surface
+        # that rather than a retry — matches the legacy single-verdict escalate behaviour.
+        if verdict != "ok" and failed and all(r["verdict"] == "escalate" for r in failed):
+            verdict = "escalate"
+
+        error_count = sum(r["error_count"] for r in failed)
+        detail_checks = [{"name": r["name"], "required": r["required"], "passed": r["passed"],
+                          "verdict": r["verdict"], "error_count": r["error_count"],
+                          "reasoning": r["reasoning"]} for r in results]
+        reasoning = ("; ".join(f"[{r['name']}] {r['reasoning']}" for r in failed)
+                     if failed else
+                     "; ".join(f"[{r['name']}] {r['reasoning']}" for r in results) or "All checks passed")
+
+        # Evidence handed downstream: prefer the failing checks; if a non-gating (evidence-only)
+        # check ran, still fold it in so analysis sees the full picture.
+        evid = failed or results
+        agg_spool = "\n\n".join(f"### {r['name']}\n{r['spool_text']}"
+                                for r in evid if r["spool_text"])
+        agg_rows: list = []
+        for r in evid:
+            agg_rows.extend(r["rows"] or [])
+        agg_errors: list = []
+        for r in evid:
+            agg_errors.extend(r["errors"] or [])
+        agg_messages: list = []
+        for r in evid:
+            agg_messages.extend(r["messages"] or [])
+
+        logger.info("validate step=%s verdict=%s checks=%d failed=%d errors=%d",
+                    step_id, verdict, len(results), len(failed), error_count)
+        await _emit({"type": "action_end", "step_id": step_id, "action": "validate",
+                     "status": verdict,
+                     "message": f"{error_count} error(s) — {reasoning}",
+                     "detail": {
+                         "verdict":       verdict,
+                         "error_count":   error_count,
+                         "errors":        agg_errors,
+                         "reasoning":     reasoning,
+                         "checks":        detail_checks,
+                         "spool_preview": "\n".join(agg_spool.splitlines()[:15]) if agg_spool else "",
+                         "rows":          agg_rows[:5],
+                         "messages":      [m.get("MESSAGE", str(m)) for m in agg_messages],
+                     }})
+
+        out: dict = {"current_validate": {
+            "step_id": step_id, "verdict": verdict, "spool_text": agg_spool,
+            "messages": agg_messages, "error_count": error_count, "reasoning": reasoning,
+        }}
+        if verdict != "ok":
+            out["current_error_context"] = {
+                "source": "validate", "summary": reasoning,
+                "spool_text": agg_spool, "rows": agg_rows[:50],
+                "messages": agg_messages, "error_count": error_count, "errors": agg_errors,
+                "default_depth": "diagnose",
+                "job_name": (poll or {}).get("job_name", "") if poll else "",
+                "job_id":   (poll or {}).get("job_id", "")   if poll else "",
+            }
+        return out
+
     async def validate_node(state: PeriodCloseState) -> dict:
         step    = _get_step(state)
         step_id = step["step_id"]
@@ -902,6 +1096,42 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         poll    = state.get("current_poll")
         vcfg    = step.get("validate", {})
         mode    = vcfg.get("mode", "keyword")
+
+        # This step's connector, plus the opaque async handle it minted. The handle is
+        # connector-owned — the engine never reads its fields, it just hands it back to
+        # read_output(). Prefer the poll's handle (async), fall back to execute meta,
+        # and finally to a legacy {job_name, job_id} reconstruction for envelopes minted
+        # before handles existed (keeps pre-Phase-2 state / tests working).
+        conn   = get_connector(session, step.get("connector", DEFAULT_CONNECTOR))
+        handle = (poll or {}).get("handle") or _meta(execute or {}, "handle") or {
+            "job_name": (poll or {}).get("job_name") or _meta(execute or {}, "job_name", ""),
+            "job_id":   (poll or {}).get("job_id")   or _meta(execute or {}, "job_id", ""),
+        }
+        # Placeholders this backend publishes for verification-action params (SAP →
+        # {{job_name}}/{{job_id}}). Backend-neutral: replaces the old hardcoded job_ctx.
+        job_ctx = conn.placeholders(handle)
+
+        async def _own_output(max_lines: int) -> tuple[str, int, list, list]:
+            """The executed step's OWN output (text/line_count/rows/messages) — what a check
+            with no action of its own inspects, and the legacy single-verdict default.
+
+            Returns the spool's own ``line_count`` (trusted, not recomputed from ``text``) so
+            a truncated spool is judged empty/non-empty the same way as a check that reads a
+            spool object directly."""
+            msgs = execute.get("messages", []) if execute else []
+            if execute and _meta(execute, "requires_poll") and poll and poll.get("sap_status") == "FINISHED":
+                sp = _text(await conn.read_output(handle, max_lines=max_lines))
+                return sp.get("text", ""), sp.get("line_count", 0), [], msgs
+            if execute:
+                sp = _text(execute)
+                return sp.get("text", ""), sp.get("line_count", 0), _rows(execute), msgs
+            return "", 0, [], msgs
+
+        # ---- Multi-check engine: a list of independent checks combined by `combine`. ----
+        checks = vcfg.get("checks")
+        if isinstance(checks, list) and checks:
+            return await _run_validate_checks(
+                state, step, step_id, vcfg, checks, job_ctx, _own_output, poll)
 
         await _emit({"type": "action_start", "step_id": step_id, "action": "validate",
                      "message": f"Validating result ({mode} mode)…"})
@@ -921,62 +1151,34 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             await _emit({"type": "action_update", "step_id": step_id, "action": "validate",
                          "message": f"Running verification "
                                     f"{run_cfg['action_type']}/{run_cfg['object_name']}…"})
-            # Runtime-only placeholders: this step's job identifiers, resolved the same
-            # way whether it ran async (job in `poll`) or inline (job in `execute` meta).
-            # Load-time tokens ({{period}}, {{company_code}}, …) are already substituted.
-            job_ctx = {
-                "job_name": (poll or {}).get("job_name") or _meta(execute or {}, "job_name", ""),
-                "job_id":   (poll or {}).get("job_id")   or _meta(execute or {}, "job_id", ""),
-            }
+            # `job_ctx` (this step's job identifiers) was resolved at the top of the node;
+            # load-time tokens ({{period}}, {{company_code}}, …) are already substituted.
             run_params = _resolve(run_cfg.get("params", {}) or {}, job_ctx)
             run = await _run_action(
                 session, run_cfg["action_type"], run_cfg["object_name"], run_params,
                 async_mode=run_cfg.get("async", False), test_run=run_cfg.get("test_run", True),
+                connector=run_cfg.get("connector", DEFAULT_CONNECTOR),
             )
-            spool_text = _spool(run).get("text", "")
+            spool_text = _text(run).get("text", "")
             rows       = _rows(run)
             if run["messages"]:
                 messages = run["messages"]
         elif (execute and _meta(execute, "requires_poll") and poll and poll.get("sap_status") == "FINISHED"):
             max_lines = vcfg.get("llm", {}).get("max_spool_lines", 500)
-            spool_res = await session.call_tool("sap_read_spool", arguments={
-                "job_name":  poll["job_name"],
-                "job_id":    poll["job_id"],
-                "max_lines": max_lines,
-            })
-            spool_text = _spool(_parse_tool_result(spool_res)).get("text", "")
+            out_env = await conn.read_output(handle, max_lines=max_lines)
+            spool_text = _text(out_env).get("text", "")
         elif execute:
             # SUBMIT that ran inline-wait (async=false) carries its spool in data;
             # TOOLS/FM steps carry rows there. Pick up whatever is present.
-            spool_text = _spool(execute).get("text", "")
+            spool_text = _text(execute).get("text", "")
             rows       = _rows(execute)
 
         if mode == "keyword":
-            kw       = vcfg.get("keyword", {})
-            ok_pats  = kw.get("ok_patterns", [])
-            err_pats = kw.get("error_patterns", ["error", "Error"])
-            src      = kw.get("source", "messages")
-            if src == "spool":
-                haystack = spool_text
-            elif src == "rows":
-                haystack = json.dumps(rows, ensure_ascii=False)
-            else:
-                haystack = " ".join(m.get("MESSAGE", m.get("text", "")) for m in messages)
-            haystack = haystack.lower()
-            hits        = [p for p in err_pats if p.lower() in haystack]
-            error_count = len(hits)
-            if error_count > 0:
-                verdict   = "retry"
-                reasoning = f"Error patterns matched: {hits}"
-            elif ok_pats and any(p.lower() in haystack for p in ok_pats):
-                verdict   = "ok"
-                reasoning = "OK patterns matched"
-            elif not ok_pats:
-                verdict   = "ok"
-                reasoning = "No error patterns found"
-            else:
-                verdict   = "retry"
-                reasoning = "No OK patterns matched"
+            # Legacy default source is "messages"; the shared helper defaults to "spool",
+            # so pin it here to preserve the historical single-verdict behaviour.
+            kw = dict(vcfg.get("keyword", {}))
+            kw.setdefault("source", "messages")
+            verdict, error_count, reasoning = _keyword_verdict(kw, spool_text, rows, messages)
 
         elif mode == "llm":
             lcfg = vcfg.get("llm", {})
@@ -1034,12 +1236,10 @@ def make_validate_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 # Node: analysis_node  (ReAct loop)
 # ---------------------------------------------------------------------------
 
-# Tools the diagnostic analyst must NEVER call because they can mutate SAP.
-# The gate is a deny-list, not an allow-list: everything else MCP exposes is
-# treated as read-only diagnostic, so new read-only tools (ours or a customer's)
-# become callable without any code change — only a newly added *mutating* tool
-# ever needs to be added here.
-MUTATING_TOOLS = {"sap_execute_step", "sap_run_tool"}
+# The diagnostic toolset is connector-provided: the analysis agent calls the
+# step's connector's list_diagnostic_tools() / call_diagnostic(), so a step on any
+# backend is diagnosed with THAT backend's read-only tools (the SAP mutating-tool
+# deny-list lives in connectors/sap_rfc.py). Nothing SAP-specific remains here.
 
 # Analysis sections a section-based (on_error.analysis) step must resolve to
 # non-empty text — from the step override or the Base analysis_defaults — for a
@@ -1069,7 +1269,7 @@ TECH_DIAGNOSIS_PLAYBOOK = (
     "1. Call sap_job_status(job_name, job_id) to confirm the final job state.\n"
     "2. Call sap_read_job_log(job_name, job_id) to read the SM37 job log — the "
     "abort reason and the last messages before termination are recorded there. "
-    "If the job log is empty, call sap_read_spool(job_name, job_id) for the "
+    "If the job log is empty, call sap_read_text(job_name, job_id) for the "
     "report's list output.\n"
     "3. Interpret the message text:\n"
     "   - it references a posting period or date -> call sap_check_period to "
@@ -1100,40 +1300,65 @@ OUTPUT_FORMAT = (
     "per object."
 )
 
+# The diagnose analyst produces EVIDENCE only — never a workflow action. It fills
+# status + errors + resolutions (the operator's three tables); the graph always
+# escalates to the operator, who chooses retry/skip/abort by button (see
+# _analyse_diagnose, where `action` is hard-fixed to user_input). So the final
+# answer carries no `action` field in either mode.
+
 # `{{max_tool_calls}}` is resolved against the per-step tool budget at assembly time.
 RESPONSE_FORMAT = (
     "Every response MUST be a single JSON object — no other text.\n"
     "To call a tool:\n"
     '  {"type":"tool_call","tool":"<name>","args":{<args>}}\n'
     "To give your final answer:\n"
-    '  {"type":"final_answer","action":"retry|user_input|skip",'
+    '  {"type":"final_answer",'
     '"result":{"status":"completed|partial|undetermined",'
     '"errors":[{"object_id":"...","error":"...","cause":"...","analysis":"..."}],'
     '"resolutions":[{"recommendation":"...","affected_objects":["..."]}]}}\n'
-    "- action: retry (re-run the step), skip (skip it), or user_input "
-    "(operator must intervene).\n"
+    "- Report the facts only; do NOT decide whether to retry or skip — the "
+    "operator decides from your diagnosis.\n"
     "- You may make at most {{max_tool_calls}} tool calls; when every reported "
     "object is covered, output the final_answer immediately.\n"
     "If a tool returns status=error, correct the arguments and call it again."
 )
 
+# Native-tool-calling counterpart of RESPONSE_FORMAT, used when the analysis
+# profile sets `tool_mode: native`. The tools are bound to the request via the
+# provider's function-calling API (not described as a JSON protocol), so this
+# only tells the model to call them natively and — crucially — to close with the
+# SAME `{status, errors, resolutions}` final_answer JSON as text mode, so the one
+# downstream parser (_flatten_result / _normalize_analysis) handles both modes.
+NATIVE_RESPONSE_FORMAT = (
+    "Investigate by calling the tools available to you through the normal "
+    "function-calling interface — never describe a tool call as text. You may "
+    "make at most {{max_tool_calls}} tool calls.\n"
+    "When every reported object is covered, stop calling tools and reply with "
+    "ONLY a single JSON object — no prose, no markdown fences:\n"
+    '  {"type":"final_answer",'
+    '"result":{"status":"completed|partial|undetermined",'
+    '"errors":[{"object_id":"...","error":"...","cause":"...","analysis":"..."}],'
+    '"resolutions":[{"recommendation":"...","affected_objects":["..."]}]}}\n'
+    "- Report the facts only; do NOT decide whether to retry or skip — the "
+    "operator decides from your diagnosis.\n"
+    "If a tool returns status=error, correct the arguments and call it again."
+)
+
+
+def _is_final_answer(parsed: object) -> bool:
+    """A parsed model reply is a diagnosis final answer (not a stray tool-result
+    dict) only if it carries one of the result-bearing keys the parser reads.
+    Guards both react loops against treating leftover tool feedback as the answer."""
+    return isinstance(parsed, dict) and any(
+        k in parsed for k in ("action", "result", "diagnosis"))
+
 
 def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
-
-    async def _call_tool(name: str, args: dict) -> dict:
-        """Dispatch an MCP tool by name. Read-only diagnostic tools are auto-allowed;
-        only the mutating tools in MUTATING_TOOLS are refused (an unknown name simply
-        errors at the MCP boundary and the model self-corrects)."""
-        if name in MUTATING_TOOLS:
-            return {"status": "error", "messages": [{"TYPE": "E", "MESSAGE": (
-                f"Tool '{name}' cannot be used during diagnosis — it modifies SAP. "
-                "Use a read-only diagnostic tool instead.")}], "data": {}}
-        r = await session.call_tool(name, arguments=args)
-        return _parse_tool_result(r)
 
     async def _run_text_react(
         llm: ChatOpenAI,
         call_tool: Callable[[str, dict], Awaitable[dict]],
+        list_tools: Callable[[], Awaitable[list[dict]]],
         system_prompt: str,
         prior_messages: list,
         emit: Callable,
@@ -1144,8 +1369,8 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
 
         The LLM must output one of two JSON objects per turn:
           {"type":"tool_call",   "tool":"<name>","args":{...}}
-          {"type":"final_answer","action":"retry|user_input|skip",
-           "result":{"status":...,"errors":[...],"resolutions":[...]}}
+          {"type":"final_answer","result":{"status":...,"errors":[...],
+                                            "resolutions":[...]}}
 
         ``system_prompt`` is the fully-assembled prompt (tools + response format
         included) built by ``_build_diagnose_system_prompt`` — this loop adds no
@@ -1191,7 +1416,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                     budget_exhausted = False
                     break  # model won't produce valid JSON — treat as terminal
                 await _substep(llm_sub, "llm", "Reply not JSON — asking to reformat",
-                               "error", "Analysis reply was not valid JSON; retrying")
+                               "retry", "Analysis reply was not valid JSON; retrying")
                 correction = HumanMessage(content=(
                     "Your last reply was not valid JSON. Reply with ONLY a single "
                     "JSON object in the required format — a tool_call or a "
@@ -1203,6 +1428,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             if parsed.get("type") != "tool_call":
                 await _substep(llm_sub, "llm", "Reached conclusion", "ok",
                                "Analysis concluded")
+                logger.info("analysis step=%s react=text turn=%d concluded", step_id, i)
                 budget_exhausted = False
                 break  # final_answer or unrecognised — exit loop
 
@@ -1211,11 +1437,13 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             arg_hint  = _summarize_tool_args(tool_args)
             tool_label = tool_name + (f" · {arg_hint}" if arg_hint else "")
 
+            logger.info("analysis step=%s react=text turn=%d tool_call=%s %s",
+                        step_id, i, tool_name, arg_hint or "")
             await _substep(llm_sub, "llm", f"Requested {tool_name}", "ok",
-                           f"Calling SAP: {tool_name}…")
+                           f"Calling {tool_name}…")
             tool_sub = f"tool-{i}"
             await _substep(tool_sub, "tool", tool_label, "running",
-                           f"Calling SAP: {tool_name}…")
+                           f"Calling {tool_name}…")
             try:
                 result = await call_tool(tool_name, tool_args)
                 tools_used.append(tool_name)
@@ -1224,6 +1452,8 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                           "messages": [{"TYPE": "E", "MESSAGE": str(exc)}], "data": {}}
 
             tool_status = "ok" if result.get("status") == "ok" else "error"
+            logger.info("analysis step=%s react=text turn=%d tool=%s -> status=%s",
+                        step_id, i, tool_name, result.get("status"))
             await _substep(tool_sub, "tool", tool_label, tool_status,
                            f"Tool returned ({tool_name}): {result.get('status')}")
 
@@ -1235,6 +1465,161 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             fb_msg = HumanMessage(content=f"Tool result:\n{feedback}")
             new_msgs.append(fb_msg)
             conv.append(fb_msg)
+
+        return new_msgs, tools_used, budget_exhausted
+
+    async def _run_native_react(
+        llm: ChatOpenAI,
+        call_tool: Callable[[str, dict], Awaitable[dict]],
+        list_tools: Callable[[], Awaitable[list[dict]]],
+        system_prompt: str,
+        prior_messages: list,
+        emit: Callable,
+        step_id: str,
+        max_steps: int = 8,
+    ) -> tuple[list, list[str], bool]:
+        """Native-tool-calling counterpart of ``_run_text_react``.
+
+        Tools are bound to the request (``llm.bind_tools``) and the model calls
+        them through the provider's function-calling API — the path that models
+        like ``openai/gpt-oss-120b`` require (they reject the text-JSON protocol
+        with Groq's ``tool_use_failed``). The model closes with the SAME
+        final_answer JSON as text mode, so the caller's parser is unchanged.
+
+        ``list_tools`` / ``call_tool`` are the step connector's diagnostic surface,
+        so the bound toolset is whatever THAT backend advertises.
+
+        Returns (new_messages_added, tool_names_used, budget_exhausted), matching
+        ``_run_text_react`` exactly.
+        """
+        schemas = await list_tools()
+        bound   = llm.bind_tools(schemas) if schemas else llm
+        conv: list = [SystemMessage(content=system_prompt)] + list(prior_messages)
+        new_msgs: list = []
+        tools_used: list[str] = []
+        budget_exhausted = True
+
+        async def _substep(sid_: str, kind: str, label: str, status: str, message: str) -> None:
+            await emit({"type": "action_update", "step_id": step_id, "action": "analysis",
+                        "message": message,
+                        "substep": {"id": sid_, "kind": kind, "label": label,
+                                    "status": status}})
+
+        reformat_tries = 0
+        MAX_REFORMAT   = 2
+        # `concluding` flips True after a tool-bound call fails at the provider (some
+        # tool-native models emit a tool call the provider rejects). We then retry
+        # ONCE with tools withheld so the model must answer in plain text, salvaging
+        # the evidence already gathered. Model-agnostic: any error on the tool-bound
+        # call triggers it — no provider- or model-specific handling.
+        concluding = False
+        for i in range(max_steps):
+            llm_sub = f"llm-{i}"
+            await _substep(llm_sub, "llm", "Reasoning…", "running", "Reasoning…")
+            try:
+                response = await (llm if concluding else bound).ainvoke(conv)
+            except Exception as exc:
+                if concluding:
+                    # The tool-free retry also failed. If we already gathered evidence,
+                    # return it as a partial result (honest) instead of aborting;
+                    # otherwise the model is genuinely unavailable — let the caller say so.
+                    await _substep(llm_sub, "llm", "Analysis call failed", "error",
+                                   "Model call failed while concluding")
+                    logger.warning("analysis step=%s react=native conclude retry failed: %s",
+                                   step_id, str(exc)[:200])
+                    if tools_used:
+                        budget_exhausted = False
+                        break
+                    raise
+                # A tool-bound call was rejected. Withhold tools and ask for the final
+                # answer from what has already been gathered. Mark this turn failed so
+                # the UI shows a red step here (not a spinner) — honest partial state.
+                await _substep(llm_sub, "llm", "Tool call rejected — concluding", "retry",
+                               "Provider rejected a tool call; requesting the final answer")
+                logger.warning("analysis step=%s react=native turn=%d tool-bound call "
+                               "rejected (%s); retrying without tools",
+                               step_id, i, str(exc)[:160])
+                nudge = HumanMessage(content=(
+                    "Stop calling tools. Using ONLY the tool results already gathered "
+                    "above, reply with ONLY the final_answer JSON object described "
+                    "earlier — no tool calls, no prose."))
+                new_msgs.append(nudge)
+                conv.append(nudge)
+                concluding = True
+                continue
+            new_msgs.append(response)
+            conv.append(response)
+
+            tool_calls = getattr(response, "tool_calls", None) or []
+            if not tool_calls:
+                # No native call this turn — the content should be the final answer.
+                raw = re.sub(r"```\w*\n?", "",
+                             (response.content or "").strip()).strip()
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = _extract_json_object(raw)
+                if _is_final_answer(parsed):
+                    await _substep(llm_sub, "llm", "Reached conclusion", "ok",
+                                   "Analysis concluded")
+                    logger.info("analysis step=%s react=native turn=%d concluded",
+                                step_id, i)
+                    budget_exhausted = False
+                    break
+                # Neither a tool call nor a valid final answer — nudge, bounded.
+                reformat_tries += 1
+                if reformat_tries > MAX_REFORMAT:
+                    await _substep(llm_sub, "llm", "Unparsable reply",
+                                   "error", "Analysis reply could not be parsed")
+                    budget_exhausted = False
+                    break
+                await _substep(llm_sub, "llm", "Reply not final — asking to conclude",
+                               "retry", "Analysis reply was not the final JSON; retrying")
+                correction = HumanMessage(content=(
+                    "Your last reply made no tool call and was not the required "
+                    "final-answer JSON. Either call a tool to continue, or reply "
+                    "with ONLY the final_answer JSON object described above."))
+                new_msgs.append(correction)
+                conv.append(correction)
+                continue
+
+            logger.info("analysis step=%s react=native turn=%d requested %d tool call(s)",
+                        step_id, i, len(tool_calls))
+            await _substep(llm_sub, "llm", f"Requested {len(tool_calls)} tool call(s)",
+                           "ok", "Calling diagnostic tools…")
+            for j, tc in enumerate(tool_calls):
+                tool_name = tc.get("name", "")
+                tool_args = tc.get("args", {}) or {}
+                tc_id     = tc.get("id") or f"call_{i}_{j}"
+                arg_hint  = _summarize_tool_args(tool_args)
+                tool_label = tool_name + (f" · {arg_hint}" if arg_hint else "")
+                tool_sub = f"tool-{i}-{j}"
+                logger.info("analysis step=%s react=native turn=%d tool_call=%s %s",
+                            step_id, i, tool_name, arg_hint or "")
+                await _substep(tool_sub, "tool", tool_label, "running",
+                               f"Calling {tool_name}…")
+                try:
+                    result = await call_tool(tool_name, tool_args)
+                    tools_used.append(tool_name)
+                except Exception as exc:
+                    result = {"status": "error",
+                              "messages": [{"TYPE": "E", "MESSAGE": str(exc)}], "data": {}}
+
+                tool_status = "ok" if result.get("status") == "ok" else "error"
+                logger.info("analysis step=%s react=native turn=%d tool=%s -> status=%s",
+                            step_id, i, tool_name, result.get("status"))
+                await _substep(tool_sub, "tool", tool_label, tool_status,
+                               f"Tool returned ({tool_name}): {result.get('status')}")
+
+                feedback = json.dumps(
+                    {"tool": tool_name, "status": result.get("status"),
+                     "messages": result.get("messages", []),
+                     "data": result.get("data", {})},
+                    ensure_ascii=False,
+                )
+                fb_msg = ToolMessage(content=feedback, tool_call_id=tc_id)
+                new_msgs.append(fb_msg)
+                conv.append(fb_msg)
 
         return new_msgs, tools_used, budget_exhausted
 
@@ -1317,7 +1702,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         }}
 
     def _build_diagnose_system_prompt(
-        state: PeriodCloseState, step: dict, ec: dict,
+        state: PeriodCloseState, step: dict, ec: dict, mode: str = "text",
     ) -> tuple[str, int]:
         """Build the diagnose system prompt + tool-call budget.
 
@@ -1325,7 +1710,13 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
         per-section fallback to top-level ``analysis_defaults``. Legacy fallback:
         the single ``on_error.analysis_guidance`` blob (so un-migrated steps keep
         working). Returns (system_prompt, max_tool_calls).
+
+        ``mode`` selects the wire protocol appended as "## Response Format":
+        ``text`` (JSON tool-call protocol our loop parses) or ``native`` (tools
+        bound to the request; only the final-answer JSON is described). Both modes
+        end on the identical final_answer JSON so the result parser is shared.
         """
+        response_format = NATIVE_RESPONSE_FORMAT if mode == "native" else RESPONSE_FORMAT
         oe   = step.get("on_error", {}) or {}
         ad   = state.get("analysis_defaults", {}) or {}
         ctx  = dict(state.get("company_config", {}))
@@ -1370,7 +1761,7 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
             # always match the graph's result parser.
             parts.append("## Output Format\n" + OUTPUT_FORMAT)
             parts.append("## Response Format\n" + _resolve(
-                RESPONSE_FORMAT, {"max_tool_calls": str(max_tool_calls)}))
+                response_format, {"max_tool_calls": str(max_tool_calls)}))
             rules = sec("rules")
             if rules:
                 parts.append("## Rules\n" + _resolve(rules, ctx))
@@ -1437,12 +1828,36 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 "tools_used": [], "status": "undetermined", "result": None,
             }}
 
-        system_prompt, max_tool_calls = _build_diagnose_system_prompt(state, step, ec)
-
+        # Tool-calling strategy is per-profile: `native` binds the tools to the
+        # request (required by tool-native models like gpt-oss), `text` (default)
+        # drives the JSON-protocol ReAct loop that works with any chat model.
+        mode = ((state.get("llm_profiles", {}) or {}).get("analysis", {})
+                or {}).get("tool_mode", "text")
         llm   = llms["analysis"]
+        # Graceful degradation: a profile set to `native` whose LLM client can't
+        # bind tools (misconfigured provider, or a stub) falls back to the text
+        # loop rather than failing the whole analysis with a cryptic attribute error.
+        if mode == "native" and not hasattr(llm, "bind_tools"):
+            logger.warning("analysis step=%s: tool_mode=native but %s has no "
+                           "bind_tools — falling back to text mode",
+                           step_id, type(llm).__name__)
+            mode = "text"
+        react = _run_native_react if mode == "native" else _run_text_react
+        system_prompt, max_tool_calls = _build_diagnose_system_prompt(state, step, ec, mode)
+
+        # Diagnostics are connector-provided: the agent investigates with the step
+        # connector's own read-only tools (SAP by default), never a hardcoded set.
+        conn = get_connector(session, step.get("connector", DEFAULT_CONNECTOR))
+
         prior = list(state.get("analysis_messages", []))
         new_messages: list = []
         tools_used: list[str] = []
+        # The diagnose analyst never decides the workflow action itself: it only
+        # produces the evidence (status + errors + resolutions → the operator's
+        # three tables). The graph therefore ALWAYS escalates to the operator, who
+        # picks retry / skip / abort by button. `action` is fixed here and the
+        # model's response format no longer carries an action field.
+        action = "user_input"
         try:
             # The error data rides in a single Human task message. On retries the
             # context is already in `prior` (analysis_messages), so append it only
@@ -1453,8 +1868,8 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                     HumanMessage(content=f"Error context:\n{_ctx_text(ec)}")]
             await _emit({"type": "action_update", "step_id": step_id, "action": "analysis",
                          "message": "Sending request to LLM…"})
-            new_messages, tools_used, budget_exhausted = await _run_text_react(
-                llm, _call_tool, system_prompt,
+            new_messages, tools_used, budget_exhausted = await react(
+                llm, conn.call_diagnostic, conn.list_diagnostic_tools, system_prompt,
                 input_msgs, _emit, step_id, max_tool_calls,
             )
             last_msg = new_messages[-1] if new_messages else None
@@ -1464,14 +1879,14 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
                 # Only trust a recovered fragment if it looks like a genuine
-                # final_answer (has "action") — otherwise it may be trailing
-                # tool-feedback text, which must fall through to the
+                # final_answer (carries a result/diagnosis) — otherwise it may be
+                # trailing tool-feedback text, which must fall through to the
                 # unparsable-response branch below.
                 candidate = _extract_json_object(raw)
-                parsed = candidate if isinstance(candidate, dict) and "action" in candidate else None
+                parsed = candidate if _is_final_answer(candidate) else None
 
-            if isinstance(parsed, dict) and parsed.get("type") != "tool_call":
-                action       = parsed.get("action", "user_input")
+            if parsed is not None and parsed.get("type") != "tool_call" \
+                    and _is_final_answer(parsed):
                 result_block = parsed.get("result")
                 if isinstance(result_block, dict):
                     status                  = result_block.get("status") or "completed"
@@ -1483,12 +1898,19 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                     status       = "completed"
                     result_block = _synthesize_result(diagnosis, status, instructions)
             else:
-                # No clean final answer: budget ran out, deviated, or empty response
-                action = "user_input"
+                # No clean final answer — three shades, all escalated to the operator:
                 if budget_exhausted:
                     status    = "partial"
                     diagnosis = ("Analysis stopped after reaching the tool-call limit "
                                  "without a complete diagnosis.")
+                elif tools_used:
+                    # Evidence WAS gathered (tool reads succeeded) but the model never
+                    # produced a final diagnosis (e.g. the concluding call failed). Be
+                    # honest: partial, not a flat failure — the gathered rows still show.
+                    status    = "partial"
+                    diagnosis = ("Analysis gathered data from the SAP tools but could "
+                                 "not complete a final diagnosis. Review the gathered "
+                                 "evidence and the errors above manually.")
                 else:
                     status = "undetermined"
                     logger.warning("analysis step=%s: unparsable model response: %.500s",
@@ -1498,11 +1920,13 @@ def make_analysis_node(session: ClientSession, llms: dict[str, ChatOpenAI]):
                 result_block = _synthesize_result(diagnosis, status, instructions)
         except Exception as exc:
             logger.warning("analysis LLM not available step=%s: %s", step_id, exc)
-            action       = "skip"
+            # Still escalate to the operator (action stays user_input) rather than
+            # silently skipping — the operator sees the failure and decides.
             status       = "undetermined"
-            diagnosis    = f"Analysis LLM not available ({str(exc)[:150]}) — skipping step"
-            instructions = None
-            result_block = None
+            diagnosis    = (f"Analysis LLM not available ({str(exc)[:150]}) — "
+                            "review manually and choose an action.")
+            instructions = "Manual review required."
+            result_block = _synthesize_result(diagnosis, status, instructions)
             tools_used   = []
 
         # Lift the model's per-error `analysis` evidence into result['analysis']
@@ -1898,6 +2322,7 @@ def _build_initial_state(period_cfg: dict, steps: list[dict],
         "steps":             steps,
         "global_defaults":   period_cfg.get("defaults", {}),
         "analysis_defaults": period_cfg.get("analysis_defaults", {}),
+        "llm_profiles":      period_cfg.get("llm_profiles", {}),
         "step_index":        max(0, start_step_index),
         "current_group":     None,
         "parallel_step_ids": [],
@@ -1993,6 +2418,7 @@ async def execute_rollback_step(
 
     action_type  = rb.get("action_type", step_cfg.get("action_type", "SUBMIT"))
     object_name  = rb.get("object_name", step_cfg.get("object_name", ""))
+    connector    = rb.get("connector", step_cfg.get("connector", DEFAULT_CONNECTOR))
     params       = _resolve(rb.get("params", []), company_config)
     async_mode   = rb.get("async", False)
     test_run     = rb.get("test_run", defaults.get("test_run", True))
@@ -2003,22 +2429,23 @@ async def execute_rollback_step(
                  "message": f"Rolling back {action_type}/{object_name}…"})
     try:
         env = await _run_action(session, action_type, object_name, params,
-                                async_mode=async_mode, test_run=test_run)
+                                async_mode=async_mode, test_run=test_run,
+                                connector=connector)
 
         if async_mode and _meta(env, "requires_poll"):
-            job_name = _meta(env, "job_name", "")
-            job_id   = _meta(env, "job_id", "")
+            conn   = get_connector(session, connector)
+            handle = _meta(env, "handle") or {
+                "job_name": _meta(env, "job_name", ""),
+                "job_id":   _meta(env, "job_id", ""),
+            }
             elapsed  = 0.0
             while elapsed < poll_timeout:
                 # Poll first so stub/already-finished jobs don't wait a full interval.
-                pr = await session.call_tool("sap_job_status",
-                                             arguments={"job_name": job_name, "job_id": job_id})
-                pd = _parse_tool_result(pr)
-                sap_st = (pd.get("data") or {}).get("state", "RUNNING")
-                if sap_st == "FINISHED":
+                state = (await conn.poll(handle))["state"]
+                if state == POLL_FINISHED:
                     env["status"] = "ok"
                     break
-                elif sap_st == "ABORTED":
+                elif state == POLL_ABORTED:
                     env["status"] = "error"
                     break
                 await asyncio.sleep(poll_interval)
@@ -2065,12 +2492,12 @@ async def run_rollback_and_restart_web(
     company_code:       str | None = None,
 ) -> None:
     """Roll back listed steps (in reverse order) then restart the graph from start_from_step."""
-    global _event_queue
-    _event_queue = asyncio.Queue()
+    event_queue: asyncio.Queue = asyncio.Queue()
+    _event_queue_var.set(event_queue)
 
     async def _relay():
         while True:
-            event = await _event_queue.get()
+            event = await event_queue.get()
             if event is None:
                 break
             await send(event)
@@ -2088,7 +2515,8 @@ async def run_rollback_and_restart_web(
         steps_meta = [
             {"step_id": s["step_id"], "description": s.get("description", s["step_id"]),
              "group": s.get("group"), "action_type": s.get("action_type", ""),
-             "async": s.get("async", False)}
+             "async": s.get("async", False),
+             "rollback_enabled": bool(s.get("rollback", {}).get("enabled", False))}
             for s in steps
         ]
         await _emit({"type": "run_init", "steps": steps_meta, "company_config": company_config,
@@ -2145,9 +2573,8 @@ async def run_rollback_and_restart_web(
         logger.error("Rollback+restart failed: %s", exc, exc_info=True)
         await _emit({"type": "run_end", "status": "error", "message": str(exc)})
     finally:
-        await _event_queue.put(None)
+        await event_queue.put(None)
         await relay_task
-        _event_queue = None
 
 
 # ---------------------------------------------------------------------------
@@ -2215,12 +2642,12 @@ async def run_period_close_web(
     fiscal_year: str | None = None,
     company_code: str | None = None,
 ) -> None:
-    global _event_queue
-    _event_queue = asyncio.Queue()
+    event_queue: asyncio.Queue = asyncio.Queue()
+    _event_queue_var.set(event_queue)
 
     async def _relay():
         while True:
-            event = await _event_queue.get()
+            event = await event_queue.get()
             if event is None:
                 break
             await send(event)
@@ -2243,6 +2670,7 @@ async def run_period_close_web(
                 "group":       s.get("group"),
                 "action_type": s.get("action_type", ""),
                 "async":       s.get("async", False),
+                "rollback_enabled": bool(s.get("rollback", {}).get("enabled", False)),
             }
             for s in steps
         ]
@@ -2302,9 +2730,8 @@ async def run_period_close_web(
         logger.error("Web run failed: %s", exc, exc_info=True)
         await _emit({"type": "run_end", "status": "error", "message": str(exc)})
     finally:
-        await _event_queue.put(None)
+        await event_queue.put(None)
         await relay_task
-        _event_queue = None
 
 
 # ---------------------------------------------------------------------------

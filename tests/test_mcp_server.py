@@ -64,7 +64,7 @@ def test_submit_inline_returns_spool():
     _assert_envelope(out)
     assert out["status"] == "ok"
     assert out["meta"]["requires_poll"] is False
-    spool = out["data"]["spool"]
+    spool = out["data"]["text"]
     assert spool["available"] is True
     assert spool["line_count"] > 0
     # RKO7KO8G is the KO8G error fixture (settlement-rule KD205 failures).
@@ -107,7 +107,7 @@ def test_read_spool_full():
     _assert_envelope(out)
     assert out["meta"]["truncated"] is False
     assert out["meta"]["line_count"] == expected
-    spool = out["data"]["spool"]
+    spool = out["data"]["text"]
     assert spool["line_count"] == expected
     assert "KD205" in spool["text"]
 
@@ -116,7 +116,7 @@ def test_read_spool_truncates():
     out = mcp_server.sap_read_spool("STUB_RKO7KO8G", "00000001", max_lines=2)
     assert out["meta"]["truncated"] is True
     assert out["meta"]["line_count"] == 2
-    assert out["data"]["spool"]["line_count"] == 2
+    assert out["data"]["text"]["line_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -130,16 +130,18 @@ def test_run_tool_read_table_normalises_rows():
     assert out["meta"]["object_name"] == "TOOL_READ_TABLE"
     assert out["meta"]["row_count"] == 1
     assert out["data"]["rows"][0]["KOKRS"] == "X500"
-    assert out["data"]["raw"]["data"][0]["KOKRS"] == "X500"   # raw always preserved
+    # raw always preserved — the verbatim RFC payload now carries rows under "rows"
+    # (EV_RESULT_DATA is payload-only; table/count moved to EV_META).
+    assert out["data"]["raw"]["rows"][0]["KOKRS"] == "X500"
 
 
-def test_run_tool_read_job_spool_normalises_spool():
+def test_run_tool_read_job_spool_normalises_text():
     out = mcp_server.sap_run_tool(
         "TOOL_READ_JOB_SPOOL", json.dumps({"jobname": "STUB_RKO7KO8G", "jobcount": "1"}))
     _assert_envelope(out)
     assert out["status"] == "ok"
-    assert out["meta"]["row_count"] == 0            # spool-like tool → no rows
-    spool = out["data"]["spool"]
+    assert out["meta"]["row_count"] == 0            # text-like tool → no rows
+    spool = out["data"]["text"]
     assert spool["available"] is True               # status "S" → available
     assert spool["line_count"] > 0
     assert "KO8G" in spool["text"]                  # stub KO8G spool header
@@ -147,11 +149,11 @@ def test_run_tool_read_job_spool_normalises_spool():
 
 def test_run_tool_unknown_tool_passes_through_raw():
     # A tool with no ABAP handler in the stub still returns a clean envelope; its raw
-    # payload stays reachable under data.raw (no rows/spool to normalise).
+    # payload stays reachable under data.raw (no rows/text to normalise).
     out = mcp_server.sap_run_tool("TOOL_FUTURE_CUSTOM", json.dumps({"x": "1"}))
     _assert_envelope(out)
     assert out["status"] == "ok"
-    assert "rows" not in out["data"] and "spool" not in out["data"]
+    assert "rows" not in out["data"] and "text" not in out["data"]
     assert out["data"]["raw"] == {}
 
 

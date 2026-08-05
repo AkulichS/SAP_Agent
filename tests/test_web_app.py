@@ -431,45 +431,45 @@ async def _in_memory_checkpointer(_db_path=None):
     return InMemorySaver()
 
 
-_E2E_CONFIG = """
-company_config:
-  company_code: "E2E"
-  controlling_area: "X500"
-  currency: "RUB"
-defaults:
-  max_retries: 1
-  poll_interval_sec: 1
-  poll_timeout_sec: 60
-  test_run: true
-  reset_each_run: true
-llm_profiles:
-  analysis: {provider: groq, model: x}
-  validation: {provider: groq, model: x}
-steps:
-  - step_id: "E2E_STEP"
-    description: "End-to-end stub settlement"
-    action_type: SUBMIT
-    object_name: "RKO7KO8G"
-    async: false
-    validate:
-      mode: keyword
-      keyword:
-        source: spool
-        ok_patterns: ["settled"]
-        error_patterns: ["FATAL"]
-"""
+# Minimal single-step base seeded into a throwaway store for the end-to-end web
+# run (see test_full_web_run_end_to_end). One inline SUBMIT whose stub spool
+# contains "settled" → keyword validate passes → the run reaches run_end quickly.
+_E2E_GLOBALS = {
+    "company_config": {"company_code": "E2E", "controlling_area": "X500",
+                       "currency": "RUB"},
+    "defaults": {"max_retries": 1, "poll_interval_sec": 1, "poll_timeout_sec": 60,
+                 "test_run": True, "reset_each_run": True},
+    "llm_profiles": {"analysis": {"provider": "groq", "model": "x"},
+                     "validation": {"provider": "groq", "model": "x"}},
+}
+_E2E_STEPS = [{
+    "step_id": "E2E_STEP",
+    "description": "End-to-end stub settlement",
+    "action_type": "SUBMIT",
+    "object_name": "RKO7KO8G",
+    "async": False,
+    "validate": {"mode": "keyword",
+                 "keyword": {"source": "spool", "ok_patterns": ["settled"],
+                             "error_patterns": ["FATAL"]}},
+}]
 
 
 def test_full_web_run_end_to_end(client, monkeypatch, make_llms, tmp_path):
-    cfg_file = tmp_path / "period_close_E2E.yaml"
-    cfg_file.write_text(_E2E_CONFIG, encoding="utf-8")
+    # The web run resolves config from the config-store by company_code
+    # (_resolve_period_cfg ignores period_config_path when a company is given), so
+    # seed a throwaway store with a minimal single-step base rather than a YAML file.
+    # This keeps the test hermetic — independent of the developer's live
+    # config_store.db (whose grown step list / tool_mode would otherwise leak in).
+    st = ConfigStore(tmp_path / "e2e.db")
+    st.save_base(_E2E_GLOBALS, _E2E_STEPS, expected_version=0, user="fixture")
+    monkeypatch.setattr(config_store, "_store", st)
 
     # In-memory checkpointer; never build a real LLM client.
     monkeypatch.setattr(graph_builder, "build_async_checkpointer", _in_memory_checkpointer)
     monkeypatch.setattr(graph_builder, "build_llms_from_config", lambda _cfg: make_llms())
-    # Point the company registry at our controlled config.
+    # E2E is unregistered, so load_effective_config("E2E") returns the seeded base.
     monkeypatch.setattr(web_app, "get_company",
-                        lambda code: {"code": "E2E", "config_file": str(cfg_file)})
+                        lambda code: {"code": "E2E", "config_file": ""})
 
     _session_cookie(client, company_codes=["E2E"])
 
@@ -494,37 +494,34 @@ def test_full_web_run_end_to_end(client, monkeypatch, make_llms, tmp_path):
     assert "step_end" in seen
 
 
-_E2E_FAIL_CONFIG = """
-company_config:
-  company_code: "E2E"
-  controlling_area: "X500"
-  currency: "RUB"
-defaults:
-  max_retries: 1
-  test_run: true
-  reset_each_run: true
-llm_profiles:
-  analysis: {provider: groq, model: x}
-  validation: {provider: groq, model: x}
-steps:
-  - step_id: "E2E_FAIL"
-    description: "Step that fails validation and escalates"
-    action_type: SUBMIT
-    object_name: "RKO7KO8G"
-    async: false
-    validate:
-      mode: keyword
-      keyword:
-        source: spool
-        ok_patterns: ["NEVERMATCH"]
-        error_patterns: ["error"]
-"""
+# Minimal single-step base whose validate can never pass (ok pattern absent, error
+# pattern present) → the step escalates to analysis. Seeded like _E2E_GLOBALS to keep
+# the interrupt test hermetic. No tool_mode → text-ReAct path, so patch_react_agent
+# drives the analysis verdict.
+_E2E_FAIL_GLOBALS = {
+    "company_config": {"company_code": "E2E", "controlling_area": "X500",
+                       "currency": "RUB"},
+    "defaults": {"max_retries": 1, "test_run": True, "reset_each_run": True},
+    "llm_profiles": {"analysis": {"provider": "groq", "model": "x"},
+                     "validation": {"provider": "groq", "model": "x"}},
+}
+_E2E_FAIL_STEPS = [{
+    "step_id": "E2E_FAIL",
+    "description": "Step that fails validation and escalates",
+    "action_type": "SUBMIT",
+    "object_name": "RKO7KO8G",
+    "async": False,
+    "validate": {"mode": "keyword",
+                 "keyword": {"source": "spool", "ok_patterns": ["NEVERMATCH"],
+                             "error_patterns": ["error"]}},
+}]
 
 
 def test_full_web_run_interrupt_then_abort(client, monkeypatch, make_llms, tmp_path,
                                            patch_react_agent):
-    cfg_file = tmp_path / "period_close_E2E_FAIL.yaml"
-    cfg_file.write_text(_E2E_FAIL_CONFIG, encoding="utf-8")
+    st = ConfigStore(tmp_path / "e2e_fail.db")
+    st.save_base(_E2E_FAIL_GLOBALS, _E2E_FAIL_STEPS, expected_version=0, user="fixture")
+    monkeypatch.setattr(config_store, "_store", st)
 
     monkeypatch.setattr(graph_builder, "build_async_checkpointer", _in_memory_checkpointer)
     monkeypatch.setattr(graph_builder, "build_llms_from_config", lambda _cfg: make_llms())
@@ -532,7 +529,7 @@ def test_full_web_run_interrupt_then_abort(client, monkeypatch, make_llms, tmp_p
     patch_react_agent('{"action":"user_input","corrected_params":null,'
                       '"diagnosis":"needs a human","user_instructions":"resolve manually"}')
     monkeypatch.setattr(web_app, "get_company",
-                        lambda code: {"code": "E2E", "config_file": str(cfg_file)})
+                        lambda code: {"code": "E2E", "config_file": ""})
 
     _session_cookie(client, company_codes=["E2E"])
 

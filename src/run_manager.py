@@ -221,9 +221,12 @@ class RunManager:
                 return False
 
             target_idx       = steps_order.index(start_from_step)
+            # Always roll back the restart target itself — it may have partially
+            # executed (e.g. an interrupted step that settled some objects and is
+            # not recorded as "ok"). Later steps are rolled back only if completed.
             steps_to_rollback = [
-                sid for sid in steps_order[target_idx:]
-                if run.step_results.get(sid) in ("ok", "skipped")
+                sid for i, sid in enumerate(steps_order[target_idx:])
+                if i == 0 or run.step_results.get(sid) in ("ok", "skipped")
             ]
 
             # Save completed steps before the rollback target so catchup replay
@@ -240,13 +243,15 @@ class RunManager:
             }
             # Save original action history for each rolled-back step so
             # get_catchup_events() can replay Execute/Poll/Validate above Rollback ✓.
+            # Includes the interrupted step being rolled back (it has action history
+            # but no "ok"/"skipped" result yet) so its pre-rollback log is preserved.
             pre_rollback_step_data = {
                 sid: {
-                    "result": run.step_results.get(sid, "ok"),
+                    "result": run.step_results.get(sid, "failed"),
                     "actions": list(run.step_action_log.get(sid, [])),
                 }
                 for sid in steps_to_rollback
-                if run.step_results.get(sid) in ("ok", "skipped")
+                if run.step_action_log.get(sid)
             }
 
             # Cancel current task (interrupted graph waits at user_node)
