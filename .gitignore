@@ -30,3 +30,8 @@ htmlcov/
 # Config delta store (per-deployment tenant data)
 config_store.db
 config_store.db-*
+
+# Licensing — the private signing key MUST NEVER be committed; issued licenses are
+# per-customer artifacts. The public key (configs/license_pubkey.pem) may be committed.
+license_signing_key.pem
+*.lic

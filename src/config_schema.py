@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -162,6 +162,10 @@ class Step(_Strict):
     step_id: str
     description: Optional[str] = Field(None, json_schema_extra={"group": "step"})
     group: Optional[str] = Field(None, json_schema_extra={"group": "step"})
+    # Licensing/module-pack tag. null/empty = product base (always licensed); a value such as
+    # "FI"/"MM" requires that entitlement in the active license (see licensing.py). Additive
+    # optional field — does NOT bump STEP_SCHEMA_VERSION.
+    module: Optional[str] = Field(None, json_schema_extra={"group": "step", "label": "Module", "widget": "text"})
     action_type: ActionType = Field("SUBMIT", json_schema_extra={"group": "step"})
     object_name: Optional[str] = Field(None, json_schema_extra={"group": "step"})
     connector: str = Field("sap_rfc", json_schema_extra={"group": "step", "label": "Connector", "widget": "text"})
@@ -183,6 +187,64 @@ class Step(_Strict):
 def validate_step(data: dict) -> Step:
     """Validate a (merged, effective) step dict against the schema. Raises ValidationError."""
     return Step.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# Schema versioning
+# ---------------------------------------------------------------------------
+# STEP_SCHEMA_VERSION tags the *grammar* of a config document (globals + steps) — it is
+# NOT the store's optimistic-lock counter (that is the content revision: "the 7th save").
+# The tag travels inside an exported config so a newer program can recognise an older
+# client's hand-built pipeline and migrate it forward, instead of silently misreading a
+# renamed/removed field on a live period close.
+#
+# Bump ONLY on a breaking shape change — renaming/removing/repurposing a field, or adding
+# a required one. Additive *optional* fields (with a default) do NOT bump: old documents
+# still validate unchanged. Every bump needs a migration entry in _MIGRATIONS below and a
+# line in this changelog.
+#
+# Schema changelog:
+#   v1 — initial versioned shape (step_id, action_type, params, pre_check, validate[legacy
+#        single-verdict + checks[]], rollback, on_error; connector field defaults sap_rfc).
+STEP_SCHEMA_VERSION = 1
+
+
+class SchemaTooNew(Exception):
+    """A config document was written by a newer program than this one can read."""
+
+
+# Each migration transforms a whole document {schema_version, globals, steps} from version
+# N to N+1 as a pure dict->dict step; register it under its source version N. Example:
+#   def _migrate_1_to_2(doc): ...   # e.g. rename every step's validate.mode -> verdict_mode
+#   _MIGRATIONS = {1: _migrate_1_to_2}
+_MIGRATIONS: dict[int, Callable[[dict], dict]] = {}
+
+
+def migrate_document(doc: dict) -> dict:
+    """Bring a config document up to STEP_SCHEMA_VERSION, returning a new dict.
+
+    Grandfather rule: a document with no ``schema_version`` is treated as v1. This is
+    correct only because, at the moment versioning is introduced, every untagged document
+    is current-shape — which is why the tag must be added *before* the first breaking
+    change, never after (an untagged doc found later would be ambiguous). A document from a
+    *newer* schema than this program raises ``SchemaTooNew`` (fail loud and legibly) rather
+    than being silently downgraded — the caller should surface "upgrade the program".
+    """
+    doc = dict(doc or {})
+    v = int(doc.get("schema_version", 1) or 1)
+    if v > STEP_SCHEMA_VERSION:
+        raise SchemaTooNew(
+            f"This configuration is schema v{v}; this program supports up to "
+            f"v{STEP_SCHEMA_VERSION}. Upgrade the program to open it."
+        )
+    while v < STEP_SCHEMA_VERSION:
+        migrate = _MIGRATIONS.get(v)
+        if migrate is None:  # pragma: no cover - guards a mis-registered migration chain
+            raise RuntimeError(f"No migration registered for schema v{v} -> v{v + 1}")
+        doc = migrate(doc)
+        v += 1
+    doc["schema_version"] = STEP_SCHEMA_VERSION
+    return doc
 
 
 def step_json_schema() -> dict:

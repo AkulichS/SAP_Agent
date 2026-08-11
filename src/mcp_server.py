@@ -510,6 +510,46 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tool: sap_system_identity
+# Logical SAP identity (SID + installation number) — licensing binding anchor
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def sap_system_identity() -> dict:
+    """
+    Return the logical identity of the connected SAP system, for anchoring the
+    per-install anti-copy license binding (installation number + SID) — NOT to
+    hardware, so a server move or EHP/support-pack upgrade keeps the same identity.
+
+    Reads via the ABAP TOOL_SYSTEM_IDENTITY handler (SID from sy-sysid, installation
+    number from the SLIC* license FM). The installation number may be empty on a
+    release/kernel where the read is unavailable; that is not an error (the binding
+    is warn-only) — SID and client are always present.
+
+    Returns
+    -------
+    The unified envelope {status, messages, meta, data} where
+        meta — {"sid", "client", "installation_number"} (also the flat convenience view)
+        data — {"rows": [{"name","value"}, ...]}   (backend-neutral rows channel)
+    """
+    conn = conn_mgr.get_connection()
+    result = _rfc(conn, "TOOLS", "TOOL_SYSTEM_IDENTITY", {})
+    rows = result["data"].get("rows", []) if isinstance(result["data"], dict) else []
+    meta = result["meta"] or {}
+
+    logger.info("sap_system_identity sid=%s instno=%s",
+                meta.get("sid"), meta.get("installation_number"))
+    return _envelope(
+        "error" if result["status"] == "E" else "ok",
+        messages = result["messages"],
+        meta     = {"sid":                 meta.get("sid", ""),
+                    "client":              meta.get("client", ""),
+                    "installation_number": meta.get("installation_number", "")},
+        data     = {"rows": rows},
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

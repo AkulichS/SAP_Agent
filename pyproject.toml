@@ -3,6 +3,9 @@ name = "sap-period-close-agent"
 version = "0.1.2"
 description = "LangGraph agent orchestrating SAP period-close procedures via RFC, with a FastAPI web UI."
 requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=42",   # Ed25519 signing/verification for offline licensing
+]
 
 [project.optional-dependencies]
 test = [

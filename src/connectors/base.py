@@ -75,6 +75,16 @@ data built by hand: it reports any top-level key outside the neutral set, and
     result-set id, … The engine merges this dict into the resolution context
     without knowing the token names.
 
+System identity (per-install license binding)
+---------------------------------------------
+``system_identity() -> dict | None``
+    The backend's *logical* identity, for anchoring the product's per-install
+    anti-copy license binding to the real system the engine is connected to
+    (never env/config the customer controls). SAP returns
+    ``{sid, installation_number}`` read over RFC; a backend with no such notion
+    returns ``None`` and the license is simply UNBOUND for it — not a special
+    case. Warn-only downstream, so an empty/None identity never blocks a run.
+
 Diagnostics (the analysis ReAct agent)
 --------------------------------------
 When a step fails, the analysis agent investigates using **this backend's** own
@@ -211,6 +221,13 @@ class Connector(Protocol):
         """Return this backend's published ``{{token}}`` values (see module doc)."""
         ...
 
+    async def system_identity(self) -> dict | None:
+        """Return this backend's logical identity for per-install license binding,
+        as a neutral ``{"sid", "installation_number"}`` mapping — or ``None`` when the
+        backend has no such notion (then the license is simply UNBOUND for it). See
+        module doc's "System identity" note."""
+        ...
+
     async def list_diagnostic_tools(self) -> list[dict]:
         """Read-only tool schemas the analysis agent may call (see module doc)."""
         ...
@@ -247,6 +264,12 @@ class BaseConnector:
 
     def placeholders(self, handle: dict) -> dict:
         return {}
+
+    async def system_identity(self) -> dict | None:
+        """No licensing identity by default — a backend with no such notion returns
+        None, so the anti-copy binding treats the license as UNBOUND for it (correct,
+        not a special case). SAP overrides this to read SID + installation number."""
+        return None
 
     async def list_diagnostic_tools(self) -> list[dict]:
         """No diagnostics by default — the agent reasons from the error context."""

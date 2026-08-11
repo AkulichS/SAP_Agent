@@ -102,6 +102,11 @@ class ConfigStore:
                     created_at   TEXT,
                     updated_at   TEXT
                 );
+                CREATE TABLE IF NOT EXISTS runtime_kv (
+                    key        TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT
+                );
                 """
             )
 
@@ -122,6 +127,27 @@ class ConfigStore:
             "run_context": json.loads(row["run_context_json"]),
             "version": row["version"],
         }
+
+    # -- runtime key/value (small process-wide runtime state, not versioned config) --------
+
+    def get_runtime_value(self, key: str) -> dict | None:
+        """Return the JSON value stored under `key`, or None if unset. Used for small runtime
+        state such as the licensing binding grace-window anchor (see licensing.py)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM runtime_kv WHERE key = ?", (key,)
+            ).fetchone()
+        return json.loads(row["value_json"]) if row else None
+
+    def set_runtime_value(self, key: str, value: dict) -> None:
+        """Upsert a small JSON value under `key` (no versioning, no history)."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO runtime_kv (key, value_json, updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET "
+                "  value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (key, json.dumps(value or {}, ensure_ascii=False), _now()),
+            )
 
     def list_companies(self) -> list[dict]:
         with self._connect() as conn:
@@ -252,6 +278,8 @@ class ConfigStore:
         return {
             "globals": doc.get("globals", {}),
             "steps": doc.get("steps", []),
+            # untagged stored doc == pre-versioning == schema v1 (grandfather rule)
+            "schema_version": doc.get("schema_version", 1),
             "version": row["version"],
         }
 
@@ -275,8 +303,14 @@ class ConfigStore:
             except Exception as exc:  # pydantic ValidationError
                 raise ValueError(f"Step '{sid}': {exc}") from exc
 
-        doc_json = json.dumps({"globals": globals_ or {}, "steps": steps or []},
-                              ensure_ascii=False)
+        # A successful save is always current-shape: the steps came either from the
+        # current-program admin form or from an import that already ran migrate_document.
+        # So stamp the running program's schema version onto the stored document.
+        doc_json = json.dumps(
+            {"schema_version": config_schema.STEP_SCHEMA_VERSION,
+             "globals": globals_ or {}, "steps": steps or []},
+            ensure_ascii=False,
+        )
         ts = _now()
         with self._lock, self._connect() as conn:
             cur = conn.execute("SELECT version FROM base_config WHERE id = 1").fetchone()

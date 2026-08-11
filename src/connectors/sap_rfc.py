@@ -113,6 +113,24 @@ class SapRfcConnector(BaseConnector):
         return {"job_name": handle.get("job_name", ""),
                 "job_id":   handle.get("job_id", "")}
 
+    async def system_identity(self) -> dict | None:
+        """Read the connected SAP system's logical identity (SID + installation
+        number) via the ``sap_system_identity`` MCP tool → ``TOOL_SYSTEM_IDENTITY``.
+
+        Returns the neutral ``{"sid", "installation_number"}`` mapping the license
+        binding anchors to. Any read failure (tool absent, RFC error) degrades to
+        ``None`` rather than raising — the binding is warn-only, so a failed identity
+        read must never break a run; the caller then falls back to its own default."""
+        try:
+            r = await self.session.call_tool("sap_system_identity", arguments={})
+        except Exception as exc:  # noqa: BLE001 — a failed identity read must never break a run
+            logger.warning("sap_rfc.system_identity read failed: %s", exc)
+            return None
+        env = parse_tool_result(r)
+        meta = env.get("meta") or {}
+        return {"sid":                 meta.get("sid") or "",
+                "installation_number": meta.get("installation_number") or ""}
+
     async def list_diagnostic_tools(self) -> list[dict]:
         """Read-only SAP tool schemas (OpenAI function shape) for the analysis agent.
 

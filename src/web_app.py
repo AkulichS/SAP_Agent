@@ -37,7 +37,7 @@ load_dotenv(Path(__file__).parent / ".env", override=True)
 import auth
 import config_settings
 from config import reset_each_run_enabled
-from config_schema import step_json_schema
+from config_schema import STEP_SCHEMA_VERSION, SchemaTooNew, migrate_document, step_json_schema
 from config_store import VersionConflict, get_config_store, load_effective_config
 from run_manager import get_company, get_run_manager, load_companies
 
@@ -291,8 +291,12 @@ async def export_base_settings(request: Request):
     if err:
         return err
     data = await run_in_threadpool(config_settings.build_base_settings)
-    text = yaml.safe_dump({"globals": data["globals"], "steps": data["steps"]},
-                          allow_unicode=True, sort_keys=False)
+    # Self-describe the export with the running program's schema version so a future
+    # program can recognise and migrate this file on import.
+    text = yaml.safe_dump(
+        {"schema_version": STEP_SCHEMA_VERSION,
+         "globals": data["globals"], "steps": data["steps"]},
+        allow_unicode=True, sort_keys=False)
     return PlainTextResponse(text, media_type="application/x-yaml",
                              headers={"Content-Disposition": 'attachment; filename="base.yaml"'})
 
@@ -310,6 +314,12 @@ async def import_base_settings(request: Request):
         doc = yaml.safe_load(raw) or {}
     except yaml.YAMLError as exc:
         return JSONResponse({"error": f"Invalid YAML: {exc}"}, status_code=400)
+    # Grandfather-rule read: an untagged file is treated as v1; an older tagged file is
+    # migrated up to the current shape; a file from a newer program is refused legibly.
+    try:
+        doc = migrate_document(doc)
+    except SchemaTooNew as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     globals_ = doc.get("globals", {}) or {}
     steps = doc.get("steps", []) or []
     try:

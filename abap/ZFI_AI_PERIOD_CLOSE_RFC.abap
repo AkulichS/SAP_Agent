@@ -760,6 +760,14 @@ FORM z_execute_tool
                    ev_meta
                    et_messages.
 
+      WHEN 'TOOL_SYSTEM_IDENTITY'.
+        PERFORM ztool_system_identity
+          USING    iv_params_json
+          CHANGING ev_status
+                   ev_result_data
+                   ev_meta
+                   et_messages.
+
       WHEN OTHERS.
         ev_status = lc_error.
         DATA(lv_msg) = 'Unknown TOOL: ' && iv_toolname.
@@ -1240,6 +1248,206 @@ FORM ztool_read_job_log
   ev_status  = lc_success.
   lv_message = |Job log read successfully. Lines={ lv_log_rows }|.
   PERFORM z_add_msg USING ev_status lv_message CHANGING et_messages.
+
+ENDFORM.
+
+
+*&============================================================*
+*& HANDLER: SYSTEM_IDENTITY — logical SAP identity (licensing anchor)
+*&============================================================*
+*
+*  Returns the logical identity of THIS SAP system so the Python side can
+*  anchor the per-install anti-copy license binding to it (installation
+*  number + SID) — NOT to hardware/drive, so a server move or EHP/support-pack
+*  upgrade keeps the same identity. Read-only; no input params.
+*
+*  Result rows (backend-neutral "rows" channel), also mirrored in EV_META:
+*    SID                 — sy-sysid           (always available)
+*    CLIENT              — sy-mandt           (always available)
+*    INSTALLATION_NUMBER — SAP installation number, read from the license via
+*                          the SLIC* function module (see z_read_instno). May be
+*                          empty on a release/kernel where the read is unavailable;
+*                          the caller treats an empty value as "unbound-ish" and the
+*                          binding is warn-only, so an empty read never blocks a close.
+*
+*  Portable across ECC 6.0 (SAP_BASIS 7.0x–7.5x) and S/4HANA: the installation
+*  number is read via a guarded, existence-checked FM cascade, so a system that
+*  lacks a given FM simply returns an empty installation number instead of dumping.
+*&============================================================*
+
+FORM ztool_system_identity
+  USING    iv_params_json TYPE string          "unused — identity takes no input
+  CHANGING ev_status      TYPE c
+           ev_result_data TYPE string
+           ev_meta        TYPE string
+           et_messages    TYPE bapiret2_t.
+
+  DATA: lv_sid    TYPE string,
+        lv_client TYPE string,
+        lv_instno TYPE string,
+        lv_rows   TYPE string,
+        lv_msg    TYPE string.
+
+  lv_sid    = sy-sysid.
+  lv_client = sy-mandt.
+
+  "--- Installation number: read from SAP's license (SLIC*), guarded + portable ---
+  PERFORM z_read_instno CHANGING lv_instno.
+
+  "--- Build rows [{name,value}] on the backend-neutral "rows" channel.
+  "    Values are SID/client/10-digit number — all JSON-safe, so no escaping needed. ---
+  lv_rows = '[' &&
+            '{"name":"SID","value":"'                 && lv_sid    && '"},' &&
+            '{"name":"CLIENT","value":"'              && lv_client && '"},' &&
+            '{"name":"INSTALLATION_NUMBER","value":"' && lv_instno && '"}'  &&
+            ']'.
+
+  IF lv_instno IS INITIAL.
+    ev_status = lc_success.   "still a successful read — SID/client are enough to report
+    lv_msg = |System identity: SID={ lv_sid } client={ lv_client } | &&
+             |(installation number unavailable on this release)|.
+    PERFORM z_add_msg USING lc_warning lv_msg CHANGING et_messages.
+  ELSE.
+    ev_status = lc_success.
+    lv_msg = |System identity: SID={ lv_sid } client={ lv_client } instno={ lv_instno }|.
+    PERFORM z_add_msg USING lc_success lv_msg CHANGING et_messages.
+  ENDIF.
+
+  " Descriptive scalars → EV_META (control); the name/value pairs are the payload (rows).
+  ev_meta        = '{"sid":"'                 && lv_sid    && '"' &&
+                   ',"client":"'              && lv_client && '"' &&
+                   ',"installation_number":"' && lv_instno && '"}'.
+  ev_result_data = '{"rows":' && lv_rows && '}'.
+
+ENDFORM.
+
+
+*&--------------------------------------------------------------------*
+*& FORM z_read_instno
+*&   Reads the SAP installation number from the license. Tries a small,
+*&   ordered list of SLIC* license function modules; the first that yields
+*&   a plausible installation number wins. FMs that do not exist on the
+*&   running release/kernel are skipped silently (existence is checked via
+*&   FUNCTION_IMPORT_INTERFACE), so this stays portable across ECC 6.0
+*&   (7.0x–7.5x) and S/4HANA and never short-dumps.
+*&
+*&   If none of the candidates match on your systems, confirm the correct
+*&   FM in SE37 (cross-check the value shown in transaction SLICENSE) and
+*&   add its name to the candidate list below — no other change is needed.
+*&--------------------------------------------------------------------*
+FORM z_read_instno
+  CHANGING ev_instno TYPE string.
+
+  DATA: lt_candidates TYPE STANDARD TABLE OF rs38l_fnam,
+        lv_fm         TYPE rs38l_fnam.
+
+  CLEAR ev_instno.
+
+  APPEND 'SLIC_GET_LICENCE_NUMBER' TO lt_candidates.
+  " (add release-specific SLIC* FMs here if the primary is absent on a target system)
+
+  LOOP AT lt_candidates INTO lv_fm.
+    PERFORM z_read_instno_via_fm USING lv_fm CHANGING ev_instno.
+    IF ev_instno IS NOT INITIAL.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
+
+ENDFORM.
+
+
+*&--------------------------------------------------------------------*
+*& FORM z_read_instno_via_fm
+*&   Calls one FM generically (no hard-coded parameter names) and returns
+*&   the first EXPORTING scalar that looks like an installation number
+*&   (all digits, length 8–12). Existence is checked first; the dynamic
+*&   call is fully guarded, so a wrong/absent FM or an unexpected interface
+*&   just returns empty rather than dumping.
+*&--------------------------------------------------------------------*
+FORM z_read_instno_via_fm
+  USING    iv_fm     TYPE rs38l_fnam
+  CHANGING ev_instno TYPE string.
+
+  DATA: lt_exc  TYPE STANDARD TABLE OF rsexc WITH DEFAULT KEY,
+        lt_imp  TYPE STANDARD TABLE OF rsimp WITH DEFAULT KEY,
+        lt_exp  TYPE STANDARD TABLE OF rsexp WITH DEFAULT KEY,
+        lt_tab  TYPE STANDARD TABLE OF rstbl WITH DEFAULT KEY,
+        lt_chg  TYPE STANDARD TABLE OF rscha WITH DEFAULT KEY,
+        lt_fp   TYPE abap_func_parmbind_tab,
+        ls_fp   TYPE abap_func_parmbind,
+        lt_fe   TYPE abap_func_excpbind_tab,
+        ls_fe   TYPE abap_func_excpbind,
+        lr_data TYPE REF TO data,
+        lv_val  TYPE string,
+        lv_len  TYPE i.
+
+  FIELD-SYMBOLS <fs> TYPE any.
+
+  CLEAR ev_instno.
+
+  "--- 1. Existence + interface metadata (skips cleanly if the FM is absent) ---
+  CALL FUNCTION 'FUNCTION_IMPORT_INTERFACE'
+    EXPORTING
+      funcname           = iv_fm
+    TABLES
+      exception_list     = lt_exc
+      export_parameter   = lt_exp
+      import_parameter   = lt_imp
+      table_parameter    = lt_tab
+      changing_parameter = lt_chg
+    EXCEPTIONS
+      error_message      = 1
+      function_not_exist = 2
+      invalid_name       = 3
+      OTHERS             = 4.
+  IF sy-subrc <> 0.
+    RETURN.
+  ENDIF.
+
+  "--- 2. Reserve a data object for every EXPORTING param, to capture output ---
+  LOOP AT lt_exp INTO DATA(ls_exp).
+    TRY.
+        CREATE DATA lr_data TYPE (ls_exp-typ).
+      CATCH cx_root.
+        CREATE DATA lr_data TYPE string.
+    ENDTRY.
+    ls_fp-name  = ls_exp-parameter.
+    ls_fp-kind  = abap_func_importing.   "FM Exporting = caller Importing
+    ls_fp-value = lr_data.
+    INSERT ls_fp INTO TABLE lt_fp.
+  ENDLOOP.
+
+  ls_fe-name  = 'OTHERS'.
+  ls_fe-value = 99.
+  INSERT ls_fe INTO TABLE lt_fe.
+
+  "--- 3. Dynamic call, fully guarded (missing mandatory imports etc. → caught) ---
+  TRY.
+      CALL FUNCTION iv_fm
+        PARAMETER-TABLE  lt_fp
+        EXCEPTION-TABLE  lt_fe.
+    CATCH cx_root.
+      RETURN.
+  ENDTRY.
+  IF sy-subrc = 99.
+    RETURN.
+  ENDIF.
+
+  "--- 4. Pick the first EXPORTING scalar that looks like an installation number ---
+  LOOP AT lt_fp INTO ls_fp WHERE kind = abap_func_importing.
+    ASSIGN ls_fp-value->* TO <fs>.
+    TRY.
+        lv_val = |{ <fs> }|.        "elementary only; a structure/table raises → skip
+      CATCH cx_root.
+        CONTINUE.
+    ENDTRY.
+    CONDENSE lv_val.
+    lv_len = strlen( lv_val ).
+    IF lv_val CO '0123456789' AND lv_len >= 8 AND lv_len <= 12.
+      ev_instno = lv_val.
+      RETURN.
+    ENDIF.
+  ENDLOOP.
 
 ENDFORM.
 

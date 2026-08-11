@@ -2554,6 +2554,9 @@ async def run_rollback_and_restart_web(
                              "total": len(steps),
                              "start_from_step": start_from_step})
 
+                lic = await _enforce_license_modules(steps)    # phase 1: strict module gate (raises to abort)
+                await _enforce_license_binding(lic, session)   # phase 2: warn-only anti-copy binding (RFC identity)
+
                 graph         = build_graph(session, llms, checkpointer)
                 initial_state = _build_initial_state(period_cfg, steps, start_step_index)
 
@@ -2578,6 +2581,145 @@ async def run_rollback_and_restart_web(
 
 
 # ---------------------------------------------------------------------------
+# Licensing enforcement (two-phase run-start gate)
+# ---------------------------------------------------------------------------
+# Two jobs, mirroring licensing.py, deliberately split around the MCP session:
+#
+#   Phase 1 — _enforce_license_modules(steps)  [BEFORE the session/graph]
+#     Loads the license and enforces module entitlement STRICTLY: a pipeline that
+#     contains steps from an unlicensed module refuses to start (far better than dying at
+#     step 40/80 of a live close). Returns the loaded License (or None in dev mode) so
+#     phase 2 reuses it without re-reading the file.
+#
+#   Phase 2 — _enforce_license_binding(license, session)  [AFTER session.initialize()]
+#     Anti-copy binding, WARN-ONLY: reads the connected system's REAL identity over RFC via
+#     the connector (`system_identity()`), evaluates the binding, emits a `license_warning`
+#     and persists the grace-window anchor. It runs post-session because that identity read
+#     needs a live connector — and reading the true system (not env the customer controls) is
+#     the entire anti-copy value. A mismatch NEVER blocks the close; past the grace window it
+#     only reports updates_allowed=False. Env (SAP_SID/SAP_INSTALLATION_NUMBER) is the
+#     last-resort fallback for stub/dev where the connector has no identity.
+#
+# The grace-window anchor persists in config_store.runtime_kv so it survives restarts.
+# No license file present ⇒ UNLICENSED dev mode (logged, non-blocking) so tests and local
+# development run untouched.
+
+_LICENSE_BINDING_KEY = "license_binding"
+
+
+def _identity_key(identity) -> str:
+    """Stable string for the observed SAP identity — used to detect when a *different* system
+    is seen (which should start its own fresh grace window rather than inherit the old one)."""
+    return f"{identity.installation_number or ''}|{(identity.sid or '').upper()}"
+
+
+async def _read_system_identity_for_run(session=None):
+    """Resolve the connected system's logical identity for anti-copy binding.
+
+    Layered, most-trustworthy first: (1) the connector's own ``system_identity()`` — the SAP
+    driver reads SID + installation number over RFC from the REAL connected system, which the
+    customer cannot fake; (2) env ``SAP_SID`` / ``SAP_INSTALLATION_NUMBER`` as a last-resort
+    fallback for stub/dev (or a backend with no identity notion). Because the binding is
+    warn-only, an empty identity from either source never blocks a close."""
+    import licensing
+    if session is not None:
+        try:
+            conn = get_connector(session, DEFAULT_CONNECTOR)
+            ident = await conn.system_identity()
+        except Exception as exc:  # noqa: BLE001 — identity read must never break a run
+            logger.warning("connector system_identity read failed: %s", exc)
+            ident = None
+        if ident and (ident.get("installation_number") or ident.get("sid")):
+            return licensing.read_system_identity(lambda: ident)
+    return licensing.read_system_identity()   # env fallback (or fully-unset → unbound-ish)
+
+
+async def _enforce_license_modules(steps: list[dict]):
+    """Phase 1 (pre-session). Load the license and strictly gate module entitlement.
+
+    Returns the loaded License, or None in UNLICENSED dev mode. Raises ModuleNotLicensed to
+    abort BEFORE anything opens when the pipeline needs an unlicensed module, or re-raises a
+    LicenseError (after emitting `invalid`) for a corrupt/forged/wrong-key file."""
+    import licensing
+
+    try:
+        lic = licensing.load_active_license()
+    except licensing.LicenseError as exc:
+        # A present-but-corrupt/forged/wrong-key license is a hard error — refuse to start.
+        await _emit({"type": "license_warning", "state": "invalid",
+                     "message": str(exc), "updates_allowed": False})
+        raise
+
+    if lic is None:
+        logger.warning("No license file found — running UNLICENSED (dev mode); module "
+                       "entitlement and anti-copy binding are NOT enforced.")
+        return None
+
+    bad = licensing.unlicensed_steps(lic, steps)
+    if bad:
+        have = ", ".join(sorted(lic.modules)) or "(none)"
+        listed = ", ".join(f"{sid} [{mod}]" for sid, mod in bad)
+        raise licensing.ModuleNotLicensed(
+            f"This license covers {have} but the pipeline contains steps from unlicensed "
+            f"module(s): {listed}. Contact your vendor to add the module."
+        )
+    return lic
+
+
+async def _enforce_license_binding(lic, session=None) -> None:
+    """Phase 2 (post-session). Anti-copy binding — warn-only, grace-windowed; never blocks the
+    close. Reads the connected system's real identity via the connector (env fallback),
+    evaluates the binding, persists the grace anchor, and emits `license_warning` for any
+    binding/support anomaly. A None license (dev mode) is a no-op."""
+    if lic is None:
+        return
+    import licensing
+    from datetime import datetime
+    from config_store import get_config_store
+
+    store    = get_config_store()
+    identity = await _read_system_identity_for_run(session)
+    id_key   = _identity_key(identity)
+    prev     = store.get_runtime_value(_LICENSE_BINDING_KEY) or {}
+
+    # Only carry a persisted grace anchor forward if it belongs to the SAME observed identity;
+    # a genuinely different system starts its own fresh grace window.
+    mismatch_since = None
+    if prev.get("identity") == id_key and prev.get("mismatch_since"):
+        try:
+            mismatch_since = datetime.fromisoformat(prev["mismatch_since"])
+        except ValueError:
+            mismatch_since = None
+
+    result = lic.evaluate_binding(identity, mismatch_since=mismatch_since)
+
+    # Persist the (possibly new) grace anchor; clear it once the system matches again.
+    if result.state in (licensing.BindingState.MISMATCH_GRACE,
+                        licensing.BindingState.MISMATCH_EXPIRED):
+        store.set_runtime_value(_LICENSE_BINDING_KEY, {
+            "identity": id_key,
+            "mismatch_since": result.mismatch_since.isoformat() if result.mismatch_since else None,
+            "state": result.state.value,
+        })
+    elif prev:
+        store.set_runtime_value(_LICENSE_BINDING_KEY,
+                               {"identity": id_key, "mismatch_since": None,
+                                "state": result.state.value})
+
+    if result.state not in (licensing.BindingState.MATCH, licensing.BindingState.UNBOUND):
+        await _emit({"type": "license_warning", "state": result.state.value,
+                     "message": result.message, "updates_allowed": result.updates_allowed})
+        logger.warning("License binding %s: %s", result.state.value, result.message)
+
+    if lic.support_expired():
+        await _emit({"type": "license_warning", "state": "support_expired",
+                     "message": ("The support/updates window for this license has expired; "
+                                 "the close still runs. Contact your vendor to renew."),
+                     "updates_allowed": False})
+        logger.warning("License support window expired for %s", lic.licensee)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -2596,6 +2738,7 @@ async def run_period_close(
     mcp_cfg     = _load_yaml(mcp_config_path)
     company_config = period_cfg["company_config"]
     steps          = _resolve(period_cfg["steps"], company_config)
+    lic            = await _enforce_license_modules(steps)   # phase 1: strict module gate (raises to abort)
     llms           = build_llms_from_config(period_cfg)
     checkpointer   = await build_async_checkpointer()
     if thread_id is None:
@@ -2605,6 +2748,7 @@ async def run_period_close(
     async with _build_cm(mcp_cfg) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
+            await _enforce_license_binding(lic, session)     # phase 2: warn-only anti-copy binding (RFC identity)
             graph = build_graph(session, llms, checkpointer)
             initial_state = _build_initial_state(period_cfg, steps)
             logger.info("Starting period close CLI run — %d steps", len(steps))
@@ -2703,12 +2847,15 @@ async def run_period_close_web(
         logger.info("Web run thread_id=%s", thread_id)
         thread_config = {"configurable": {"thread_id": thread_id}}
 
+        lic = await _enforce_license_modules(steps)   # phase 1: strict module gate (raises to abort)
+
         await _emit({"type": "run_start", "company_config": company_config, "total": len(steps),
                      "start_from_step": start_from or steps[0]["step_id"]})
 
         async with _build_cm(mcp_cfg) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                await _enforce_license_binding(lic, session)   # phase 2: warn-only anti-copy binding (RFC identity)
                 graph         = build_graph(session, llms, checkpointer)
                 initial_state = _build_initial_state(period_cfg, steps, start_step_index)
 
