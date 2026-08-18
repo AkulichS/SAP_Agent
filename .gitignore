@@ -35,3 +35,8 @@ config_store.db-*
 # per-customer artifacts. The public key (configs/license_pubkey.pem) may be committed.
 license_signing_key.pem
 *.lic
+
+# Throwaway one-off scripts (dev-data fix-ups). Never carried in the repo:
+# pre-release, so shape changes are applied to the dev DB by hand, not by
+# migration code that would ship dead.
+Temp/

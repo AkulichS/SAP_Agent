@@ -6,7 +6,6 @@ parallel group. Stub-backed runs exercise graph → mcp_server → SAP stub toge
 canned-session runs drive the failure/retry branches deterministically.
 """
 
-import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 

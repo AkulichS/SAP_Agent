@@ -149,7 +149,13 @@ def settings_store(tmp_path, monkeypatch):
     return st
 
 
-def _admin(client, codes=("RU06",)):
+def _sys_admin(client, codes=("RU06",)):
+    """The top role: every permission, and global company scope regardless of `codes`."""
+    _session_cookie(client, username="root", role="sys_admin", company_codes=list(codes))
+
+
+def _company_admin(client, codes=("RU06",)):
+    """Company-scoped config admin: may edit its own companies' deltas, nothing above."""
     _session_cookie(client, username="admin", role="admin", company_codes=list(codes))
 
 
@@ -164,14 +170,34 @@ def test_settings_requires_admin(client, settings_store):
 
 
 def test_settings_company_authz(client, settings_store):
-    _admin(client, codes=["RU06"])
+    _company_admin(client, codes=["RU06"])
     assert client.get("/api/settings/RU47").status_code == 403      # unknown + unassigned
 
 
+def test_company_admin_scoped_to_its_own_companies(client, settings_store):
+    """A company admin is confined to its `company_codes` — being in the registry is not
+    enough. This is what lets several admins hold overlapping or disjoint company sets."""
+    settings_store.create_company("RU99", "New Co", user="root")
+    _company_admin(client, codes=["RU06"])
+    assert client.get("/api/settings/RU99").status_code == 403
+    assert client.get("/api/settings/RU06").status_code == 200
+
+
+def test_company_admin_cannot_reach_base_writes_or_registries(client, settings_store):
+    """The whole point of the split: `admin` configures companies, `sys_admin` owns the
+    product base, the registries and the user list."""
+    _company_admin(client, codes=["RU06"])
+    assert client.get("/api/settings/base").status_code == 200        # read-only view: allowed
+    assert client.put("/api/settings/base",
+                      json={"version": 1, "globals": {}, "steps": []}).status_code == 403
+    assert client.get("/api/registry/companies").status_code == 403
+    assert client.get("/api/registry/users").status_code == 403
+
+
 def test_settings_reachable_for_company_created_in_registry(client, settings_store):
-    """An admin who creates a company must be able to configure it, even though the new
-    code is in nobody's users.yaml company_codes yet."""
-    _admin(client, codes=["RU06"])
+    """A sys_admin who creates a company must be able to configure it straight away —
+    that now falls out of its global scope rather than a special case in the gate."""
+    _sys_admin(client, codes=["RU06"])
     assert client.post("/api/registry/companies",
                        json={"code": "RU99", "display_name": "New Co"}).status_code == 200
     assert client.get("/api/settings/RU99").status_code == 200
@@ -182,14 +208,15 @@ def test_settings_reachable_for_company_created_in_registry(client, settings_sto
 
 
 def test_settings_operator_still_blocked_for_registered_company(client, settings_store):
-    """Registry membership relaxes the company check for admins only — not the role check."""
-    settings_store.create_company("RU99", "New Co", user="admin")
+    """Company scope never substitutes for the permission: an operator holding RU99 may
+    run it, but `config_company` is not in the operator role at all."""
+    settings_store.create_company("RU99", "New Co", user="root")
     _session_cookie(client, role="operator", company_codes=["RU99"])
     assert client.get("/api/settings/RU99").status_code == 403
 
 
 def test_settings_get_put_reset_roundtrip(client, settings_store):
-    _admin(client, codes=["RU06"])
+    _company_admin(client, codes=["RU06"])
     data = client.get("/api/settings/RU06").json()
     assert data["version"] == 0
     assert _ko8g_field(data, "test_run")["overridden"] is False
@@ -215,7 +242,7 @@ def test_settings_get_put_reset_roundtrip(client, settings_store):
 
 
 def test_settings_put_rejects_invalid(client, settings_store):
-    _admin(client, codes=["RU06"])
+    _company_admin(client, codes=["RU06"])
     r = client.put("/api/settings/RU06", json={
         "version": 0,
         "override": {"KO8G": {"validate": {"keyword": {"source": "BOGUS"}}}},
@@ -233,13 +260,13 @@ def test_form_schema_requires_admin(client, settings_store):
 
 
 def test_form_schema_returns_sections(client, settings_store):
-    _admin(client)
+    _company_admin(client)
     d = client.get("/api/settings/form-schema").json()
     assert [s["key"] for s in d["sections"]][0] == "step"
 
 
 def test_base_get_put_history_roundtrip(client, settings_store):
-    _admin(client)
+    _sys_admin(client)
     data = client.get("/api/settings/base").json()
     assert data["version"] == 1          # settings_store seeds the base tier once
     n = len(data["steps"])
@@ -264,14 +291,224 @@ def test_base_get_put_history_roundtrip(client, settings_store):
 
 
 def test_base_put_rejects_invalid_step(client, settings_store):
-    _admin(client)
+    _sys_admin(client)
     r = client.put("/api/settings/base",
                    json={"version": 0, "globals": {}, "steps": [{"step_id": "X", "action_type": "NOPE"}]})
     assert r.status_code == 400
 
 
+def test_users_requires_admin(client, settings_store):
+    _session_cookie(client, role="operator", company_codes=["RU06"])
+    assert client.get("/api/registry/users").status_code == 403
+
+
+def test_users_crud(client, settings_store):
+    _sys_admin(client)
+    # seed a sys_admin so the last-sys_admin guard never blocks the edits below
+    settings_store.create_user("root", auth.hash_password("x"), role="sys_admin")
+
+    assert {u["username"] for u in client.get("/api/registry/users").json()} == {"root"}
+
+    # create — password is hashed server-side, never echoed back
+    r = client.post("/api/registry/users", json={
+        "username": "ivanov", "password": "secret", "display_name": "Ivanov",
+        "email": "ivanov@example.com",
+        "role": "operator", "company_codes": ["RU06", "RU72"]})
+    assert r.status_code == 200
+    ivanov = next(u for u in r.json()["users"] if u["username"] == "ivanov")
+    assert "password_hash" not in ivanov and ivanov["company_codes"] == ["RU06", "RU72"]
+    assert ivanov["email"] == "ivanov@example.com"
+
+    # the created user can actually authenticate — with a password they must then replace
+    assert auth.get_user("ivanov") and auth.verify_password(
+        "secret", auth.get_user("ivanov")["password_hash"])
+    assert auth.get_user("ivanov")["must_change_password"] is True
+
+    # duplicate → 400
+    assert client.post("/api/registry/users",
+                       json={"username": "ivanov", "password": "y"}).status_code == 400
+    # no password and no address to mail a generated one to → 400
+    assert client.post("/api/registry/users",
+                       json={"username": "nopass"}).status_code == 400
+    # bad role → 400
+    assert client.post("/api/registry/users",
+                       json={"username": "x", "password": "y", "role": "root"}).status_code == 400
+
+    # update: change role and address; there is no password field to change
+    r = client.put("/api/registry/users/ivanov",
+                   json={"role": "admin", "email": "i.ivanov@example.com",
+                         "password": "newpw"})
+    assert r.status_code == 200
+    row = next(u for u in r.json() if u["username"] == "ivanov")
+    assert row["role"] == "admin" and row["email"] == "i.ivanov@example.com"
+    assert auth.verify_password("secret", auth.get_user("ivanov")["password_hash"])
+
+    # delete
+    r = client.request("DELETE", "/api/registry/users/ivanov")
+    assert r.status_code == 200
+    assert "ivanov" not in {u["username"] for u in r.json()}
+
+
+def test_users_create_generates_password_when_none_given(client, settings_store, monkeypatch):
+    """No typed password + an address on file ⇒ one is generated and mailed, and the
+    admin never sees it."""
+    _sys_admin(client)
+    sent = {}
+    monkeypatch.setattr(web_app.mailer, "is_configured", lambda: True)
+    monkeypatch.setattr(web_app.mailer, "send_password_email",
+                        lambda to, user, pw, *, reset: sent.update(to=to, pw=pw, reset=reset))
+
+    r = client.post("/api/registry/users",
+                    json={"username": "petrov", "email": "petrov@example.com"})
+    assert r.status_code == 200
+    assert r.json()["emailed"] is True and r.json()["password"] is None
+    assert sent["to"] == "petrov@example.com" and sent["reset"] is False
+    assert auth.verify_password(sent["pw"], auth.get_user("petrov")["password_hash"])
+
+
+def test_users_reset_password_mails_and_locks_the_account(client, settings_store, monkeypatch):
+    _sys_admin(client)
+    settings_store.create_user("petrov", auth.hash_password("original"), role="operator",
+                               email="petrov@example.com")
+    sent = {}
+    monkeypatch.setattr(web_app.mailer, "is_configured", lambda: True)
+    monkeypatch.setattr(web_app.mailer, "send_password_email",
+                        lambda to, user, pw, *, reset: sent.update(to=to, pw=pw, reset=reset))
+
+    r = client.post("/api/registry/users/petrov/reset-password", json={})
+    assert r.status_code == 200
+    assert r.json()["emailed"] is True and r.json()["password"] is None
+    assert sent["reset"] is True
+    user = auth.get_user("petrov")
+    assert not auth.verify_password("original", user["password_hash"])
+    assert auth.verify_password(sent["pw"], user["password_hash"])
+    assert user["must_change_password"] is True
+
+
+def test_users_reset_password_returns_it_when_undeliverable(client, settings_store, monkeypatch):
+    """No SMTP (or no address) is not a dead end: the one-time password comes back once
+    so the admin can hand it over — otherwise a fresh deployment could onboard nobody."""
+    _sys_admin(client)
+    settings_store.create_user("petrov", auth.hash_password("original"), role="operator")
+    monkeypatch.setattr(web_app.mailer, "is_configured", lambda: True)
+
+    r = client.post("/api/registry/users/petrov/reset-password", json={})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["emailed"] is False and body["password"]
+    assert auth.verify_password(body["password"], auth.get_user("petrov")["password_hash"])
+
+
+def test_operator_company_scope_is_exclusive(client, settings_store):
+    """Every company is closed by exactly one operator, so a second one is refused —
+    while the same overlap between admins is fine (that is holiday cover)."""
+    _sys_admin(client)
+    settings_store.create_user("op1", auth.hash_password("x"), role="operator",
+                               company_codes=["RU06", "RU72"])
+
+    r = client.post("/api/registry/users", json={
+        "username": "op2", "password": "y", "role": "operator",
+        "company_codes": ["RU72"]})
+    assert r.status_code == 400 and "RU72" in r.json()["error"]
+
+    # …the same codes under a non-exclusive role are fine
+    assert client.post("/api/registry/users", json={
+        "username": "adm2", "password": "y", "role": "admin",
+        "company_codes": ["RU72"]}).status_code == 200
+
+    # …and an operator may of course keep its own codes on an unrelated edit
+    assert client.put("/api/registry/users/op1",
+                      json={"company_codes": ["RU06", "RU72"]}).status_code == 200
+
+    # promoting the admin to operator would now take RU72 off op1 → refused
+    assert client.put("/api/registry/users/adm2",
+                      json={"role": "operator"}).status_code == 400
+
+
+def test_company_scope_picker_offers_only_free_codes(client, settings_store):
+    _sys_admin(client)
+    for code in ("RU06", "RU72", "RU47"):
+        settings_store.create_company(code, code, user="root")
+    settings_store.create_user("op1", auth.hash_password("x"), role="operator",
+                               company_codes=["RU72"])
+
+    free = client.get("/api/registry/company-scope?role=operator").json()
+    assert set(free["all"]) == {"RU06", "RU72", "RU47"}
+    assert set(free["free"]) == {"RU06", "RU47"} and free["exclusive"] is True
+
+    # editing op1 itself: keeping RU72 is not a clash, so it stays on offer
+    own = client.get("/api/registry/company-scope?role=operator&username=op1").json()
+    assert set(own["free"]) == {"RU06", "RU72", "RU47"}
+
+    # a non-exclusive role sees the whole registry
+    adm = client.get("/api/registry/company-scope?role=admin").json()
+    assert set(adm["free"]) == {"RU06", "RU72", "RU47"} and adm["exclusive"] is False
+
+
+def test_handed_over_password_fences_the_session_until_replaced(client, settings_store):
+    """A one-time password gets you in and nothing else: every gated endpoint refuses
+    until the user sets one of their own."""
+    settings_store.create_user("temp", auth.hash_password("handedover"),
+                               role="sys_admin", must_change_password=True)
+    r = client.post("/api/login", json={"username": "temp", "password": "handedover"})
+    assert r.status_code == 200 and r.json()["must_change_password"] is True
+
+    assert client.get("/api/me").json()["must_change_password"] is True
+    assert client.get("/api/registry/users").status_code == 403
+    assert client.get("/api/settings/base").status_code == 403
+    with pytest.raises(WebSocketDisconnect) as ei:
+        with client.websocket_connect("/ws/dashboard") as ws:
+            ws.receive_json()
+    assert ei.value.code == 4003
+
+    # setting a real password lifts the fence (and re-issues the cookie that carries it)
+    assert client.post("/api/me/password", json={
+        "current_password": "handedover", "new_password": "myownpassword"}).status_code == 200
+    assert client.get("/api/me").json()["must_change_password"] is False
+    assert client.get("/api/registry/users").status_code == 200
+
+
+def test_self_service_password_reset(client, settings_store, monkeypatch):
+    settings_store.create_user("petrov", auth.hash_password("original"), role="operator",
+                               email="petrov@example.com")
+    sent = {}
+    monkeypatch.setattr(web_app.mailer, "is_configured", lambda: True)
+    monkeypatch.setattr(web_app.mailer, "send_password_email",
+                        lambda to, user, pw, *, reset: sent.update(to=to, pw=pw))
+
+    r = client.post("/api/password-reset", json={"username": "petrov"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert sent["to"] == "petrov@example.com"
+    user = auth.get_user("petrov")
+    assert auth.verify_password(sent["pw"], user["password_hash"])
+    assert user["must_change_password"] is True
+
+    # an unknown account gets the identical reply — the login screen is not a directory
+    sent.clear()
+    same = client.post("/api/password-reset", json={"username": "ghost"})
+    assert same.status_code == 200 and same.json() == r.json() and not sent
+
+
+def test_self_service_password_reset_without_smtp(client, settings_store, monkeypatch):
+    settings_store.create_user("petrov", auth.hash_password("original"), role="operator",
+                               email="petrov@example.com")
+    monkeypatch.setattr(web_app.mailer, "is_configured", lambda: False)
+    r = client.post("/api/password-reset", json={"username": "petrov"})
+    assert r.status_code == 503
+    # the account is untouched — no silent lockout
+    assert auth.verify_password("original", auth.get_user("petrov")["password_hash"])
+
+
+def test_users_last_admin_guarded_via_api(client, settings_store):
+    _sys_admin(client)
+    settings_store.create_user("solo", auth.hash_password("x"), role="sys_admin")
+    assert client.request("DELETE", "/api/registry/users/solo").status_code == 400
+    assert client.put("/api/registry/users/solo",
+                      json={"role": "operator"}).status_code == 400
+
+
 def test_registry_crud(client, settings_store):
-    _admin(client)
+    _sys_admin(client)
     assert client.get("/api/registry/companies").json() == []
     r = client.post("/api/registry/companies", json={"code": "RU99", "display_name": "New Co"})
     assert r.status_code == 200
@@ -286,9 +523,143 @@ def test_registry_crud(client, settings_store):
     assert r.json() == []
 
 
+def test_registry_listing_carries_the_delta_state(client, settings_store):
+    """The Manage-companies detail pane reads these off the listing — one request, not
+    one per company."""
+    _sys_admin(client)
+    client.post("/api/registry/companies", json={"code": "RU06", "display_name": "Co"})
+    row = client.get("/api/registry/companies").json()[0]
+    assert row["has_override"] is False and row["override_version"] == 0
+
+    settings_store.save_override("RU06", {"defaults": {"max_retries": 9}}, {},
+                                 expected_version=None, user="ivanov")
+    row = client.get("/api/registry/companies").json()[0]
+    assert row["has_override"] is True
+    assert row["override_version"] == 1 and row["override_updated_by"] == "ivanov"
+
+
+def test_base_settings_report_their_author(client, settings_store):
+    """The Base panel in the registry dialog names who last moved the base."""
+    _sys_admin(client)
+    before = client.get("/api/settings/base").json()
+    assert before["updated_by"] == "fixture"        # whoever seeded it
+    client.put("/api/settings/base",
+               json={"globals": {}, "steps": [], "version": before["version"]})
+    body = client.get("/api/settings/base").json()
+    assert body["version"] == before["version"] + 1
+    assert body["updated_by"] == "root" and body["updated_at"]
+
+
+# ===========================================================================
+# Roles: permission set, company scope, read-only manager
+# ===========================================================================
+
+def test_me_publishes_the_permission_set(client, settings_store):
+    """The UI hides controls off this list instead of keeping its own role table."""
+    _session_cookie(client, role="manager", company_codes=["RU06"])
+    data = client.get("/api/me").json()
+    assert data["role"] == "manager"
+    assert data["permissions"] == ["view"]          # read-only: no run, no config
+
+    _sys_admin(client)
+    perms = client.get("/api/me").json()["permissions"]
+    assert {"run", "config_base", "manage_users", "manage_registry"} <= set(perms)
+
+
+def test_sys_admin_scope_is_every_registered_company(client, settings_store):
+    """Global scope is implied by the role, so a sys_admin never has to add itself to a
+    company's list to see or configure it."""
+    for code in ("RU06", "RU47"):
+        settings_store.create_company(code, code, user="root")
+    _sys_admin(client, codes=[])                     # empty company_codes on purpose
+    assert {c["code"] for c in client.get("/api/companies").json()} == {"RU06", "RU47"}
+    assert client.get("/api/settings/RU47").status_code == 200
+
+
+def test_wildcard_scope_expands_to_the_registry(client, settings_store):
+    """`"*"` in company_codes is the explicit form of the same thing — the intended way
+    to give a manager oversight of the whole close."""
+    for code in ("RU06", "RU47"):
+        settings_store.create_company(code, code, user="root")
+    _session_cookie(client, role="manager", company_codes=["*"])
+    assert {c["code"] for c in client.get("/api/companies").json()} == {"RU06", "RU47"}
+
+
+def test_manager_is_read_only_over_rest(client, settings_store):
+    _session_cookie(client, role="manager", company_codes=["RU06"])
+    assert client.get("/api/companies").status_code == 200          # sees the dashboard
+    assert client.get("/api/settings/RU06").status_code == 403      # but configures nothing
+    assert client.get("/api/registry/users").status_code == 403
+
+
 # ===========================================================================
 # WebSocket: auth gating
 # ===========================================================================
+
+def test_ws_company_refuses_control_from_read_only_role(client, monkeypatch):
+    """A manager receives the whole event stream and can drive none of it. Enforced
+    server-side — hiding the buttons in the UI is not access control."""
+    started = []
+    monkeypatch.setattr(graph_builder, "run_period_close_web",
+                        lambda *a, **k: started.append(1))
+    _session_cookie(client, role="manager", company_codes=["RU06"])
+
+    with client.websocket_connect("/ws?company=RU06") as ws:
+        assert ws.receive_json()["type"] == "company_status"        # watching is fine
+        for msg in ({"type": "start"},
+                    {"type": "decision", "action": "skip_step"},
+                    {"type": "rollback_and_restart", "start_from_step": "S1"}):
+            ws.send_json(msg)
+            ev = ws.receive_json()
+            assert ev["type"] == "error" and "read-only" in ev["message"]
+    assert started == []                                            # nothing ever ran
+
+
+def test_ws_dashboard_refuses_start_from_read_only_role(client, monkeypatch):
+    started = []
+    monkeypatch.setattr(graph_builder, "run_period_close_web",
+                        lambda *a, **k: started.append(1))
+    _session_cookie(client, role="manager", company_codes=["RU06"])
+
+    with client.websocket_connect("/ws/dashboard") as ws:
+        ws.send_json({"type": "start", "company": "RU06"})
+        ev = ws.receive_json()
+        assert ev["type"] == "error" and "read-only" in ev["message"]
+    assert started == []
+
+
+# ===========================================================================
+# REST: self-service password change
+# ===========================================================================
+
+def test_change_own_password(client, settings_store):
+    """Any role may rotate its own password — routing every reset through a sys_admin is
+    what pushes teams toward shared accounts."""
+    settings_store.create_user("ivanov", auth.hash_password("oldpassword"),
+                               role="operator", company_codes=["RU06"])
+    _session_cookie(client, username="ivanov", role="operator")
+
+    # wrong current password → 403, and the stored hash is untouched
+    assert client.post("/api/me/password", json={
+        "current_password": "WRONG", "new_password": "newpassword"}).status_code == 403
+    assert auth.verify_password("oldpassword", auth.get_user("ivanov")["password_hash"])
+
+    # too short → 400
+    assert client.post("/api/me/password", json={
+        "current_password": "oldpassword", "new_password": "short"}).status_code == 400
+
+    r = client.post("/api/me/password", json={
+        "current_password": "oldpassword", "new_password": "newpassword"})
+    assert r.status_code == 200
+    assert auth.verify_password("newpassword", auth.get_user("ivanov")["password_hash"])
+
+
+def test_change_own_password_requires_auth(client):
+    assert client.post("/api/me/password", json={
+        "current_password": "x", "new_password": "yyyyyyyy"}).status_code == 401
+
+
+
 
 def test_ws_unauthenticated_closes_4001(client):
     with pytest.raises(WebSocketDisconnect) as ei:

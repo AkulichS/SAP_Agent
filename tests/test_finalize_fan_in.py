@@ -1,6 +1,5 @@
 """finalize_step_node verdict mapping and fan_in_node parallel merge."""
 
-import pytest
 
 from graph_builder import make_fan_in_node, make_finalize_step_node
 

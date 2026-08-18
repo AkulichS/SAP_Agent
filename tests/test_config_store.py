@@ -194,7 +194,8 @@ def test_validate_override_rejects_bad_enum_and_unknown_step():
 # ---------------------------------------------------------------------------
 
 def test_base_unseeded_is_version_zero(store):
-    assert store.get_base() == {"globals": {}, "steps": [], "version": 0}
+    assert store.get_base() == {"globals": {}, "steps": [], "version": 0,
+                                "updated_at": None, "updated_by": None}
 
 
 def test_get_base_steps_falls_back_to_files_then_db(store, tmp_path):
@@ -271,6 +272,31 @@ def test_registry_create_list_rename_delete(store):
     store.delete_company("RU06")
     assert {c["code"] for c in store.list_registry()} == {"RU47"}
     assert store.get_override("RU06")["version"] == 0   # overrides gone
+
+
+def test_registry_reports_each_company_s_own_delta(store):
+    """The registry listing carries the delta state the master–detail dialog shows, so it
+    needs no query per company. A run_context-only company still 'runs on Base'."""
+    store.create_company("RU06", "Has settings", user="a")
+    store.create_company("RU47", "Plain", user="a")
+    store.create_company("RU72", "Context only", {"controlling_area": "X500"}, user="a")
+    store.save_override("RU06", {"defaults": {"max_retries": 9}}, {}, expected_version=None, user="ivanov")
+
+    reg = {c["code"]: c for c in store.list_registry()}
+
+    assert reg["RU06"]["has_override"] is True
+    assert reg["RU06"]["override_version"] == 1
+    assert reg["RU06"]["override_updated_by"] == "ivanov"
+    assert reg["RU06"]["override_updated_at"]
+
+    # never overridden: no row at all
+    assert reg["RU47"]["has_override"] is False
+    assert reg["RU47"]["override_version"] == 0
+    assert reg["RU47"]["override_updated_by"] is None
+
+    # a row exists (the seeded run_context bumped it to v1) but the delta is still empty
+    assert reg["RU72"]["override_version"] == 1
+    assert reg["RU72"]["has_override"] is False
 
 
 def test_registry_duplicate_rejected(store):

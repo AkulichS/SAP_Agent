@@ -409,9 +409,6 @@ class RunManager:
             "step_progress": list(run.step_progress),
         }
 
-    def get_all_statuses(self) -> dict[str, dict]:
-        return {code: self.get_status(code) for code in self._runs}
-
     def get_catchup_events(self, company_code: str) -> list[dict]:
         """Return replay events for a subscriber that joined after the run started."""
         run = self._runs.get(company_code)

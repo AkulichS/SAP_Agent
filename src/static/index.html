@@ -29,12 +29,29 @@
       --skipped:      #858585;
       --pending:      #5a5a5a;
       --header-bg:    #323233;
-      --scrollbar:    #424242;
+      --scrollbar:      #6b7488;   /* muted label grey — the thumb, everywhere */
+      --scrollbar-hov:  #8b95a6;
       --font:         'Segoe UI', Consolas, 'DejaVu Sans', sans-serif;
       --mono:         Consolas, 'Courier New', monospace;
     }
 
     html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; }
+
+    /* ── Scrollbars: one style for every scrolling surface in the app ──
+       Set on `*` (not per pane) so native widgets — <select multiple>, <textarea>, combo
+       menus — lose the OS-default white bar with arrow buttons too. The thumb is the muted
+       label grey, drawn 4px wide via a transparent border + content-box clip so it reads as
+       a slim pill with breathing room rather than a channel. Anything that wants a different
+       bar (e.g. #tab-bar, which hides its own) overrides by its own higher specificity. */
+    * { scrollbar-width: thin; scrollbar-color: var(--scrollbar) transparent; }
+    *::-webkit-scrollbar { width: 10px; height: 10px; }
+    *::-webkit-scrollbar-track, *::-webkit-scrollbar-corner { background: transparent; }
+    *::-webkit-scrollbar-button { display: none; }        /* no stepper arrows */
+    *::-webkit-scrollbar-thumb {
+      background: var(--scrollbar); border: 3px solid transparent;
+      background-clip: content-box; border-radius: 5px;
+    }
+    *::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-hov); }
 
     /* ── Layout ── */
     #app { display: flex; flex-direction: column; height: 100%; }
@@ -51,31 +68,49 @@
     #titlebar .logo { font-size: 15px; font-weight: 600; color: var(--text-bright); letter-spacing: .5px; }
     #titlebar .context { color: var(--text-dim); font-size: 12px; flex: 1; }
     #titlebar .ws-status { font-size: 11px; padding: 2px 8px; border-radius: 3px; font-weight: 500; }
+    /* Who is signed in, sitting beside the connection state — the one place it is always
+       visible, on the dashboard and inside a company run alike. */
+    #titlebar .tb-user {
+      font-size: 11.5px; color: var(--text-dim); margin-left: auto;
+      max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
     .ws-status.connecting { color: var(--warn); }
     .ws-status.open       { color: var(--ok); }
     .ws-status.closed     { color: var(--failed); }
-    /* ── Tab bar ── */
+    /* ── Tab bar ──
+       Browser-style: each tab is its own rounded card sitting on the title bar, separated
+       by a gap rather than by a divider rule. The bar scrolls sideways instead of clipping,
+       so a client with many companies open can still reach the last tab. */
     #tab-bar {
-      display: flex; align-items: stretch; flex: 1;
-      overflow: hidden; margin-left: 4px;
+      display: flex; align-items: flex-end; gap: 4px; flex: 1; align-self: stretch;
+      overflow-x: auto; overflow-y: hidden; margin-left: 10px; padding-right: 6px;
+      scrollbar-width: none;                       /* the tabs are the affordance, not a bar */
     }
+    #tab-bar::-webkit-scrollbar { height: 0; }
     .tab-item {
-      display: flex; align-items: center; gap: 5px;
-      padding: 0 14px; height: 100%;
+      display: flex; align-items: center; gap: 6px;
+      padding: 0 12px; height: calc(100% - 6.5px);   /* ~5% shorter than the title bar's own line */
       font-size: 12px; color: var(--text-dim);
-      cursor: pointer; border-right: 1px solid var(--border);
+      cursor: pointer;
+      background: rgba(255,255,255,.04);
+      border: 1px solid transparent; border-bottom: none;
+      border-radius: 7px 7px 0 0;
       transition: background .1s, color .1s;
       white-space: nowrap; user-select: none; flex-shrink: 0;
     }
-    .tab-item:hover { background: rgba(255,255,255,.05); color: var(--text); }
-    .tab-item.active { background: var(--bg); color: var(--text-bright); box-shadow: inset 0 -2px 0 var(--accent); }
+    .tab-item:hover { background: rgba(255,255,255,.08); color: var(--text); }
+    .tab-item.active {
+      background: var(--bg); color: var(--text-bright);
+      border-color: var(--border);
+      box-shadow: inset 0 -2px 0 var(--accent);
+    }
     .tab-dot { font-size: 8px; line-height: 1; }
     .tab-close {
-      font-size: 10px; margin-left: 3px; width: 16px; height: 16px;
-      border-radius: 3px; display: inline-flex; align-items: center; justify-content: center;
+      font-size: 10px; margin-left: 2px; width: 15px; height: 15px;
+      border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
       color: var(--text-dim); flex-shrink: 0;
     }
-    .tab-close:hover { background: rgba(255,255,255,.12); color: var(--text); }
+    .tab-close:hover { background: rgba(255,255,255,.14); color: var(--text); }
 
     /* Main row */
     #main { display: flex; flex: 1; overflow: hidden; }
@@ -99,8 +134,6 @@
     }
 
     #step-list { flex: 1; overflow-y: auto; padding: 4px 0; }
-    #step-list::-webkit-scrollbar { width: 6px; }
-    #step-list::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
 
     .step-item {
       display: flex; align-items: flex-start; gap: 8px;
@@ -170,8 +203,6 @@
     #content-header .step-path { color: var(--text-bright); font-weight: 500; }
 
     #action-log { flex: 1; overflow-y: auto; padding: 12px 16px; }
-    #action-log::-webkit-scrollbar { width: 8px; }
-    #action-log::-webkit-scrollbar-thumb { background: var(--scrollbar); border-radius: 3px; }
 
     /* ── Action entry ── */
     .action-entry {
@@ -414,6 +445,52 @@
     }
     #pm-btn-cancel:hover { opacity: .8; }
 
+    /* ══════════════════════════════════════════════════════
+       CHANGE-PASSWORD MODAL (self-service, every role)
+    ══════════════════════════════════════════════════════ */
+    #passwd-overlay {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,.65); z-index: 130;
+      align-items: center; justify-content: center;
+    }
+    #passwd-overlay.visible { display: flex; }
+    #passwd-modal {
+      background: #252526; border: 1px solid var(--border); border-radius: 6px;
+      width: 380px; max-width: calc(100vw - 40px); padding: 20px 24px;
+    }
+    #passwd-modal h2 {
+      font-size: 14px; font-weight: 600; color: var(--text-bright); margin-bottom: 4px;
+    }
+    #passwd-modal .pm-company { font-size: 12px; color: var(--text-dim); margin-bottom: 18px; }
+    /* Fixed label column so all three inputs share one left edge and one width —
+       "CURRENT"/"NEW"/"REPEAT" are different lengths and would otherwise stagger them. */
+    #passwd-modal .pm-row label { width: 72px; margin-right: 12px; }
+    /* Masked plain-text inputs, not type=password: Chrome's password manager offers to
+       generate/save on any password field and its bubble covers the dialog. No password
+       field, no bubble — and nothing here is worth autofilling anyway. */
+    .masked { -webkit-text-security: disc; text-security: disc; }
+    #passwd-forced-note {
+      font-size: 11.5px; color: var(--warn); line-height: 1.5; margin-bottom: 14px;
+      background: rgba(224,163,77,.08); border: 1px solid #6a4a1a;
+      border-radius: 5px; padding: 8px 10px;
+    }
+    #passwd-msg { font-size: 12px; margin-top: 10px; min-height: 15px; }
+    #passwd-msg.err { color: var(--failed); }
+    #passwd-msg.ok  { color: var(--ok, #89d185); }
+    #passwd-actions { display: flex; gap: 8px; margin-top: 18px; }
+    #pw-btn-save {
+      flex: 1; padding: 8px; background: var(--accent); color: #fff;
+      border: none; border-radius: 4px; cursor: pointer;
+      font-size: 13px; font-weight: 500; transition: opacity .15s;
+    }
+    #pw-btn-save:hover { opacity: .85; }
+    #pw-btn-save:disabled { opacity: .4; cursor: default; }
+    #pw-btn-cancel {
+      padding: 8px 16px; background: #3c3c3c; color: var(--text);
+      border: none; border-radius: 4px; cursor: pointer; font-size: 13px;
+    }
+    #pw-btn-cancel:hover { opacity: .8; }
+
     /* Period edit button on company card */
     .period-edit-btn {
       background: none; border: none; color: #ffb347;
@@ -470,10 +547,14 @@
     }
     #login-btn:hover { opacity: .85; }
     #login-btn:disabled { opacity: .4; cursor: default; }
+    #login-forgot { text-align: center; margin-top: 12px; }
+    #login-forgot a { font-size: 11.5px; color: var(--text-dim); cursor: pointer; }
+    #login-forgot a:hover { color: var(--accent); text-decoration: underline; }
     #login-error {
       color: var(--failed); font-size: 12px; margin-top: 10px; text-align: center;
-      min-height: 18px;
+      min-height: 18px; line-height: 1.5;
     }
+    #login-error.ok { color: var(--ok, #89d185); }
 
     /* ══════════════════════════════════════════════════════
        DASHBOARD PAGE
@@ -489,7 +570,10 @@
       border-bottom: 1px solid var(--border);
     }
     #dashboard-header h2 { font-size: 15px; font-weight: 600; color: var(--text-bright); }
-    #dashboard-header .user-info { font-size: 12px; color: var(--text-dim); }
+    /* Labels the gear beside it rather than repeating the signed-in identity — that
+       now lives once, in the title bar next to the connection state. */
+    #dashboard-header .user-info { font-size: 12px; color: var(--text-dim); cursor: pointer; }
+    #dashboard-header .user-info:hover { color: var(--text); }
     #settings-btn {
       background: none; border: none; cursor: pointer;
       padding: 3px 6px; color: var(--text-dim); line-height: 1;
@@ -501,6 +585,12 @@
       background: transparent; color: var(--text-dim); cursor: pointer;
     }
     #logout-btn:hover { color: var(--text); }
+    #passwd-btn {
+      margin-left: 8px; font-size: 11px; padding: 3px 10px;
+      border: 1px solid var(--border); border-radius: 3px;
+      background: transparent; color: var(--text-dim); cursor: pointer;
+    }
+    #passwd-btn:hover { color: var(--text); }
 
     #company-grid {
       flex: 1; overflow-y: auto;
@@ -559,6 +649,7 @@
   <div id="titlebar">
     <span class="logo">⚙ SAP Period Close Agent</span>
     <div id="tab-bar"><!-- tabs populated by JS --></div>
+    <span id="titlebar-user" class="tb-user"></span>
     <span id="ws-status" class="ws-status connecting">⬤ connecting</span>
   </div>
 
@@ -570,8 +661,10 @@
       <div id="dashboard-header">
         <h2>Period Close — Company Selection</h2>
         <div style="display:flex;align-items:center;gap:0">
-          <span id="user-display" class="user-info"></span>
+          <span id="user-display" class="user-info" onclick="openSettings()"
+                title="Settings" style="display:none">Settings</span>
           <button id="settings-btn" onclick="openSettings()" style="display:none" title="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" d="M11.078 2.25c-.917 0-1.699.663-1.85 1.567L9.05 4.889c-.02.12-.115.26-.297.348a7.493 7.493 0 0 0-.986.57c-.166.115-.334.126-.45.083L6.3 5.508a1.875 1.875 0 0 0-2.282.819l-.922 1.597a1.875 1.875 0 0 0 .432 2.385l.84.692c.095.078.17.229.154.43a7.598 7.598 0 0 0 0 1.139c.015.2-.059.352-.153.43l-.841.692a1.875 1.875 0 0 0-.432 2.385l.922 1.597a1.875 1.875 0 0 0 2.282.818l1.019-.382c.115-.043.283-.031.45.082.312.214.641.405.985.57.182.088.277.228.297.35l.178 1.071c.151.904.933 1.567 1.85 1.567h1.844c.916 0 1.699-.663 1.85-1.567l.178-1.072c.02-.12.114-.26.297-.349.344-.165.673-.356.985-.57.167-.114.335-.125.45-.082l1.02.382a1.875 1.875 0 0 0 2.28-.819l.923-1.597a1.875 1.875 0 0 0-.432-2.385l-.84-.692c-.095-.078-.17-.229-.154-.43a7.614 7.614 0 0 0 0-1.139c-.016-.2.059-.352.153-.43l.84-.692c.708-.582.891-1.59.433-2.385l-.922-1.597a1.875 1.875 0 0 0-2.282-.818l-1.02.382c-.114.043-.282.031-.449-.083a7.49 7.49 0 0 0-.985-.57c-.183-.087-.277-.227-.297-.348l-.179-1.072a1.875 1.875 0 0 0-1.85-1.567h-1.843ZM12 15.75a3.75 3.75 0 1 0 0-7.5 3.75 3.75 0 0 0 0 7.5Z" clip-rule="evenodd"/></svg></button>
+          <button id="passwd-btn" onclick="openPasswordModal()" title="Change your password">Password</button>
           <button id="logout-btn" onclick="logout()">Logout</button>
         </div>
       </div>
@@ -608,6 +701,42 @@
       </div>
     </div>
 
+    <!-- ═══ SETTINGS PAGE (its own tab; styles live with the settings block below) ═══ -->
+    <div id="settings-page">
+      <div id="settings-head">
+        <h3>Settings</h3>
+        <label style="font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:#6b7488">Company</label>
+        <select id="settings-company" onchange="loadSettings(this.value)"></select>
+        <button id="registry-btn" onclick="openRegistry()" title="Create / rename / delete companies"
+                style="background:#222732;border:1px solid #2c313c;color:#c3cad6;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">Manage companies</button>
+        <button id="users-btn" onclick="openUsers()" title="Create / edit / delete users"
+                style="background:#222732;border:1px solid #2c313c;color:#c3cad6;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">Manage users</button>
+        <button onclick="closeSettings()" title="Close the Settings tab"
+                style="background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer">×</button>
+      </div>
+      <div id="settings-body">
+        <div id="settings-steps"></div>
+        <div id="settings-fields-col">
+          <div id="settings-tabbar"></div>
+          <div id="settings-fields"></div>
+        </div>
+      </div>
+      <div id="settings-foot">
+        <span class="msg">
+          <a class="version-link" id="settings-version-link" onclick="openSettingsHistory()" style="display:none"></a>
+          <span class="foot-sep" style="margin-left:16px;color:#3c4252">|</span>
+          <span class="status-label" style="margin-left:16px;text-transform:none;font-size:12.5px">Status:</span>
+          <span id="settings-msg" style="margin-left:6px;text-transform:none;font-size:12.5px;color:#c3cad6"></span>
+        </span>
+        <span id="settings-readonly-note" style="display:none;font-size:12.5px;color:#d8a657">
+          Read-only — editing the Base needs the <b>config_base</b> permission (sys_admin).
+          Pick a company above to edit its settings.
+        </span>
+        <button class="danger" id="settings-reset-btn" onclick="resetAllSettings()">Reset all to base</button>
+        <button class="primary" id="settings-save-btn" onclick="saveSettings()">Save</button>
+      </div>
+    </div>
+
   </div><!-- #main -->
 
   <!-- Status bar -->
@@ -637,6 +766,9 @@
       <button class="modal-btn btn-skip"    onclick="sendDecision('skip_step')">⏭ Skip Step</button>
       <button class="modal-btn btn-abort"   onclick="sendDecision('abort')">✕ Abort Run</button>
       <button id="modal-rollback-btn" class="modal-btn" style="background:#6b3a00;color:#ffb347;" onclick="openRollbackFromModal()">↩ Roll Back…</button>
+    </div>
+    <div id="modal-readonly-note" style="display:none;margin-top:16px;font-size:12px;color:#7b8494">
+      Read-only role — an operator decides how this step continues.
     </div>
   </div>
 </div>
@@ -697,18 +829,50 @@
   </div>
 </div>
 
+<!-- Change own password — available to every role, so routine resets never need a sys_admin -->
+<div id="passwd-overlay">
+  <div id="passwd-modal">
+    <h2>Change password</h2>
+    <div class="pm-company" id="passwd-who"></div>
+    <div id="passwd-forced-note" style="display:none">
+      You signed in with a one-time password. Set one only you know to continue.
+    </div>
+    <div class="pm-row">
+      <label>Current</label>
+      <input id="pw-current" class="masked" type="text" autocomplete="off"
+             spellcheck="false" data-1p-ignore data-lpignore="true">
+    </div>
+    <div class="pm-row">
+      <label>New</label>
+      <input id="pw-new" class="masked" type="text" autocomplete="off"
+             spellcheck="false" data-1p-ignore data-lpignore="true">
+    </div>
+    <div class="pm-row">
+      <label>Repeat</label>
+      <input id="pw-new2" class="masked" type="text" autocomplete="off"
+             spellcheck="false" data-1p-ignore data-lpignore="true">
+    </div>
+    <div id="passwd-msg"></div>
+    <div id="passwd-actions">
+      <button id="pw-btn-save" onclick="submitPasswordChange()">✓ Change</button>
+      <button id="pw-btn-cancel" onclick="closePasswordModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- Settings overlay (admin only) -->
 <style>
-  #settings-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,.6);
-    display: none; align-items: center; justify-content: center; z-index: 50;
+  /* Settings is a page behind its own tab, not an overlay: it sits in #main alongside the
+     dashboard and the company views, so a half-edited config can stay open while the admin
+     goes to look at a run. Its own sub-dialogs (companies, users, history) stay modal. */
+  #settings-page {
+    display: none; flex: 1; flex-direction: column; min-width: 0; overflow: hidden;
+    background: var(--panel, #1b1f27);
+    /* Its own stacking context: as an overlay it clamped its children (tooltips at 200,
+       combo dropdowns) beneath the dialogs above it, and in the page flow it must too. */
+    position: relative; z-index: 0;
   }
-  #settings-overlay.visible { display: flex; }
-  #settings-modal {
-    background: var(--panel, #1b1f27); border: 1px solid var(--border, #2c313c);
-    border-radius: 10px; width: min(1100px, 94vw); height: min(760px, 92vh);
-    display: flex; flex-direction: column; overflow: hidden;
-  }
+  #settings-page.visible { display: flex; }
   #settings-head {
     display: flex; align-items: center; gap: 12px; padding: 12px 16px;
     border-bottom: 1px solid var(--border, #2c313c);
@@ -716,23 +880,38 @@
   #settings-head h3 { font-size: 15px; font-weight: 600; color: var(--text-bright, #e8edf5); flex: 1; }
   #settings-head select { background:#11141a; color:#e8edf5; border:1px solid #2c313c; border-radius:6px; padding:5px 8px; }
   #settings-body { flex: 1; display: flex; min-height: 0; }
+  /* Master pane, same shape as Manage companies' company index: a pinned head, a list that
+     scrolls on its own, and a pinned footer — so ＋ Add step never scrolls out of reach
+     however many steps the base carries. */
   #settings-steps {
-    width: 240px; border-right: 1px solid var(--border,#2c313c); overflow-y: auto; padding: 6px;
+    width: 360px; flex-shrink: 0; border-right: 1px solid var(--border,#2c313c);
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden; padding: 6px 6px 0;
   }
+  #settings-steps .rail-scroll { flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 4px; }
   .rail-section-label {
     font-size: 10px; text-transform: uppercase; letter-spacing:.4px; color: #6b7488;
     padding: 10px 9px 4px;
   }
+  /* Rule under the pinned head, so the list below reads as scrolling under it. */
+  #settings-steps .rail-section-label { padding-bottom:6px; margin-bottom:4px; border-bottom:1px solid #2c313c; }
   .set-step {
     padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 12.5px;
     color: var(--text, #c3cad6); display:flex; align-items:center; gap:6px;
+    border-left: 2px solid transparent;
   }
-  .set-step:hover { background:#222732; }
-  .set-step.active { background:#283042; color:#fff; }
+  .set-step:hover { background:rgba(255,255,255,.04); }
+  /* Selected step is marked like the selected company code: darker plate + blue accent bar. */
+  .set-step.active { background:#202737; border-left-color:#9dc0ef; color:#fff; }
+  .set-step.active .sid { color:#9dc0ef; }
+  .set-step .sid { font-family: var(--mono); font-size:12px;
+                   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .set-step.dim { opacity:.5; }
   .set-step .dot { width:7px; height:7px; border-radius:50%; background:#f0a73a; visibility:hidden; }
   .set-step.has-override .dot { visibility:visible; }
   #settings-fields { flex: 1; overflow-y: auto; padding: 14px 18px; background: var(--panel, #1b1f27); }
+  /* A form, not a table: cap the content width so fields (and the params grid worst of all)
+     stop stretching edge-to-edge on a wide monitor. */
+  #settings-fields > * { max-width: 1040px; min-width: 0; }
   .set-group-title { font-size: 11px; text-transform: uppercase; letter-spacing:.5px;
     color: var(--text-dim,#7b8494); margin: 14px 0 6px; }
   .set-field { display: grid; grid-template-columns: 220px 1fr auto; gap: 10px;
@@ -763,6 +942,8 @@
   .tip-icon .tip-text { display:none; position:absolute; bottom:calc(100% + 4px); left:0; transform:none;
     background:#1e2330; color:#c3cad6; border:1px solid #3c4252; border-radius:6px;
     padding:6px 9px; font-size:11px; line-height:1.5; white-space:pre-line;
+    /* A tip is prose, so it never inherits the label's uppercase/tracking styling. */
+    text-transform:none; letter-spacing:normal; font-weight:400;
     width:240px; z-index:200; pointer-events:none; box-shadow:0 4px 12px rgba(0,0,0,.4); }
   .tip-icon:hover .tip-text { display:block; }
   #settings-foot { display:flex; align-items:center; gap:10px; padding: 12px 16px;
@@ -779,6 +960,16 @@
     text-decoration:none; cursor:pointer; border-bottom: 1px dashed #6b7488;
   }
   #settings-foot .version-link:hover { color:var(--text,#c3cad6); border-bottom-color:var(--text,#c3cad6); }
+
+  /* Read-only tier (base config without `config_base`): everything still legible, nothing
+     typeable — the pane is for reading the base your delta sits on. */
+  #settings-body .readonly input:disabled,
+  #settings-body .readonly select:disabled,
+  #settings-body .readonly textarea:disabled {
+    color:#9aa3b2; opacity:1; cursor:not-allowed;
+  }
+  #settings-body .readonly button:disabled { opacity:.3; cursor:not-allowed; }
+  #settings-body .readonly input[type=checkbox]:disabled { opacity:.6; }
 
   /* Confirm dialog */
   #settings-confirm-overlay {
@@ -817,13 +1008,16 @@
     box-shadow:0 8px 32px rgba(0,0,0,.55);
   }
   #settings-confirm-box h4 { margin:0 0 10px; font-size:14px; color:#ff6b6b; }
-  #settings-confirm-box p  { margin:0 0 22px; font-size:13px; color:var(--text,#c3cad6); line-height:1.5; }
+  #settings-confirm-box p  { margin:0 0 22px; font-size:13px; color:var(--text,#c3cad6); line-height:1.5;
+    white-space:pre-line; }
   #settings-confirm-box .actions { display:flex; justify-content:flex-end; gap:8px; }
   #settings-confirm-box .actions button { padding:7px 18px; border-radius:6px; font-size:13px; cursor:pointer; }
   #settings-confirm-box .actions .btn-cancel { background:none; border:1px solid var(--border,#2c313c); color:var(--text,#c3cad6); }
   #settings-confirm-box .actions .btn-confirm { background:#c0392b; border:none; color:#fff; }
+  #settings-confirm-box .actions .btn-alt    { background:#222732; border:1px solid #2c313c; color:#c3cad6; }
   #settings-confirm-box .actions .btn-cancel:hover  { border-color:#c3cad6; }
   #settings-confirm-box .actions .btn-confirm:hover { background:#e74c3c; }
+  #settings-confirm-box .actions .btn-alt:hover     { border-color:#c3cad6; }
 
   /* History panel */
   #settings-history-overlay {
@@ -1023,9 +1217,11 @@
   }
   .set-step .step-tools button:hover { color:#fff; }
   .set-step .step-tools button.del:hover { color:#e06c75; }
+  /* Pinned below the scrolling list (never inside it), like Manage companies' ＋ Add company. */
   #settings-steps .rail-action {
-    display:flex; gap:8px; padding:8px 6px 4px; border-top:1px solid rgba(44,49,60,.6); margin-top:6px;
+    display:flex; gap:8px; padding:9px 3px 8px; border-top:1px solid #2c313c; flex-shrink:0;
   }
+  #settings-steps .rail-action .step-add-btn { width:100%; margin-top:0; }
 
   /* ── Prompt field (large textarea) preview + expand ── */
   .prompt-field .ctl { display:flex; flex-direction:column; gap:4px; }
@@ -1066,6 +1262,8 @@
   .pe-pane.hidden { display:none; }
   .pe-editor-pane { border-right:1px solid var(--border,#2c313c); }
   .pe-editor-pane .CodeMirror { width:100%; height:100%; font-size:13px; background:#11141a; color:#dfe6f0; }
+  /* CodeMirror paints the square between its two scrollbars white by default (vendor CSS). */
+  .CodeMirror-scrollbar-filler, .CodeMirror-gutter-filler { background-color:transparent; }
   .pe-editor-pane .CodeMirror-cursor { border-left:1px solid #e8edf5; }
   .pe-editor-pane .CodeMirror-selected { background:#2a3550 !important; }
   .pe-editor-pane .CodeMirror-line::selection, .pe-editor-pane .CodeMirror-line ::selection { background:#2a3550; }
@@ -1107,55 +1305,68 @@
     display:none; align-items:center; justify-content:center; z-index:210;
   }
   #registry-overlay.visible { display:flex; }
+  /* Master–detail: a narrow index of codes on the left, everything you can do to the
+     selected one on the right. Rows stay one line so a client with 100+ company codes
+     still sees a useful slice of the list; the actions get names instead of icons. */
   #registry-box {
     background:var(--panel,#1b1f27); border:1px solid var(--border,#2c313c); border-radius:10px;
-    width:min(560px,92vw); max-height:82vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.55);
+    width:min(760px,94vw); max-height:84vh; display:flex; flex-direction:column; box-shadow:0 8px 32px rgba(0,0,0,.55);
   }
-  #registry-box .reg-head { display:flex; align-items:center; padding:14px 18px; border-bottom:1px solid var(--border,#2c313c); }
+  #registry-box .reg-head { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid var(--border,#2c313c); }
   #registry-box .reg-head h4 { flex:1; margin:0; font-size:14px; color:var(--text-bright,#e8edf5); }
   #registry-box .reg-head button { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
-  #registry-box .reg-body { overflow-y:auto; padding:10px 18px; }
-  .reg-row { display:flex; align-items:center; gap:8px; padding:7px 0; border-bottom:1px solid rgba(44,49,60,.5); font-size:13px; color:#c3cad6; }
-  .reg-row .code { font-family:monospace; color:#9dc0ef; width:80px; }
-  .reg-row .name { flex:1; }
-  .reg-row button { background:none;border:none;color:#7b8494;cursor:pointer;font-size:12px;display:inline-flex;align-items:center; }
-  .reg-row button:hover { color:#e06c75; }
-  .reg-row button svg { display:block; }
-  .reg-row-base { border-bottom:1px solid #3c4252; margin-bottom:6px; padding-bottom:11px; }
-  .reg-new { display:grid; grid-template-columns:90px 1fr auto; gap:8px; padding:12px 0 4px; }
-  .reg-new input { background:#11141a;color:#e8edf5;border:1px solid #2c313c;border-radius:5px;padding:6px 8px;font-size:12.5px; }
-  .reg-new button { background:#22314a;border:1px solid #34507a;color:#9dc0ef;border-radius:6px;padding:6px 12px;cursor:pointer;font-size:12.5px; }
-</style>
-<div id="settings-overlay">
-  <div id="settings-modal">
-    <div id="settings-head">
-      <h3>Settings</h3>
-      <label style="font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:#6b7488">Company</label>
-      <select id="settings-company" onchange="loadSettings(this.value)"></select>
-      <button onclick="openRegistry()" title="Create / rename / delete companies"
-              style="background:#222732;border:1px solid #2c313c;color:#c3cad6;border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">Manage companies</button>
-      <button onclick="closeSettings()" style="background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer">×</button>
-    </div>
-    <div id="settings-body">
-      <div id="settings-steps"></div>
-      <div id="settings-fields-col">
-        <div id="settings-tabbar"></div>
-        <div id="settings-fields"></div>
-      </div>
-    </div>
-    <div id="settings-foot">
-      <span class="msg">
-        <a class="version-link" id="settings-version-link" onclick="openSettingsHistory()" style="display:none"></a>
-        <span class="foot-sep" style="margin-left:16px;color:#3c4252">|</span>
-        <span class="status-label" style="margin-left:16px;text-transform:none;font-size:12.5px">Status:</span>
-        <span id="settings-msg" style="margin-left:6px;text-transform:none;font-size:12.5px;color:#c3cad6"></span>
-      </span>
-      <button class="danger" id="settings-reset-btn" onclick="resetAllSettings()">Reset all to base</button>
-      <button class="primary" onclick="saveSettings()">Save</button>
-    </div>
-  </div>
-</div>
+  .reg-count { font-size:11px; color:#6b7488; white-space:nowrap; }
 
+  /* Fixed height so both panes scroll internally instead of growing the dialog. */
+  .reg-md { display:grid; grid-template-columns:236px 1fr; height:clamp(340px, 58vh, 500px); overflow:hidden; }
+  .reg-list { border-right:1px solid #2c313c; display:flex; flex-direction:column; min-width:0; min-height:0; }
+  .reg-filter { padding:11px 12px; }
+  .reg-filter input { width:100%; background:#0c0f14; color:#e8edf5; border:1px solid #2c313c;
+                      border-radius:5px; padding:6px 9px; font-size:12.5px; }
+  .reg-filter input:focus { outline:none; border-color:#34507a; }
+  #registry-body { flex:1; overflow-y:auto; min-height:0; }
+  .reg-item { display:flex; align-items:center; gap:8px; padding:7px 12px; cursor:pointer;
+              border-left:2px solid transparent; }
+  .reg-item:hover { background:rgba(255,255,255,.04); }
+  .reg-item.sel { background:#202737; border-left-color:#9dc0ef; }
+  .reg-item:focus-visible { outline:1px solid #34507a; outline-offset:-2px; }
+  .reg-item .code { font-family:var(--mono); color:#9dc0ef; font-size:12.5px; width:56px; flex-shrink:0; }
+  .reg-item .nm { flex:1; font-size:12px; color:#8b95a6; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  /* Filled = the company carries its own delta; hollow = it runs on plain Base. */
+  .reg-dot { width:6px; height:6px; border-radius:50%; background:none;
+             box-shadow:inset 0 0 0 1px #445270; flex-shrink:0; }
+  .reg-dot.own { background:#7fb0ef; box-shadow:none; }
+  .reg-item-base { border-bottom:1px solid #2c313c; padding:9px 12px; }
+  .reg-item-base .code { width:auto; }
+  .reg-list-foot { padding:9px 12px; border-top:1px solid #2c313c; }
+  .reg-list-foot button { width:100%; background:#22314a; border:1px solid #34507a; color:#9dc0ef;
+                          border-radius:6px; padding:7px 12px; cursor:pointer; font-size:12.5px; }
+
+  .reg-detail { padding:18px 20px; display:flex; flex-direction:column; gap:16px; overflow-y:auto; min-height:0; }
+  .reg-detail .rd-title { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .reg-detail .rd-title .code { font-family:var(--mono); color:#9dc0ef; font-size:17px; }
+  .reg-detail label { display:block; font-size:10px; letter-spacing:.5px; text-transform:uppercase;
+                      color:#6b7488; margin-bottom:5px; }
+  .reg-detail input[type=text] { width:100%; background:#0c0f14; color:#e8edf5; border:1px solid #2c313c;
+                      border-radius:5px; padding:7px 9px; font-size:13px; }
+  .reg-detail input[type=text]:focus { outline:none; border-color:#34507a; }
+  .rd-facts { display:grid; grid-template-columns:1fr 1fr; gap:14px 18px; }
+  .rd-facts .v { font-size:12.5px; color:#c3cad6; }
+  .rd-facts .v small, .rd-facts .v .none { color:#6b7488; }
+  .rd-note { font-size:12px; color:#7b8494; line-height:1.55; }
+  .rd-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:auto; padding-top:8px; }
+  .rd-actions button { border-radius:6px; padding:7px 13px; cursor:pointer; font-size:12.5px;
+                       background:#22314a; border:1px solid #34507a; color:#9dc0ef; }
+  .rd-actions button.quiet { background:#222732; border-color:#2c313c; color:#c3cad6; }
+  .rd-actions button.danger { background:none; border-color:#6a3038; color:#e0808c; }
+  .rd-actions button:disabled { opacity:.4; cursor:default; }
+  .rd-actions .sp { flex:1; }
+  .rd-chip { font-size:10px; letter-spacing:.4px; padding:2px 7px; border-radius:9px; border:1px solid; }
+  .rd-chip.own  { color:#7fb0ef; border-color:#2c4468; background:#16233a; }
+  .rd-chip.base { color:#6b7488; border-color:#2c313c; background:#191d24; }
+  #reg-msg { font-size:11.5px; min-height:15px; color:#63c9a8; }
+  #reg-msg.err { color:#e06c75; }
+</style>
 <!-- Confirm dialog (replaces browser confirm()) -->
 <div id="settings-confirm-overlay">
   <div id="settings-confirm-box">
@@ -1163,6 +1374,8 @@
     <p id="settings-confirm-text"></p>
     <div class="actions">
       <button class="btn-cancel" id="settings-confirm-cancel">Cancel</button>
+      <!-- Optional third choice (see showConfirm's `alt` option); hidden unless asked for. -->
+      <button class="btn-alt" id="settings-confirm-alt" style="display:none"></button>
       <button class="btn-confirm" id="settings-confirm-ok">Reset</button>
     </div>
   </div>
@@ -1220,9 +1433,193 @@
   <div id="registry-box">
     <div class="reg-head">
       <h4>Manage companies</h4>
+      <span class="reg-count" id="reg-count"></span>
       <button onclick="closeRegistry()">×</button>
     </div>
-    <div class="reg-body" id="registry-body"></div>
+    <div class="reg-md">
+      <div class="reg-list">
+        <div class="reg-filter">
+          <input id="reg-filter" placeholder="Filter by code or name…" autocomplete="off"
+                 spellcheck="false" oninput="renderRegistryRows()" aria-label="Filter companies">
+        </div>
+        <div class="reg-item reg-item-base" id="reg-base-item" tabindex="0" role="button"
+             onclick="selectRegistryEntry('__base__')"
+             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectRegistryEntry('__base__')}">
+          <span class="reg-dot own"></span>
+          <span class="code">⚙ Base</span>
+        </div>
+        <div id="registry-body"></div>
+        <div class="reg-list-foot">
+          <button onclick="selectRegistryEntry('__new__')">＋ Add company</button>
+        </div>
+      </div>
+      <div class="reg-detail" id="registry-detail"></div>
+    </div>
+  </div>
+</div>
+
+<!-- User registry manager -->
+<style>
+  #users-overlay { position:fixed; inset:0; background:rgba(8,10,14,.62); z-index:60; display:none; align-items:flex-start; justify-content:center; }
+  #users-overlay.visible { display:flex; }
+  #users-box { background:#1a1e26; border:1px solid #2c313c; border-radius:12px; width:min(720px,94vw); margin-top:7vh; max-height:82vh; display:flex; flex-direction:column; box-shadow:0 24px 60px rgba(0,0,0,.5); }
+  #users-box .reg-head { display:flex; align-items:center; justify-content:space-between; padding:16px 20px; border-bottom:1px solid #2c313c; }
+  #users-box .reg-head h4 { margin:0; font-size:15px; color:#e8edf5; }
+  #users-box .reg-head button { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
+  #users-box .reg-body { padding:12px 20px 18px; overflow-y:auto; }
+  .usr-row { display:grid; grid-template-columns:1.3fr 1.4fr auto auto; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid #232833; }
+  .usr-row .u-name { color:#e8edf5; font-size:13px; }
+  .usr-row .u-name small { display:block; color:#7b8494; font-size:11px; }
+  .usr-row .u-meta { color:#9aa3b2; font-size:11.5px; }
+  .usr-row .u-role { font-size:10.5px; text-transform:uppercase; letter-spacing:.4px; padding:2px 7px; border-radius:10px; }
+  .usr-row .u-role.admin { background:#3a2a12; color:#e0a34d; border:1px solid #6a4a1a; }
+  .usr-row .u-role.sys_admin { background:#3a1620; color:#ef7f96; border:1px solid #6a2436; }
+  .usr-row .u-role.manager { background:#152e28; color:#63c9a8; border:1px solid #245046; }
+  .usr-row .u-role.operator { background:#16233a; color:#7fb0ef; border:1px solid #2c4468; }
+  .usr-row .u-actions { display:flex; gap:6px; }
+  .usr-row .u-actions button { background:none;border:none;color:#7b8494;cursor:pointer;font-size:13px; }
+  .usr-row .u-actions button:hover { color:#e06c75; }
+  .usr-row .u-name small.u-mail { color:#6b7488; }
+  .usr-row .u-name .u-temp { color:#e0a34d; font-size:10px; letter-spacing:.3px; }
+  .usr-foot { display:flex; justify-content:flex-end; padding-top:14px; }
+  .usr-foot button { background:#22314a;border:1px solid #34507a;color:#9dc0ef;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:12.5px; }
+
+  /* ── User editor (pop-up, like the company registry dialogs) ── */
+  #user-edit-overlay { position:fixed; inset:0; background:rgba(8,10,14,.66); z-index:70; display:none; align-items:center; justify-content:center; }
+  #user-edit-overlay.visible { display:flex; }
+  #user-edit-box { background:#1a1e26; border:1px solid #2c313c; border-radius:12px; width:min(520px,94vw); max-height:88vh; overflow-y:auto; box-shadow:0 24px 60px rgba(0,0,0,.55); }
+  #user-edit-box .ue-head { display:flex; align-items:center; justify-content:space-between; padding:15px 20px; border-bottom:1px solid #2c313c; }
+  #user-edit-box .ue-head h4 { margin:0; font-size:15px; color:#e8edf5; }
+  #user-edit-box .ue-head button { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
+  #user-edit-box .ue-body { padding:16px 20px 4px; }
+  .ue-row { display:flex; align-items:center; margin-bottom:12px; }
+  .ue-row > label { width:132px; flex-shrink:0; font-size:10.5px; text-transform:uppercase;
+                    letter-spacing:.5px; color:#7b8494; }
+  .ue-row input, .ue-row select { flex:1; min-width:0; background:#0c0f14; color:#e8edf5;
+                    border:1px solid #2c313c; border-radius:5px; padding:7px 9px; font-size:12.5px; }
+  .ue-row input:disabled, .ue-row input[readonly] { color:#9aa3b2; background:#11141a; }
+  .ue-row .ue-pick { margin-left:8px; flex-shrink:0; background:#222732; border:1px solid #2c313c;
+                    color:#c3cad6; border-radius:5px; padding:7px 12px; font-size:12px; cursor:pointer; }
+  .ue-row .ue-pick:disabled { opacity:.4; cursor:default; }
+  /* Field guidance is the same ⓘ affordance the settings fields use, so nothing shouts from
+     the form itself. Inside a dialog the bubble drops downward — the top row's tip would
+     otherwise be clipped by the box. */
+  .ue-row .tip-icon .tip-text, .sc-pane .tip-icon .tip-text { bottom:auto; top:calc(100% + 5px); }
+  #user-edit-box .ue-foot { display:flex; gap:8px; align-items:center; padding:14px 20px 18px; border-top:1px solid #2c313c; margin-top:8px; }
+  #user-edit-box .ue-foot .spacer { flex:1; }
+  #user-edit-box .ue-foot button { border-radius:6px; padding:7px 14px; cursor:pointer; font-size:12.5px;
+                    background:#22314a; border:1px solid #34507a; color:#9dc0ef; }
+  #user-edit-box .ue-foot button.ghost { background:none; border:1px solid #2c313c; color:#9aa3b2; }
+  #user-edit-box .ue-foot button.reset { background:none; border:1px solid #6a4a1a; color:#e0a34d; }
+  #ue-msg { font-size:11.5px; padding:0 20px; min-height:16px; color:#63c9a8; }
+  #ue-msg.err { color:#e06c75; }
+
+  /* ── Dual-list company-scope picker (SAP-style two-pane transfer) ── */
+  #scope-overlay { position:fixed; inset:0; background:rgba(8,10,14,.7); z-index:80; display:none; align-items:center; justify-content:center; }
+  #scope-overlay.visible { display:flex; }
+  #scope-box { background:#1a1e26; border:1px solid #2c313c; border-radius:12px; width:min(660px,95vw); box-shadow:0 24px 60px rgba(0,0,0,.55); }
+  #scope-box .sc-head { display:flex; align-items:center; justify-content:space-between; padding:15px 20px; border-bottom:1px solid #2c313c; }
+  #scope-box .sc-head h4 { margin:0; font-size:15px; color:#e8edf5; }
+  #scope-box .sc-head button { background:none;border:none;color:#7b8494;font-size:20px;cursor:pointer; }
+  #scope-box .sc-body { display:grid; grid-template-columns:1fr auto 1fr; gap:12px; padding:16px 20px; align-items:center; }
+  .sc-pane { display:flex; flex-direction:column; min-width:0; }
+  .sc-pane label { font-size:10.5px; text-transform:uppercase; letter-spacing:.5px; color:#7b8494; margin-bottom:6px; }
+  .sc-pane select { height:230px; background:#0c0f14; color:#e8edf5; border:1px solid #2c313c;
+                    border-radius:6px; font-size:12.5px; padding:4px; }
+  .sc-pane select option { padding:3px 6px; }
+  .sc-arrows { display:flex; flex-direction:column; gap:10px; }
+  .sc-arrows button { background:#222732; border:1px solid #2c313c; color:#c3cad6; border-radius:6px;
+                      padding:6px 12px; cursor:pointer; font-size:14px; line-height:1; }
+  .sc-arrows button:hover { border-color:#34507a; color:#9dc0ef; }
+  #scope-note { font-size:11px; color:#6b7488; padding:0 20px 4px; line-height:1.5; }
+  #scope-box .sc-foot { display:flex; gap:8px; justify-content:flex-end; padding:12px 20px 18px; }
+  #scope-box .sc-foot button { border-radius:6px; padding:7px 14px; cursor:pointer; font-size:12.5px;
+                    background:#22314a; border:1px solid #34507a; color:#9dc0ef; }
+  #scope-box .sc-foot button.ghost { background:none; border:1px solid #2c313c; color:#9aa3b2; }
+</style>
+<div id="users-overlay">
+  <div id="users-box">
+    <div class="reg-head">
+      <h4>Manage users</h4>
+      <button onclick="closeUsers()">×</button>
+    </div>
+    <div class="reg-body" id="users-body"></div>
+  </div>
+</div>
+
+<!-- User editor — add and edit share one dialog, so the scope picker has one home -->
+<div id="user-edit-overlay">
+  <div id="user-edit-box">
+    <div class="ue-head">
+      <h4 id="ue-title">Edit user</h4>
+      <button onclick="closeUserEditor()">×</button>
+    </div>
+    <div class="ue-body">
+      <div class="ue-row">
+        <label>Username<span class="tip-icon">ⓘ<span class="tip-text">The name the user signs in with. It identifies the account, so it cannot be changed afterwards.</span></span></label>
+        <input id="ue-username" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="ue-row">
+        <label>Display name<span class="tip-icon">ⓘ<span class="tip-text">Optional. Shown next to the username in the user list.</span></span></label>
+        <input id="ue-display" autocomplete="off">
+      </div>
+      <div class="ue-row">
+        <label>E-mail<span class="tip-icon">ⓘ<span class="tip-text">Optional, but it is where one-time passwords are sent. Without an address a generated password has to be handed over by hand.</span></span></label>
+        <input id="ue-email" type="email" autocomplete="off" spellcheck="false"
+               placeholder="optional — where password resets are sent">
+      </div>
+      <div class="ue-row">
+        <label>Role<span class="tip-icon">ⓘ<span class="tip-text">What the user may do. operator runs the close; manager watches it read-only; admin adds company configuration; sys_admin also holds the base config, registries and users.</span></span></label>
+        <select id="ue-role" onchange="onUserRoleChange()"></select>
+      </div>
+      <div class="ue-row">
+        <label>Company scope<span class="tip-icon">ⓘ<span class="tip-text" id="ue-codes-hint"></span></span></label>
+        <input id="ue-codes" readonly placeholder="none">
+        <button class="ue-pick" id="ue-codes-btn" onclick="openScopePicker()">Select…</button>
+      </div>
+      <div class="ue-row" id="ue-pass-row">
+        <label>Initial password<span class="tip-icon">ⓘ<span class="tip-text">Leave blank to generate one and e-mail it. Either way it is a one-time password — the user is asked to replace it at first sign-in.</span></span></label>
+        <input id="ue-pass" class="masked" type="text" autocomplete="off"
+               spellcheck="false" data-1p-ignore data-lpignore="true">
+      </div>
+    </div>
+    <div id="ue-msg"></div>
+    <div class="ue-foot">
+      <button class="reset" id="ue-reset-btn" onclick="resetUserPassword()"
+              title="Generate a new one-time password and e-mail it to the user">↻ Reset password</button>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="closeUserEditor()">Cancel</button>
+      <button id="ue-save-btn" onclick="saveUserEditor()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Company-scope picker: assigned ⇄ available, the two-pane transfer SAP users expect -->
+<div id="scope-overlay">
+  <div id="scope-box">
+    <div class="sc-head">
+      <h4 id="scope-title">Company scope</h4>
+      <button onclick="closeScopePicker()">×</button>
+    </div>
+    <div class="sc-body">
+      <div class="sc-pane">
+        <label>Assigned<span class="tip-icon">ⓘ<span class="tip-text">The companies this user reaches. Select one or more and press ➡ (or double-click) to give them back.</span></span></label>
+        <select id="scope-assigned" multiple size="12" ondblclick="scopeMove('remove')"></select>
+      </div>
+      <div class="sc-arrows">
+        <button onclick="scopeMove('add')"    title="Assign selected">⬅</button>
+        <button onclick="scopeMove('remove')" title="Remove selected">➡</button>
+      </div>
+      <div class="sc-pane">
+        <label>Available<span class="tip-icon">ⓘ<span class="tip-text">Registered companies this user may still be given. Select one or more and press ⬅ (or double-click) to assign them.</span></span></label>
+        <select id="scope-available" multiple size="12" ondblclick="scopeMove('add')"></select>
+      </div>
+    </div>
+    <div id="scope-note"></div>
+    <div class="sc-foot">
+      <button class="ghost" onclick="closeScopePicker()">Cancel</button>
+      <button onclick="applyScopePicker()">Apply</button>
+    </div>
   </div>
 </div>
 
@@ -1240,6 +1637,7 @@
       <input id="login-pass" type="password" autocomplete="current-password"/>
     </div>
     <button id="login-btn" onclick="doLogin()">Sign In</button>
+    <div id="login-forgot"><a onclick="requestPasswordReset()">Forgot password?</a></div>
     <div id="login-error"></div>
   </div>
 </div>
@@ -1250,7 +1648,7 @@
 // ═══════════════════════════════════════════════════════════
 
 const appState = {
-  user: null,                 // {username, display_name, role, companies}
+  user: null,                 // {username, display_name, role, permissions[], companies}
   currentCompany: null,       // company code currently open in detail view
 
   // Detail-view state
@@ -1275,7 +1673,8 @@ const appState = {
 
   // Tabs
   openTabs: [],               // company codes with open tabs (dashboard is always implicit)
-  activeTab: 'dashboard',     // 'dashboard' | company_code
+  activeTab: 'dashboard',     // 'dashboard' | 'settings' | company_code
+  settingsOpen: false,        // is the Settings tab open (it appears only once asked for)
 };
 
 // ═══════════════════════════════════════════════════════════
@@ -1284,10 +1683,17 @@ const appState = {
 
 function showLogin()     { document.getElementById('login-overlay').classList.remove('hidden'); }
 function hideLogin()     { document.getElementById('login-overlay').classList.add('hidden'); }
+/** The three pages are mutually exclusive; every route goes through here so a new page
+ *  needs one line, not a hide-call in each of its siblings. */
+function showPage(id) {
+  ['dashboard-page', 'detail-page', 'settings-page'].forEach(p => {
+    document.getElementById(p).classList.toggle('visible', p === id);
+  });
+}
+
 function showDashboard() {
   appState.activeTab = 'dashboard';
-  document.getElementById('dashboard-page').classList.add('visible');
-  document.getElementById('detail-page').classList.remove('visible');
+  showPage('dashboard-page');
   setStatus('Ready');
   renderTabs();
   if (wsDashboard && wsDashboard.readyState !== WebSocket.OPEN) connectDashboardWS();
@@ -1313,10 +1719,19 @@ function showDetail(company) {
   appState.currentCompany = company;
   appState.activeTab = company;
   if (!appState.openTabs.includes(company)) appState.openTabs.push(company);
-  document.getElementById('dashboard-page').classList.remove('visible');
-  document.getElementById('detail-page').classList.add('visible');
+  showPage('detail-page');
   renderTabs();
   connectCompanyWS(company);
+}
+
+/** Bring the Settings tab to the front. Nothing is re-fetched — the editor keeps whatever
+ *  company and unsaved edits it had, which is the point of it being a tab. */
+function showSettings() {
+  appState.activeTab = 'settings';
+  appState.settingsOpen = true;
+  showPage('settings-page');
+  setStatus('Settings');
+  renderTabs();
 }
 
 // ─── Tab bar ────────────────────────────────────────────────
@@ -1330,6 +1745,19 @@ function renderTabs() {
   dt.innerHTML = '⊞ Dashboard';
   dt.addEventListener('click', showDashboard);
   bar.appendChild(dt);
+
+  // Settings tab — opened on demand from the ⚙ button, and closable like a company tab.
+  // It sits next to Dashboard so it keeps its place however many companies are open.
+  if (appState.settingsOpen) {
+    const st = document.createElement('div');
+    st.className = 'tab-item' + (appState.activeTab === 'settings' ? ' active' : '');
+    st.innerHTML = '<span>⚙ Settings</span><span class="tab-close" title="Close">✕</span>';
+    st.addEventListener('click', (e) => {
+      if (e.target.classList.contains('tab-close')) { closeSettings(); }
+      else if (appState.activeTab !== 'settings') { showSettings(); }
+    });
+    bar.appendChild(st);
+  }
 
   // Company tabs
   appState.openTabs.forEach(code => {
@@ -1388,7 +1816,7 @@ async function doLogin() {
   const errEl = document.getElementById('login-error');
   const user = document.getElementById('login-user').value.trim();
   const pass = document.getElementById('login-pass').value;
-  errEl.textContent = '';
+  errEl.textContent = ''; errEl.className = '';
   btn.disabled = true;
   try {
     const r = await fetch('/api/login', {
@@ -1406,12 +1834,74 @@ async function doLogin() {
   }
 }
 
+/** Self-service reset: mail the account a fresh one-time password. The reply is
+ *  deliberately the same whether or not the username exists — the login screen is not
+ *  a place to find out who has an account here. */
+async function requestPasswordReset() {
+  const errEl = document.getElementById('login-error');
+  const user = document.getElementById('login-user').value.trim();
+  if (!user) {
+    errEl.className = '';
+    errEl.textContent = 'Enter your username first, then press "Forgot password?".';
+    return;
+  }
+  errEl.className = ''; errEl.textContent = 'Sending…';
+  try {
+    const r = await fetch('/api/password-reset', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username: user}),
+    });
+    const data = await r.json().catch(() => ({}));
+    errEl.className = r.ok ? 'ok' : '';
+    errEl.textContent = r.ok
+      ? (data.message || 'Check your e-mail for a new password.')
+      : (data.error || ('Error ' + r.status));
+  } catch {
+    errEl.className = '';
+    errEl.textContent = 'Network error';
+  }
+}
+
 // Compute the previous calendar month as the default closing period
 function defaultPeriod() {
   const d = new Date();
   const m = d.getMonth(); // 0 = January
   if (m === 0) return { period: '12', fiscal_year: String(d.getFullYear() - 1) };
   return { period: String(m), fiscal_year: String(d.getFullYear()) };
+}
+
+// Permission check for hiding controls. The list comes from /api/me — the UI never
+// keeps its own copy of the role table. This is cosmetic only: every endpoint and both
+// WebSockets re-check server-side, so a hidden button is a courtesy, not a boundary.
+function can(perm) {
+  return (appState.user && appState.user.permissions || []).includes(perm);
+}
+
+// Who is signed in, shown once — in the title bar beside the connection state.
+function renderTitlebarUser() {
+  const el = document.getElementById('titlebar-user');
+  if (!el) return;
+  const u = appState.user || {};
+  el.textContent = u.display_name || u.username || '';
+  el.title = u.username ? `${u.username} · ${u.role || ''}` : '';
+}
+
+// Show/hide every role-gated control in one place, so a new role needs no scattered edits.
+function applyPermissionsToChrome() {
+  const runner = can('run');
+  const show = (id, ok) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = ok ? '' : 'none';
+  };
+  show('user-display',   can('config_company'));   // the "Settings" label beside the gear
+  show('settings-btn',   can('config_company'));
+  show('registry-btn',   can('manage_registry'));
+  show('users-btn',      can('manage_users'));
+  show('btn-start',      runner);
+  show('modal-actions',  runner);
+  show('btn-rb-confirm', runner);
+  const note = document.getElementById('modal-readonly-note');
+  if (note) note.style.display = runner ? 'none' : '';
 }
 
 function onLoginSuccess(data) {
@@ -1422,9 +1912,16 @@ function onLoginSuccess(data) {
   appState.companies   = data.companies || [];
   appState.openTabs    = [];
   appState.activeTab   = 'dashboard';
+  appState.settingsOpen = false;
   hideLogin();
   renderDashboard();
   showDashboard();
+  if (data.must_change_password) {
+    // Signed in on a one-time password: the server refuses every other call (and both
+    // sockets) until it is replaced, so don't open one.
+    openPasswordModal(true);
+    return;
+  }
   connectDashboardWS();
 }
 
@@ -1467,10 +1964,73 @@ function startCompany(code) {
   }
 }
 
+// ─── Change own password ─────────────────────────────────────────────────────
+
+// `forced` is the first sign-in after a handed-over password: the dialog cannot be
+// dismissed, because the server refuses everything else until it is replaced.
+let passwordChangeForced = false;
+
+function openPasswordModal(forced) {
+  passwordChangeForced = !!forced;
+  document.getElementById('passwd-who').textContent =
+    (appState.user && appState.user.username) || '';
+  ['pw-current', 'pw-new', 'pw-new2'].forEach(id => document.getElementById(id).value = '');
+  const msg = document.getElementById('passwd-msg');
+  msg.textContent = ''; msg.className = '';
+  document.getElementById('passwd-forced-note').style.display = passwordChangeForced ? '' : 'none';
+  document.getElementById('pw-btn-cancel').style.display = passwordChangeForced ? 'none' : '';
+  document.getElementById('passwd-overlay').classList.add('visible');
+  document.getElementById('pw-current').focus();
+}
+
+function closePasswordModal() {
+  if (passwordChangeForced) return;      // nothing to go back to until it is set
+  document.getElementById('passwd-overlay').classList.remove('visible');
+}
+
+async function submitPasswordChange() {
+  const msg  = document.getElementById('passwd-msg');
+  const cur  = document.getElementById('pw-current').value;
+  const nw   = document.getElementById('pw-new').value;
+  const nw2  = document.getElementById('pw-new2').value;
+  const fail = t => { msg.className = 'err'; msg.textContent = t; };
+  if (nw !== nw2)   return fail('The two new passwords do not match.');
+  if (nw.length < 8) return fail('New password must be at least 8 characters.');
+  if (nw === cur)   return fail('The new password must differ from the current one.');
+
+  const btn = document.getElementById('pw-btn-save');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/me/password', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({current_password: cur, new_password: nw}),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      return fail(d.error || ('Error ' + r.status));
+    }
+    msg.className = 'ok';
+    msg.textContent = 'Password changed.';
+    const wasForced = passwordChangeForced;
+    passwordChangeForced = false;
+    setTimeout(() => {
+      document.getElementById('passwd-overlay').classList.remove('visible');
+      // The lock is lifted server-side (a fresh cookie); re-read /api/me so the app
+      // boots normally instead of staying on the fenced-off screen.
+      if (wasForced) checkAuth();
+    }, 900);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function logout() {
   await fetch('/api/logout', {method: 'POST'});
   if (wsDashboard) { wsDashboard.close(); wsDashboard = null; }
   if (wsCompany)   { wsCompany.close();   wsCompany   = null; }
+  appState.user = {};
+  renderTitlebarUser();
   showLogin();
   document.getElementById('dashboard-page').classList.remove('visible');
   document.getElementById('detail-page').classList.remove('visible');
@@ -1522,10 +2082,8 @@ function handleDashboardEvent(e) {
 
 function renderDashboard() {
   const grid = document.getElementById('company-grid');
-  const userDisplay = document.getElementById('user-display');
-  userDisplay.textContent = appState.user.display_name || appState.user.username;
-  document.getElementById('settings-btn').style.display =
-    (appState.user.role === 'admin') ? '' : 'none';
+  renderTitlebarUser();
+  applyPermissionsToChrome();
   grid.innerHTML = '';
   appState.companies.forEach(c => {
     appState.dashboardStatus[c.code] = c.run_status || {status: 'idle'};
@@ -1567,9 +2125,9 @@ function cardHTML(c) {
     </div>
     <div class="company-progress" id="progress-${c.code}">${prog}</div>
     <div class="company-card-actions">
-      <button class="card-btn btn-card-start" id="start-${c.code}"
+      ${can('run') ? `<button class="card-btn btn-card-start" id="start-${c.code}"
         ${canStart ? '' : 'disabled'}
-        onclick="startCompany('${esc(c.code)}')">▶ Start</button>
+        onclick="startCompany('${esc(c.code)}')">▶ Start</button>` : ''}
       <button class="card-btn btn-card-view" onclick="showDetail('${esc(c.code)}')">👁 View</button>
     </div>`;
 }
@@ -2564,11 +3122,23 @@ async function ensureDescriptor() {
   if (r.ok) settingsState.descriptor = await r.json();
 }
 
+/** The ⚙ button. First press opens the Settings tab on the tier this user can actually edit
+ *  — Base for a sys_admin, otherwise their first company, since Base is read-only without
+ *  `config_base` and landing an admin there looks like a broken editor. Later presses just
+ *  bring the tab forward, so an admin who wandered off to a run comes back where they left. */
 async function openSettings() {
+  const firstOpen = !appState.settingsOpen;
+  showSettings();
+  if (!firstOpen) return;
   await ensureDescriptor();
-  document.getElementById('settings-overlay').classList.add('visible');
   await refreshSettingsCompanies('__base__');
-  loadSettings('__base__');
+  let start = '__base__';
+  if (!can('config_base')) {
+    const sel = document.getElementById('settings-company');
+    const firstCompany = [...sel.options].map(o => o.value).find(v => v !== '__base__');
+    if (firstCompany) { start = firstCompany; sel.value = firstCompany; }
+  }
+  loadSettings(start);
 }
 
 // Options come from the company registry (not the login-time company list), so a company
@@ -2585,8 +3155,41 @@ async function refreshSettingsCompanies(select) {
   sel.value = codes.includes(keep) || keep === '__base__' ? keep : '__base__';
   return sel.value;
 }
+/** True when the editor holds edits that were never saved. Same comparison the two save
+ *  paths make, so "no changes to save" and "safe to close" can never disagree. */
+function settingsDirty() {
+  if (settingsState.mode === 'base') {
+    if (settingsState.savedBase === undefined) return false;
+    return JSON.stringify({globals: settingsState.globals, steps: settingsState.baseSteps})
+           !== settingsState.savedBase;
+  }
+  if (settingsState.savedOverride === undefined) return false;
+  pruneDelta();
+  return !deepEqual(settingsState.override, settingsState.savedOverride)
+      || !deepEqual(settingsState.runOverride, settingsState.savedRunOverride);
+}
+
+/** Closing the tab throws the editor away, so unlike switching tabs it has to ask first. */
 function closeSettings() {
-  document.getElementById('settings-overlay').classList.remove('visible');
+  if (settingsDirty()) {
+    showConfirm('Close settings',
+      'The settings editor has unsaved changes. Close the tab and discard them?',
+      'Discard', discardAndCloseSettings);
+    return;
+  }
+  discardAndCloseSettings();
+}
+
+function discardAndCloseSettings() {
+  appState.settingsOpen = false;
+  settingsState.savedBase = undefined;
+  settingsState.savedOverride = undefined;
+  document.getElementById('settings-page').classList.remove('visible');
+  if (appState.activeTab !== 'settings') { renderTabs(); return; }
+  // Land back on the company that was being watched, if its tab is still open.
+  const back = appState.currentCompany;
+  if (back && appState.openTabs.includes(back)) showDetail(back);
+  else showDashboard();
 }
 
 function loadSettings(code) {
@@ -2638,46 +3241,90 @@ function stepDelta(sid) {
   return (settingsState.override[sid] = settingsState.override[sid] || {});
 }
 
+/** Can the signed-in user *write* the tier now on screen?
+ *
+ *  The tiers split the same way the server splits them (web_app._require): reading the base
+ *  takes `config_company`, writing it takes `config_base`. An `admin` therefore sees the base
+ *  their delta sits on but may not move it — so the editor renders, read-only, instead of
+ *  letting them type into a form whose Save is going to 403. Cosmetic only: the endpoint is
+ *  still the boundary. */
+function settingsCanWrite() {
+  return settingsState.mode === 'base' ? can('config_base') : can('config_company');
+}
+
+/** Freeze the whole editor when the current tier is read-only for this user.
+ *  Called after every render, since both panes are rebuilt from scratch each time. */
+function applySettingsReadOnly() {
+  const ro = !settingsCanWrite();
+  ['settings-steps', 'settings-fields'].forEach(id => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.classList.toggle('readonly', ro);
+    if (!ro) return;   // only ever *add* disabled: some ↺ reset / ✕ buttons render disabled
+                       // as their inactive state, and both panes are rebuilt per render, so
+                       // the writable case is already correct without touching anything.
+    box.querySelectorAll('input, select, textarea').forEach(el => { el.disabled = true; });
+    // Buttons inside the panes are all mutators (add/delete/move/remove-row); the rail's
+    // step selection lives on the row div, so disabling them costs no navigation.
+    box.querySelectorAll('button').forEach(el => { el.disabled = true; });
+  });
+  const show = (id, ok) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = ok ? '' : 'none';
+  };
+  show('settings-save-btn', !ro);
+  show('settings-reset-btn', !ro);
+  show('settings-readonly-note', ro && settingsState.mode === 'base');
+}
+
 // ── Left rail ────────────────────────────────────────────────
 function renderSettingsSteps() {
   const box = document.getElementById('settings-steps');
   const rb = document.getElementById('settings-reset-btn');
   if (rb) rb.textContent = settingsState.mode === 'base' ? 'Discard changes' : 'Reset all to base';
-  return settingsState.mode === 'base' ? renderBaseRail(box) : renderCompanyRail(box);
+  settingsState.mode === 'base' ? renderBaseRail(box) : renderCompanyRail(box);
+  applySettingsReadOnly();
+  // The list scrolls now, so a step selected off-screen (a freshly added one, or one picked
+  // before a re-render) has to be brought back into view. 'nearest' = no-op when visible.
+  const sel = box.querySelector('.rail-scroll .set-step.active');
+  if (sel) sel.scrollIntoView({block: 'nearest'});
 }
 
+// The rail is head + scrolling list (+ pinned footer in base mode): the entry above the list
+// and ＋ Add step stay put while only the steps scroll.
 function renderCompanyRail(box) {
-  let html = `<div class="set-step ${settingsState.selectedStep==='__run_context__'?'active':''}"
-                   onclick="selectSettingsStep('__run_context__')">
-                <span class="dot"></span>Company data</div>`;
-  html += settingsState.steps.map(s => {
+  const head = `<div class="set-step ${settingsState.selectedStep==='__run_context__'?'active':''}"
+                     onclick="selectSettingsStep('__run_context__')">
+                  <span class="dot"></span>Company data</div>
+                <div class="rail-section-label">Steps</div>`;
+  const rows = settingsState.steps.map(s => {
     const ov = Object.keys(settingsState.override[s.step_id] || {}).length > 0;
     const disabled = (settingsState.override[s.step_id] || {}).enabled === false;
     return `<div class="set-step ${s.step_id===settingsState.selectedStep?'active':''} ${ov?'has-override':''} ${disabled?'dim':''}"
                  onclick="selectSettingsStep('${esc(s.step_id)}')">
-              <span class="dot"></span>${esc(s.step_id)}</div>`;
+              <span class="dot"></span><span class="sid">${esc(s.step_id)}</span></div>`;
   }).join('');
-  box.innerHTML = html;
+  box.innerHTML = head + `<div class="rail-scroll">${rows}</div>`;
 }
 
 function renderBaseRail(box) {
-  let html = `<div class="set-step ${settingsState.selectedStep==='__globals__'?'active':''}"
-                   onclick="selectSettingsStep('__globals__')">
-                <span class="dot"></span><b>Global settings</b></div>
-              <div class="rail-section-label">Steps</div>`;
-  html += settingsState.baseSteps.map((s, i) => {
+  const head = `<div class="set-step ${settingsState.selectedStep==='__globals__'?'active':''}"
+                     onclick="selectSettingsStep('__globals__')">
+                  <span class="dot"></span><b>Global settings</b></div>
+                <div class="rail-section-label">Steps</div>`;
+  const rows = settingsState.baseSteps.map((s, i) => {
     const disabled = s.enabled === false;
     return `<div class="set-step ${s.step_id===settingsState.selectedStep?'active':''} ${disabled?'dim':''}"
                  onclick="selectSettingsStep('${esc(s.step_id)}')">
-              <span class="dot" style="visibility:hidden"></span>${esc(s.step_id)}
+              <span class="dot" style="visibility:hidden"></span><span class="sid">${esc(s.step_id)}</span>
               <span class="step-tools">
                 <button title="Move up"   onclick="event.stopPropagation();moveBaseStep(${i},-1)">▲</button>
                 <button title="Move down" onclick="event.stopPropagation();moveBaseStep(${i},1)">▼</button>
                 <button class="del" title="Delete step" onclick="event.stopPropagation();deleteBaseStep(${i})">✕</button>
               </span></div>`;
   }).join('');
-  html += `<div class="rail-action"><button class="step-add-btn" onclick="addBaseStep()">＋ Add step</button></div>`;
-  box.innerHTML = html;
+  box.innerHTML = head + `<div class="rail-scroll">${rows}</div>` +
+    `<div class="rail-action"><button class="step-add-btn" onclick="addBaseStep()">＋ Add step</button></div>`;
 }
 
 function selectSettingsStep(sid) {
@@ -2693,7 +3340,8 @@ function renderSettingsFields() {
   // Only the step editor uses the section tab bar; clear it for globals / run-context views.
   const tb = document.getElementById('settings-tabbar');
   if (tb) tb.innerHTML = '';
-  return settingsState.mode === 'base' ? renderBaseFields() : renderCompanyFields();
+  settingsState.mode === 'base' ? renderBaseFields() : renderCompanyFields();
+  applySettingsReadOnly();
 }
 
 function renderCompanyFields() {
@@ -2765,9 +3413,11 @@ const GLOBAL_FIELD_HELP = {
   'llm_profiles.analysis.provider':    'API provider for the "diagnose" analysis agent: groq or openrouter',
   'llm_profiles.analysis.model':       'Model id used for the "diagnose" analysis agent',
   'llm_profiles.analysis.temperature': 'Sampling temperature for the analysis model (leave empty for the provider default)',
+  'llm_profiles.analysis.tool_mode':   'How the model is given its diagnostic tools:\n• text — tool calls travel as JSON in the reply (the ReAct protocol); works with any model\n• native — the provider\'s own function-calling API; required by tool-native models such as gpt-oss',
   'llm_profiles.validation.provider':    'API provider for validate/pre-check LLM checks: groq or openrouter',
   'llm_profiles.validation.model':       'Model id used for validate/pre-check LLM checks',
   'llm_profiles.validation.temperature': 'Sampling temperature for the validation model (leave empty for the provider default)',
+  'llm_profiles.validation.tool_mode':   'How the model is given its tools:\n• text — tool calls travel as JSON in the reply (the ReAct protocol); works with any model\n• native — the provider\'s own function-calling API; required by tool-native models such as gpt-oss\nValidation prompts judge output rather than call tools, so this rarely matters here.',
   'analysis_defaults.max_tool_calls':  'Default diagnostic tool-call budget for a step\'s on_error.analysis (a step can override this)',
   'analysis_defaults.role':            'Default persona/role used when a step\'s on_error.analysis.role is not set',
   'analysis_defaults.tools':           'Default list of diagnostic tools for every step\'s analysis. A step can override (and trim) this in On error → Analysis → Tools.',
@@ -2782,8 +3432,51 @@ function autoResizeTextareas(container) {
   });
 }
 
+/** A 409 means another admin saved this tier while it was open here (overlapping admins are
+ *  deliberate — see permissions.py). Never reload silently: that throws away edits nobody can
+ *  get back. Show what happened and let the user pick; Cancel — the safe default — leaves the
+ *  edits on screen. "Overwrite" is not a lock bypass: the other version stays in the change
+ *  history with its author, so it can be read back and re-applied. */
+async function handleSaveConflict(onReload, onOverwrite) {
+  const isBase = settingsState.mode === 'base';
+  const label = isBase ? 'the Base configuration' : 'company ' + settingsState.code;
+  let who = '';
+  try {
+    const url = isBase ? '/api/settings/base/history'
+                       : `/api/settings/${settingsState.code}/history`;
+    const r = await fetch(url, {credentials:'same-origin'});
+    if (r.ok) {
+      const top = (await r.json())[0];
+      if (top) who = ` — v${top.version} by ${top.updated_by || 'someone'}` +
+        (top.updated_at ? ' at ' + new Date(top.updated_at).toLocaleString() : '');
+    }
+  } catch { /* the dialog is worth showing even without the attribution */ }
+  const keep = () => setSettingsMsg('Not saved — your edits are still here. '
+                                  + 'Open the version link to see what changed.');
+  setSettingsMsg('Not saved — changed elsewhere.');
+  showConfirm('Changed elsewhere',
+    `Someone else saved ${label} while you were editing it${who}.\n`
+    + `You loaded v${settingsState.version}, and your edits are still on screen.\n\n`
+    + `Reload — take their version and discard yours.\n`
+    + `Overwrite — save yours on top; theirs stays in the change history.\n`
+    + `Cancel — keep your edits so you can copy what you need first.`,
+    'Reload (discard mine)', onReload,
+    {altLabel: 'Overwrite theirs', onAlt: onOverwrite, onCancel: keep});
+}
+
+/** Re-read the version that is stored now and save on top of it (the "Overwrite" choice). */
+async function forceResaveSettings() {
+  const isBase = settingsState.mode === 'base';
+  const url = isBase ? '/api/settings/base' : `/api/settings/${settingsState.code}`;
+  const r = await fetch(url, {credentials:'same-origin'});
+  if (!r.ok) { setSettingsMsg('Could not re-read the stored version (' + r.status + ') — not saved.'); return; }
+  settingsState.version = (await r.json()).version;
+  return saveSettings();
+}
+
 async function saveSettings() {
   if (settingsState.mode === 'base') return saveBaseSettings();
+  if (!settingsCanWrite()) { setSettingsMsg("Error: permission 'config_company' required."); return; }
   delete settingsState.runOverride[''];   // drop an unnamed field left over from "＋ Add field"
   pruneDelta();
   if (deepEqual(settingsState.override, settingsState.savedOverride) &&
@@ -2801,7 +3494,10 @@ async function saveSettings() {
     method:'PUT', credentials:'same-origin',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
   });
-  if (r.status === 409) { setSettingsMsg('Changed elsewhere — reloading…'); return loadSettings(settingsState.code); }
+  if (r.status === 409) {
+    const code = settingsState.code;
+    return handleSaveConflict(() => loadSettings(code), forceResaveSettings);
+  }
   if (!r.ok) { const e = await r.json().catch(()=>({})); setSettingsMsg('Error: ' + (e.error||r.status)); return; }
   const data = await r.json();
   applyLoaded(data);
@@ -2818,6 +3514,7 @@ function stripBlankParamKeys(node) {
 }
 
 async function saveBaseSettings() {
+  if (!settingsCanWrite()) { setSettingsMsg("Error: permission 'config_base' required (sys_admin)."); return; }
   stripBlankParamKeys(settingsState.baseSteps);
   stripBlankParamKeys(settingsState.globals);   // drop unnamed tool-template param rows
   const snapshot = JSON.stringify({globals: settingsState.globals, steps: settingsState.baseSteps});
@@ -2828,7 +3525,7 @@ async function saveBaseSettings() {
     method:'PUT', credentials:'same-origin',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body),
   });
-  if (r.status === 409) { setSettingsMsg('Changed elsewhere — reloading…'); return loadBaseSettings(); }
+  if (r.status === 409) return handleSaveConflict(loadBaseSettings, forceResaveSettings);
   if (!r.ok) { const e = await r.json().catch(()=>({})); setSettingsMsg('Error: ' + (e.error||r.status)); return; }
   const data = await r.json();
   settingsState.version = data.version;
@@ -2865,7 +3562,9 @@ function resetAllSettings() {
   );
 }
 
-function showConfirm(title, text, okLabel, onOk) {
+/** Modal confirm. `opts` may carry {altLabel, onAlt, onCancel} for a third choice. */
+function showConfirm(title, text, okLabel, onOk, opts) {
+  opts = opts || {};
   document.getElementById('settings-confirm-title').textContent = title;
   document.getElementById('settings-confirm-text').textContent = text;
   document.getElementById('settings-confirm-ok').textContent = okLabel;
@@ -2873,10 +3572,21 @@ function showConfirm(title, text, okLabel, onOk) {
   overlay.classList.add('visible');
   const ok = document.getElementById('settings-confirm-ok');
   const cancel = document.getElementById('settings-confirm-cancel');
+  const alt = document.getElementById('settings-confirm-alt');
   const close = () => overlay.classList.remove('visible');
   ok.onclick = () => { close(); onOk(); };
-  cancel.onclick = close;
-  overlay.onclick = e => { if (e.target === overlay) close(); };
+  cancel.onclick = () => { close(); if (opts.onCancel) opts.onCancel(); };
+  // A third choice, for the rare dialog where "do it" / "don't" is a false pair — the
+  // save-conflict dialog needs reload / overwrite / neither.
+  if (opts.altLabel) {
+    alt.style.display = '';
+    alt.textContent = opts.altLabel;
+    alt.onclick = () => { close(); if (opts.onAlt) opts.onAlt(); };
+  } else {
+    alt.style.display = 'none';
+    alt.onclick = null;
+  }
+  overlay.onclick = e => { if (e.target === overlay) { close(); if (opts.onCancel) opts.onCancel(); } };
 }
 
 // Styled replacement for window.prompt(). onOk receives the trimmed value.
@@ -2926,8 +3636,9 @@ async function openSettingsHistory() {
   body.innerHTML = histData.map((row, i) => {
     const ts = row.updated_at ? new Date(row.updated_at).toLocaleString() : '—';
     // Only the oldest entry can be pruned, and never the last remaining one; rows are
-    // ordered newest→oldest, so the oldest is the last in the list.
-    const canDelete = i === histData.length - 1 && histData.length > 1;
+    // ordered newest→oldest, so the oldest is the last in the list. Pruning is a write on
+    // the tier, so it follows the same permission as saving it.
+    const canDelete = i === histData.length - 1 && histData.length > 1 && settingsCanWrite();
     const del = canDelete
       ? `<button class="hist-del" title="Delete this (oldest) history version"
              onclick="event.stopPropagation();deleteOldestHistory(${row.version})">✕</button>`
@@ -3372,6 +4083,7 @@ function renderStepForm(box) {
 
   box.innerHTML = renderFormSection(ctx, sections.find(s => s.key === active));
   autoResizeTextareas(box);
+  applySettingsReadOnly();   // section tabs re-render this pane on their own
 }
 
 function selectFormSection(key) {
@@ -4317,6 +5029,7 @@ function renderGlobalsFields(box) {
   });
   box.innerHTML = html;
   autoResizeTextareas(box);
+  applySettingsReadOnly();
 }
 function globalFieldHTML(f) {
   const val = dotGet(settingsState.globals, f.path);
@@ -4488,40 +5201,201 @@ function renderMarkdown(src) {
 //  Company registry manager
 // ═══════════════════════════════════════════════════════════
 
-const ICON_UPLOAD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 L20 12 H14 V22 H10 V12 H4 Z"/></svg>';
-const ICON_DOWNLOAD = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 22 L4 12 H10 V2 H14 V12 H20 Z"/></svg>';
+let registryCache = [];         // last-fetched company registry — the filter reads from here
+let registryBase = null;        // {version, updated_by, updated_at, steps} for the Base panel
+let regSelected = '__base__';   // company code, '__base__', or '__new__' (the create form)
 
 async function openRegistry() {
   document.getElementById('registry-overlay').classList.add('visible');
+  document.getElementById('reg-filter').value = '';
+  regSelected = '__base__';
   await renderRegistry();
+  document.getElementById('reg-filter').focus();
 }
 function closeRegistry() { document.getElementById('registry-overlay').classList.remove('visible'); }
 
 async function renderRegistry() {
   const body = document.getElementById('registry-body');
   body.innerHTML = '<div class="diff-empty">Loading…</div>';
-  const r = await fetch('/api/registry/companies', {credentials:'same-origin'});
+  // Base facts come along for the ride so selecting ⚙ Base needs no second round trip.
+  const [r, rb] = await Promise.all([
+    fetch('/api/registry/companies', {credentials:'same-origin'}),
+    fetch('/api/settings/base', {credentials:'same-origin'}),
+  ]);
   if (!r.ok) { body.innerHTML = '<div class="diff-empty">Error ' + r.status + '</div>'; return; }
-  const rows = await r.json();
-  const baseRow = `<div class="reg-row reg-row-base">
-      <span class="code"></span>
-      <span class="name">⚙ Base</span>
-      <button title="Upload Base from a YAML file" onclick="triggerUploadYaml('__base__')">${ICON_UPLOAD}</button>
-      <button title="Download Base as a YAML file" onclick="downloadConfigYaml('__base__')">${ICON_DOWNLOAD}</button>
-    </div>`;
-  body.innerHTML = baseRow + rows.map(c => `<div class="reg-row">
+  registryCache = await r.json();
+  if (rb.ok) {
+    const b = await rb.json();
+    registryBase = {version: b.version, updated_by: b.updated_by,
+                    updated_at: b.updated_at, steps: (b.steps || []).length};
+  }
+  renderRegistryRows();
+  renderRegistryDetail();
+}
+
+/** Paint the list from `registryCache` through the filter box. Kept apart from the fetch so
+ *  typing re-renders without a round trip — the point of the filter is 100+ company codes. */
+function renderRegistryRows() {
+  const q = (document.getElementById('reg-filter').value || '').trim().toLowerCase();
+  const shown = q
+    ? registryCache.filter(c => (c.code || '').toLowerCase().includes(q)
+                             || (c.display_name || '').toLowerCase().includes(q))
+    : registryCache;
+
+  document.getElementById('reg-count').textContent = q
+    ? `${shown.length} of ${registryCache.length}`
+    : `${registryCache.length} ${registryCache.length === 1 ? 'company' : 'companies'}`;
+
+  document.getElementById('registry-body').innerHTML = shown.length
+    ? shown.map(c => `<div class="reg-item${c.code === regSelected ? ' sel' : ''}"
+             tabindex="0" role="button" title="${esc(c.display_name || c.code)}"
+             onclick="selectRegistryEntry('${esc(c.code)}')"
+             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();selectRegistryEntry('${esc(c.code)}')}">
+        <span class="reg-dot${c.has_override ? ' own' : ''}"></span>
+        <span class="code">${esc(c.code)}</span>
+        <span class="nm">${esc(c.display_name || c.code)}</span>
+      </div>`).join('')
+    : `<div class="diff-empty">${q ? 'No company matches “' + esc(q) + '”' : 'No companies yet'}</div>`;
+
+  document.getElementById('reg-base-item').classList.toggle('sel', regSelected === '__base__');
+  // Keep the selected code visible — after creating one it may sit far down a long list.
+  const selEl = document.querySelector('#registry-body .reg-item.sel');
+  if (selEl) selEl.scrollIntoView({block: 'nearest'});
+}
+
+/** Select an entry in the left list: a company code, `__base__`, or `__new__` (the create
+ *  form, which lives in the detail pane rather than in a dialog of its own). */
+function selectRegistryEntry(code) {
+  regSelected = code;
+  renderRegistryRows();
+  renderRegistryDetail();
+}
+
+function registryMsg(text, isError) {
+  const el = document.getElementById('reg-msg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = isError ? 'err' : '';
+}
+
+/** The right-hand pane: what the selected entry is, and everything you can do to it. */
+function renderRegistryDetail() {
+  const d = document.getElementById('registry-detail');
+
+  if (regSelected === '__new__') {
+    d.innerHTML = `
+      <div class="rd-title"><span class="code">New company</span></div>
+      <div>
+        <label for="reg-new-code">Company code</label>
+        <input type="text" id="reg-new-code" maxlength="12" placeholder="RU25" spellcheck="false"
+               onkeydown="if(event.key==='Enter')createCompany()">
+      </div>
+      <div>
+        <label for="reg-new-name">Display name</label>
+        <input type="text" id="reg-new-name" placeholder="Defaults to the code"
+               onkeydown="if(event.key==='Enter')createCompany()">
+      </div>
+      <div class="rd-note">A new company starts on the base configuration — it gets settings of
+        its own the first time you save an override for it.</div>
+      <div id="reg-msg"></div>
+      <div class="rd-actions">
+        <button onclick="createCompany()">＋ Create company</button>
+        <button class="quiet" onclick="selectRegistryEntry('__base__')">Cancel</button>
+      </div>`;
+    document.getElementById('reg-new-code').focus();
+    return;
+  }
+
+  if (regSelected === '__base__') {
+    const b = registryBase || {};
+    d.innerHTML = `
+      <div class="rd-title"><span class="code">⚙ Base</span>
+        <span class="rd-chip base">inherited by ${registryCache.length}
+          ${registryCache.length === 1 ? 'company' : 'companies'}</span></div>
+      <div class="rd-note">The product step library and the global defaults. Every company's
+        configuration is a delta on top of this document, so a change here moves them all.</div>
+      <div class="rd-facts">
+        <div><label>Version</label><div class="v">${b.version ? esc(b.version) :
+          '<span class="none">not seeded yet</span>'}</div></div>
+        <div><label>Steps</label><div class="v">${b.steps == null ? '—' : esc(b.steps)}</div></div>
+        <div><label>Last change</label><div class="v">${b.updated_by
+          ? esc(b.updated_by) + (b.updated_at ? ' <small>· ' + esc(fmtWhen(b.updated_at)) + '</small>' : '')
+          : '<span class="none">never</span>'}</div></div>
+      </div>
+      <div id="reg-msg"></div>
+      <div class="rd-actions">
+        <button onclick="openConfigFor('__base__')">Open settings</button>
+        <button class="quiet" onclick="triggerUploadYaml('__base__')">Import YAML…</button>
+        <button class="quiet" onclick="downloadConfigYaml('__base__')">Export YAML</button>
+      </div>`;
+    return;
+  }
+
+  const c = registryCache.find(x => x.code === regSelected);
+  if (!c) {
+    d.innerHTML = '<div class="diff-empty">Select a company on the left</div>';
+    return;
+  }
+  d.innerHTML = `
+    <div class="rd-title">
       <span class="code">${esc(c.code)}</span>
-      <span class="name">${esc(c.display_name || c.code)}</span>
-      <button title="Upload from a YAML file" onclick="triggerUploadYaml('${esc(c.code)}')">${ICON_UPLOAD}</button>
-      <button title="Download as a YAML file" onclick="downloadConfigYaml('${esc(c.code)}')">${ICON_DOWNLOAD}</button>
-      <button title="Rename" onclick="renameCompany('${esc(c.code)}','${esc(c.display_name||'')}')">✎</button>
-      <button title="Delete" onclick="deleteCompanyReg('${esc(c.code)}')">✕</button>
-    </div>`).join('') +
-    `<div class="reg-new">
-       <input id="reg-new-code" placeholder="CODE" maxlength="12">
-       <input id="reg-new-name" placeholder="Display name">
-       <button onclick="createCompany()">＋ Add</button>
-     </div>`;
+      ${c.has_override ? '<span class="rd-chip own">own settings</span>'
+                       : '<span class="rd-chip base">runs on Base</span>'}
+    </div>
+    <div>
+      <label for="reg-name">Display name</label>
+      <input type="text" id="reg-name" value="${esc(c.display_name || '')}"
+             oninput="onRegistryNameEdit()"
+             onkeydown="if(event.key==='Enter')saveCompanyName()">
+    </div>
+    <div class="rd-facts">
+      <div><label>Settings version</label><div class="v">${c.has_override ? esc(c.override_version)
+        : '<span class="none">no delta yet</span>'}</div></div>
+      <div><label>Last change</label><div class="v">${c.override_updated_by
+        ? esc(c.override_updated_by) + (c.override_updated_at
+            ? ' <small>· ' + esc(fmtWhen(c.override_updated_at)) + '</small>' : '')
+        : '<span class="none">never</span>'}</div></div>
+    </div>
+    <div id="reg-msg"></div>
+    <div class="rd-actions">
+      <button onclick="openConfigFor('${esc(c.code)}')">Open settings</button>
+      <button class="quiet" id="reg-name-save" onclick="saveCompanyName()" disabled>Save name</button>
+      <button class="quiet" onclick="triggerUploadYaml('${esc(c.code)}')">Import YAML…</button>
+      <button class="quiet" onclick="downloadConfigYaml('${esc(c.code)}')">Export YAML</button>
+      <span class="sp"></span>
+      <button class="danger" onclick="deleteCompanyReg('${esc(c.code)}')">Delete</button>
+    </div>`;
+}
+
+/** ISO timestamp → the short local form the rest of the panel uses. */
+function fmtWhen(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d) ? iso : d.toLocaleString([], {year:'numeric', month:'short', day:'numeric',
+                                                hour:'2-digit', minute:'2-digit'});
+}
+
+function onRegistryNameEdit() {
+  const c = registryCache.find(x => x.code === regSelected) || {};
+  const el = document.getElementById('reg-name-save');
+  if (el) el.disabled = (document.getElementById('reg-name').value || '') === (c.display_name || '');
+}
+
+/** Rename in place — the detail pane already holds the field, so no prompt dialog. */
+async function saveCompanyName() {
+  const code = regSelected;
+  const name = (document.getElementById('reg-name').value || '').trim();
+  if (!name) { registryMsg('A display name is required.', true); return; }
+  if (!await registryPost('/api/registry/companies/' + encodeURIComponent(code), 'PUT',
+                          {display_name: name})) return;
+  await afterRegistryChange();
+  registryMsg('Saved.');
+}
+
+/** Jump from the registry into the settings editor for that company (or Base). */
+function openConfigFor(code) {
+  closeRegistry();
+  refreshSettingsCompanies(code).then(() => loadSettings(code));
 }
 
 /** Download a company's (or Base's) YAML config to disk, via the native Save dialog
@@ -4599,7 +5473,14 @@ function triggerUploadYaml(code) {
 async function registryPost(url, method, body) {
   const r = await fetch(url, {method, credentials:'same-origin',
     headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined});
-  if (!r.ok) { const e = await r.json().catch(()=>({})); alert('Error: ' + (e.error || r.status)); return false; }
+  if (!r.ok) {
+    const e = await r.json().catch(()=>({}));
+    const text = e.error || ('Error ' + r.status);
+    // Show the refusal where the admin is looking — the detail pane — when it is on screen.
+    if (document.getElementById('reg-msg')) registryMsg(text, true);
+    else alert('Error: ' + text);
+    return false;
+  }
   return true;
 }
 
@@ -4619,26 +5500,301 @@ async function afterRegistryChange(select) {
 async function createCompany() {
   const code = (document.getElementById('reg-new-code').value || '').trim();
   const name = (document.getElementById('reg-new-name').value || '').trim();
-  if (!code) return;
+  if (!code) { registryMsg('A company code is required.', true); return; }
   if (!await registryPost('/api/registry/companies', 'POST', {code, display_name: name || code})) return;
+  document.getElementById('reg-filter').value = '';   // never hide the row just created
+  regSelected = code;                                 // land on the new company's panel
   await afterRegistryChange(code);
-  loadSettings(code);       // jump straight into the new company's settings
-}
-function renameCompany(code, cur) {
-  showInputDialog('Rename company', 'Display name for ' + code, cur, 'Save', async name => {
-    if (!name) return;
-    if (await registryPost('/api/registry/companies/' + encodeURIComponent(code), 'PUT', {display_name: name}))
-      await afterRegistryChange();
-  });
 }
 function deleteCompanyReg(code) {
   showConfirm('Delete company', 'Delete company "' + code + '" and all its saved settings? This cannot be undone.', 'Delete',
     async () => {
       if (!await registryPost('/api/registry/companies/' + encodeURIComponent(code), 'DELETE')) return;
       const wasOpen = settingsState.code === code;
+      if (regSelected === code) regSelected = '__base__';
       await afterRegistryChange(wasOpen ? '__base__' : undefined);
       if (wasOpen) loadSettings('__base__');
     });
+}
+
+// ═══════════════════════════════════════════════════════════
+//  User registry ("Manage users") — DB-backed, admin only
+// ═══════════════════════════════════════════════════════════
+
+async function openUsers() {
+  document.getElementById('users-overlay').classList.add('visible');
+  await renderUsers();
+}
+function closeUsers() { document.getElementById('users-overlay').classList.remove('visible'); }
+
+/** POST/PUT/DELETE against the user registry. Returns the parsed body, or null on error
+ *  (the message is shown to the caller — every refusal here is one an admin must read). */
+async function usersCall(url, method, body) {
+  const r = await fetch(url, {method, credentials:'same-origin',
+    headers: body ? {'Content-Type':'application/json'} : {}, body: body ? JSON.stringify(body) : undefined});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const text = data.error || ('Error ' + r.status);
+    // Show the refusal where the admin is looking: in the editor when it is open,
+    // otherwise (a delete from the list) as a dialog.
+    if (document.getElementById('user-edit-overlay').classList.contains('visible'))
+      userEditorMsg(text, true);
+    else
+      alert('Error: ' + text);
+    return null;
+  }
+  return data || {};
+}
+
+// Role labels for the picker. The authoritative table lives in src/permissions.py;
+// these strings only describe it to whoever is assigning the role.
+const ROLE_LABELS = {
+  operator:  'operator — run the close',
+  manager:   'manager — read-only oversight',
+  admin:     'admin — operator + company config',
+  sys_admin: 'sys_admin — everything incl. base, registries, users',
+};
+// Mirrors permissions.GLOBAL_SCOPE_ROLES / EXCLUSIVE_SCOPE_ROLES — cosmetic only; the
+// scope endpoint and every write re-derive both server-side.
+const GLOBAL_SCOPE_ROLES    = ['sys_admin'];
+const EXCLUSIVE_SCOPE_ROLES = ['operator'];
+
+async function renderUsers() {
+  const body = document.getElementById('users-body');
+  body.innerHTML = '<div class="diff-empty">Loading…</div>';
+  const r = await fetch('/api/registry/users', {credentials:'same-origin'});
+  if (!r.ok) { body.innerHTML = '<div class="diff-empty">Error ' + r.status + '</div>'; return; }
+  const rows = await r.json();
+
+  const rowHtml = u => `<div class="usr-row">
+        <span class="u-name">${esc(u.username)}
+          <small>${esc(u.display_name || '')}</small>
+          ${u.email ? `<small class="u-mail">${esc(u.email)}</small>` : ''}
+          ${u.must_change_password ? '<small class="u-temp">one-time password pending</small>' : ''}
+        </span>
+        <span class="u-meta">${(u.company_codes||[]).map(esc).join(', ') || '<span style="color:#5a6270">no companies</span>'}</span>
+        <span class="u-role ${esc(u.role)}">${esc(u.role)}</span>
+        <span class="u-actions">
+          <button title="Edit" onclick="openUserEditor('${esc(u.username)}')">✎</button>
+          <button title="Delete" onclick="deleteUser('${esc(u.username)}')">✕</button>
+        </span>
+      </div>`;
+
+  body.innerHTML =
+    (rows.length ? rows.map(rowHtml).join('') : '<div class="diff-empty">No users yet</div>') +
+    '<div class="usr-foot"><button onclick="openUserEditor(null)">＋ Add user</button></div>';
+  usersCache = rows;
+}
+
+let usersCache = [];        // last-fetched registry — the editor reads the row from here
+let userEditing = null;     // username being edited, or null in create mode
+let userScope = [];         // company codes staged in the editor (applied on Save)
+let userRolePrev = null;    // role the scope in `userScope` belongs to
+
+function userEditorMsg(text, isError) {
+  const el = document.getElementById('ue-msg');
+  el.textContent = text || '';
+  el.className = isError ? 'err' : '';
+}
+
+function openUserEditor(username) {
+  const u = username ? (usersCache.find(x => x.username === username) || {}) : {};
+  userEditing = username || null;
+  userScope = (u.company_codes || []).slice();
+
+  document.getElementById('ue-title').textContent = username ? 'Edit user' : 'Add user';
+  const nameEl = document.getElementById('ue-username');
+  nameEl.value = u.username || '';
+  nameEl.disabled = !!username;                 // the username is the account's identity
+  document.getElementById('ue-display').value = u.display_name || '';
+  document.getElementById('ue-email').value   = u.email || '';
+  document.getElementById('ue-pass').value    = '';
+
+  const roleSel = document.getElementById('ue-role');
+  roleSel.innerHTML = Object.keys(ROLE_LABELS).map(rl =>
+    `<option value="${rl}">${ROLE_LABELS[rl]}</option>`).join('');
+  roleSel.value = u.role || 'operator';
+  userRolePrev = roleSel.value;   // opening the dialog is not a role change
+
+  // Creating mints the initial password; editing never touches it — a sys_admin resets,
+  // and the generated password goes to the user, not to the admin.
+  document.getElementById('ue-pass-row').style.display  = username ? 'none' : '';
+  document.getElementById('ue-reset-btn').style.display = username ? '' : 'none';
+  document.getElementById('ue-save-btn').textContent = username ? 'Save' : '＋ Create user';
+
+  userEditorMsg('');
+  onUserRoleChange();
+  document.getElementById('user-edit-overlay').classList.add('visible');
+  (username ? document.getElementById('ue-display') : nameEl).focus();
+}
+
+function closeUserEditor() {
+  document.getElementById('user-edit-overlay').classList.remove('visible');
+}
+
+/** Keep the scope field honest about the selected role: sys_admin always reaches every
+ *  company (permissions.GLOBAL_SCOPE_ROLES), so there is nothing to pick. */
+function onUserRoleChange() {
+  const role = document.getElementById('ue-role').value;
+  const global = GLOBAL_SCOPE_ROLES.includes(role);
+  // Only an actual *change* rewrites the scope: a `manager` may legitimately hold "*",
+  // and merely opening its editor must not silently strip it.
+  if (global) userScope = ['*'];
+  else if (GLOBAL_SCOPE_ROLES.includes(userRolePrev)) userScope = [];
+  userRolePrev = role;
+  document.getElementById('ue-codes-btn').disabled = global;
+  const hint = document.getElementById('ue-codes-hint');   // the ⓘ bubble on the label
+  if (global) {
+    hint.textContent = 'sys_admin reaches every registered company — the scope is always *.';
+  } else if (EXCLUSIVE_SCOPE_ROLES.includes(role)) {
+    hint.textContent = 'Each company is closed by exactly one operator, so the picker only '
+                     + 'offers companies no other operator holds.';
+  } else {
+    hint.textContent = 'Company scopes may overlap for this role — that is what makes cover possible.';
+  }
+  renderUserScopeField();
+}
+
+function renderUserScopeField() {
+  const el = document.getElementById('ue-codes');
+  el.value = userScope.length
+    ? (userScope.includes('*') ? '*  (all companies)' : userScope.join(', '))
+    : '';
+}
+
+async function saveUserEditor() {
+  const username = (document.getElementById('ue-username').value || '').trim();
+  const payload = {
+    display_name: (document.getElementById('ue-display').value || '').trim(),
+    email:        (document.getElementById('ue-email').value || '').trim(),
+    role:          document.getElementById('ue-role').value,
+    company_codes: userScope.slice(),
+  };
+  const btn = document.getElementById('ue-save-btn');
+  btn.disabled = true;
+  try {
+    if (userEditing) {
+      if (!await usersCall('/api/registry/users/' + encodeURIComponent(userEditing),
+                           'PUT', payload)) return;
+      closeUserEditor();
+    } else {
+      if (!username) { userEditorMsg('A username is required.', true); return; }
+      const pass = document.getElementById('ue-pass').value;
+      const res = await usersCall('/api/registry/users', 'POST',
+                                  {username, password: pass, ...payload});
+      if (!res) return;
+      // A generated password that could not be mailed comes back once, here, so the
+      // admin can hand it over; a delivered one is never shown to anybody.
+      if (res.password) {
+        userEditing = username;
+        openUserEditorAfterCreate(username);
+        userEditorMsg(res.note + '  →  ' + res.password, false);
+      } else {
+        closeUserEditor();
+      }
+    }
+  } finally {
+    btn.disabled = false;
+    await renderUsers();
+  }
+}
+
+/** Re-open the just-created user in edit mode so the one-time password stays on screen. */
+function openUserEditorAfterCreate(username) {
+  document.getElementById('ue-pass-row').style.display  = 'none';
+  document.getElementById('ue-reset-btn').style.display = '';
+  document.getElementById('ue-username').disabled = true;
+  document.getElementById('ue-title').textContent = 'Edit user';
+  document.getElementById('ue-save-btn').textContent = 'Save';
+}
+
+function resetUserPassword() {
+  const username = userEditing;
+  if (!username) return;
+  const u = usersCache.find(x => x.username === username) || {};
+  showConfirm('Reset password',
+    u.email
+      ? `Generate a new one-time password for "${username}" and e-mail it to ${u.email}? `
+        + 'Their current password stops working immediately.'
+      : `"${username}" has no e-mail address on file, so the generated password will be `
+        + 'shown here for you to hand over. Their current password stops working immediately.',
+    'Reset', async () => {
+      const res = await usersCall(
+        '/api/registry/users/' + encodeURIComponent(username) + '/reset-password', 'POST', {});
+      if (!res) return;
+      userEditorMsg(res.password ? res.note + '  →  ' + res.password : res.note, false);
+      await renderUsers();
+    });
+}
+
+function deleteUser(username) {
+  showConfirm('Delete user', 'Delete user "' + username + '"? This cannot be undone.', 'Delete',
+    async () => {
+      if (!await usersCall('/api/registry/users/' + encodeURIComponent(username), 'DELETE')) return;
+      await renderUsers();
+    });
+}
+
+// ─── Company-scope picker (two-pane transfer) ────────────────────────────────
+// Assigned on the left, still-available on the right, arrows between — the shape SAP
+// itself uses, and the one that survives a client with 100+ company codes.
+
+let scopeAssigned = [], scopeAvailable = [];
+
+async function openScopePicker() {
+  const role = document.getElementById('ue-role').value;
+  if (GLOBAL_SCOPE_ROLES.includes(role)) return;
+  const params = new URLSearchParams({role});
+  if (userEditing) params.set('username', userEditing);
+  const r = await fetch('/api/registry/company-scope?' + params, {credentials:'same-origin'});
+  if (!r.ok) { userEditorMsg('Could not load companies (' + r.status + ')', true); return; }
+  const data = await r.json();
+
+  scopeAssigned  = userScope.filter(c => c !== '*');
+  // `free` already excludes what another operator holds; the server refuses a clash
+  // anyway, so this only keeps the admin from building one by hand.
+  scopeAvailable = (data.free || []).filter(c => !scopeAssigned.includes(c));
+
+  document.getElementById('scope-title').textContent = 'Company scope — ' + role;
+  const hidden = (data.all || []).length - (data.free || []).length;
+  document.getElementById('scope-note').textContent = data.exclusive && hidden > 0
+    ? `${hidden} of ${(data.all||[]).length} companies are not listed: another operator already closes them.`
+    : '';
+  renderScopeLists();
+  document.getElementById('scope-overlay').classList.add('visible');
+}
+
+function closeScopePicker() {
+  document.getElementById('scope-overlay').classList.remove('visible');
+}
+
+function renderScopeLists() {
+  const fill = (id, codes) => {
+    document.getElementById(id).innerHTML =
+      codes.slice().sort().map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  };
+  fill('scope-assigned',  scopeAssigned);
+  fill('scope-available', scopeAvailable);
+}
+
+function scopeMove(direction) {
+  const from = direction === 'add' ? 'scope-available' : 'scope-assigned';
+  const picked = [...document.getElementById(from).selectedOptions].map(o => o.value);
+  if (!picked.length) return;
+  if (direction === 'add') {
+    scopeAvailable = scopeAvailable.filter(c => !picked.includes(c));
+    scopeAssigned  = scopeAssigned.concat(picked);
+  } else {
+    scopeAssigned  = scopeAssigned.filter(c => !picked.includes(c));
+    scopeAvailable = scopeAvailable.concat(picked);
+  }
+  renderScopeLists();
+}
+
+function applyScopePicker() {
+  userScope = scopeAssigned.slice();
+  renderUserScopeField();
+  closeScopePicker();
 }
 
 // ═══════════════════════════════════════════════════════════

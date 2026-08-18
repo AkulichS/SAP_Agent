@@ -5,7 +5,6 @@ deterministic. Async only so CompanyRun's asyncio.Queue fields construct under a
 running loop.
 """
 
-import pytest
 
 from run_manager import CompanyRun, RunManager
 

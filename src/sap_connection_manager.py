@@ -1,22 +1,37 @@
 """
 SAPConnectionManager
 --------------------
-Thread-safe singleton that owns the pyrfc connection.
+Thread-safe singleton that owns a **pool** of pyrfc connections.
 Lives exclusively inside the MCP server process — the agent never imports this.
 
 Usage:
     mgr = SAPConnectionManager()
-    mgr.configure(params)          # once at startup
-    conn = mgr.get_connection()    # anywhere in MCP tools
+    mgr.configure(params)              # once at startup
+    with mgr.connection() as conn:     # anywhere in MCP tools
+        conn.call(...)
+
+Why a pool: one shared MCP server serves every concurrent company run, and each
+RFC call runs in a worker thread (``mcp_server._tool``). A single connection
+behind a lock would serialize every run against SAP; a pool lets N calls proceed
+in parallel while still *bounding* the load — each busy connection occupies one
+SAP dialog work process, so ``SAP_POOL_SIZE`` is the throttle you hand Basis.
+
+The pool is lazy (connections are created on demand up to the cap), LIFO (the
+hottest connection is reused first), and self-healing (a connection idle longer
+than ``SAP_PING_INTERVAL`` is pinged before hand-out, and one whose call raised
+is closed rather than returned to the pool). A checkout blocks up to
+``SAP_POOL_TIMEOUT`` seconds waiting for a free slot, then raises.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -62,13 +77,25 @@ class SAPConnectionParams:
         return {k: v for k, v in base.items() if v is not None}
 
 
+@dataclass
+class _Pooled:
+    """One pooled connection plus the moment it was last handed back."""
+    conn: Any
+    last_used: float
+
+
+DEFAULT_POOL_SIZE       = 8       # concurrent RFC calls = concurrent SAP dialog work processes
+DEFAULT_ACQUIRE_TIMEOUT = 300.0   # seconds a caller waits for a free connection
+DEFAULT_PING_INTERVAL   = 60.0    # skip the liveness ping on a connection used this recently
+
+
 class SAPConnectionManager:
     """
-    Singleton connection manager.
+    Singleton pool of pyrfc connections.
 
-    Thread-safe: get_connection() can be called from multiple asyncio
-    tasks running in the same thread (the MCP server's event loop) as well
-    as from background threads used by pyrfc callbacks.
+    Thread-safe: ``connection()`` may be called from any number of worker threads
+    (that is the point — the MCP server offloads every blocking RFC call to one)
+    as well as from the event loop thread.
     """
 
     _instance: SAPConnectionManager | None = None
@@ -89,8 +116,14 @@ class SAPConnectionManager:
 
     def _init_internal(self) -> None:
         self._params: SAPConnectionParams | None = None
-        self._connection: Any | None = None          # pyrfc.Connection
-        self._conn_lock = threading.Lock()
+        # Pool state, all guarded by _cond: _idle holds handed-back connections,
+        # _live counts every connection the pool owns (idle + checked out).
+        self._cond  = threading.Condition()
+        self._idle: list[_Pooled] = []
+        self._live  = 0
+        self._pool_size       = _env_int("SAP_POOL_SIZE", DEFAULT_POOL_SIZE)
+        self._acquire_timeout = _env_float("SAP_POOL_TIMEOUT", DEFAULT_ACQUIRE_TIMEOUT)
+        self._ping_interval   = _env_float("SAP_PING_INTERVAL", DEFAULT_PING_INTERVAL)
         self._reconnect_delay_base: float = 2.0      # seconds, doubles on each retry
         self._max_retries: int = 5
 
@@ -98,58 +131,136 @@ class SAPConnectionManager:
     # Public API
     # ------------------------------------------------------------------
 
-    def configure(self, params: SAPConnectionParams) -> None:
+    def configure(self, params: SAPConnectionParams, *, pool_size: int | None = None) -> None:
         """Call once at MCP server startup before any tool invocation."""
         self._params = params
+        if pool_size is not None:
+            self._pool_size = max(1, int(pool_size))
         logger.info(
-            f"SAPConnectionManager configured for host={params.ashost} client={params.client}",
+            f"SAPConnectionManager configured for host={params.ashost} "
+            f"client={params.client} pool_size={self._pool_size}",
         )
 
-    def get_connection(self) -> Any:
+    @property
+    def pool_size(self) -> int:
+        """Maximum number of simultaneously open connections (the RFC concurrency cap)."""
+        return self._pool_size
+
+    @contextmanager
+    def connection(self) -> Iterator[Any]:
+        """Check out a live connection for the duration of one RFC call.
+
+        The connection returns to the pool on exit; if the body raised, it is
+        closed instead — a pyrfc connection whose call blew up may be in an
+        undefined state, and a fresh one costs less than a poisoned one.
         """
-        Return a live pyrfc.Connection.
-        Transparently reconnects when the connection is stale.
-        """
-        with self._conn_lock:
-            if self._connection is None or not self._is_alive():
-                self._reconnect()
-            return self._connection
+        conn   = self._acquire()
+        broken = False
+        try:
+            yield conn
+        except Exception:
+            broken = True
+            raise
+        finally:
+            self._release(conn, broken=broken)
+
+    def stats(self) -> dict[str, int]:
+        """Pool occupancy — for logging and the capacity tests."""
+        with self._cond:
+            return {"max": self._pool_size, "live": self._live, "idle": len(self._idle)}
 
     def close(self) -> None:
         """Graceful shutdown — call from MCP server lifespan teardown."""
-        with self._conn_lock:
-            self._close_connection()
-        logger.info("SAP connection closed")
+        with self._cond:
+            idle, in_use = self._idle, self._live - len(self._idle)
+            self._idle, self._live = [], 0
+            self._cond.notify_all()
+        for p in idle:
+            _close_quietly(p.conn)
+        if in_use:
+            logger.warning("SAP pool closed with %d connection(s) still checked out", in_use)
+        logger.info("SAP connection pool closed (%d idle connections)", len(idle))
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _is_alive(self) -> bool:
-        if self._connection is None:
-            return False
+    def _acquire(self) -> Any:
+        """Hand out a live connection: reuse an idle one, open a new one while
+        below the cap, else wait for a peer to hand one back."""
+        deadline = time.monotonic() + self._acquire_timeout
+        while True:
+            candidate: _Pooled | None = None
+            with self._cond:
+                if self._idle:
+                    candidate = self._idle.pop()      # LIFO — keep the hot one hot
+                elif self._live < self._pool_size:
+                    self._live += 1                   # reserve the slot, connect outside the lock
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ConnectionError(
+                            f"No SAP connection available after {self._acquire_timeout:.0f}s "
+                            f"(pool_size={self._pool_size}, all busy) — raise SAP_POOL_SIZE "
+                            f"or reduce concurrent runs"
+                        )
+                    self._cond.wait(remaining)
+                    continue
+
+            # Liveness check runs OUTSIDE the lock — it is a network round trip.
+            if candidate is not None:
+                if self._is_usable(candidate):
+                    return candidate.conn
+                self._drop(candidate.conn)            # frees the slot, then retry
+                continue
+
+            try:
+                return self._connect()
+            except Exception:
+                with self._cond:                      # give the reserved slot back
+                    self._live -= 1
+                    self._cond.notify()
+                raise
+
+    def _release(self, conn: Any, *, broken: bool) -> None:
+        if broken:
+            self._drop(conn)
+            return
+        with self._cond:
+            # "Nothing is checked out" per the accounting means the pool was closed
+            # under this caller (shutdown) — that connection is orphaned, not idle.
+            orphaned = self._live <= len(self._idle)
+            if not orphaned:
+                self._idle.append(_Pooled(conn, time.monotonic()))
+            self._cond.notify()
+        if orphaned:
+            _close_quietly(conn)
+
+    def _drop(self, conn: Any) -> None:
+        """Close a connection and free its pool slot."""
+        with self._cond:
+            self._live = max(0, self._live - 1)
+            self._cond.notify()
+        _close_quietly(conn)
+
+    def _is_usable(self, pooled: _Pooled) -> bool:
+        """True if the connection can be handed out. Freshly used ones are trusted
+        without a ping — pinging every checkout would double the RFC call count."""
+        if time.monotonic() - pooled.last_used < self._ping_interval:
+            return True
         try:
-            self._connection.ping()
+            pooled.conn.ping()
             return True
         except Exception:
-            logger.debug("SAP ping failed — connection considered dead")
+            logger.debug("SAP ping failed — dropping stale pooled connection")
             return False
 
-    def _close_connection(self) -> None:
-        if self._connection is not None:
-            try:
-                self._connection.close()
-            except Exception:
-                pass
-            self._connection = None
-
-    def _reconnect(self) -> None:
+    def _connect(self) -> Any:
+        """Open one new connection, with back-off retries."""
         if self._params is None:
             raise RuntimeError(
-                "SAPConnectionManager.configure() must be called before get_connection()"
+                "SAPConnectionManager.configure() must be called before connection()"
             )
-
-        self._close_connection()
 
         last_exc: Exception | None = None
         delay = self._reconnect_delay_base
@@ -159,13 +270,13 @@ class SAPConnectionManager:
                 logger.info(f"SAP connect attempt {attempt}/{self._max_retries} …")
 
                 if HAS_PYRFC:
-                    self._connection = pyrfc.Connection(**self._params.to_pyrfc_dict())
+                    conn = pyrfc.Connection(**self._params.to_pyrfc_dict())
                 else:
                     # Stub for local dev / CI without SAP libs
-                    self._connection = _StubConnection(self._params)
+                    conn = _StubConnection(self._params)
 
                 logger.info(f"SAP connection established (attempt {attempt})")
-                return
+                return conn
 
             except Exception as exc:
                 last_exc = exc
@@ -177,6 +288,27 @@ class SAPConnectionManager:
         raise ConnectionError(
             f"Failed to connect to SAP after {self._max_retries} attempts"
         ) from last_exc
+
+
+def _close_quietly(conn: Any) -> None:
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ[name]))
+    except (KeyError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------------------

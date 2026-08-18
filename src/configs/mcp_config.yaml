@@ -7,7 +7,19 @@
 
 # ── MCP Server process settings ────────────────────────────────────────────
 server:
-  # Transport: "stdio" (default, same machine) or "sse" (remote / containerised)
+  # Transport: "stdio" (default, same machine) or "sse" (one shared server).
+  #
+  #   stdio — the agent SPAWNS A SERVER SUBPROCESS PER RUN. Zero setup, so it is
+  #           the default for the CLI, tests and local dev — but N concurrent
+  #           company runs mean N interpreters and N sets of SAP connections.
+  #   sse   — every run connects to one already-running mcp_server.py, which
+  #           pools SAP connections across all of them. Use this for any
+  #           multi-run web deployment.
+  #
+  # Both sides read MCP_TRANSPORT (and MCP_SSE_URL) from the environment first,
+  # so a deployment flips transport in .env without editing this file:
+  #   MCP_TRANSPORT=sse
+  #   MCP_SSE_URL=http://127.0.0.1:8100/sse
   transport: stdio
 
   # --- stdio transport (used when transport=stdio) ---
@@ -17,8 +29,18 @@ server:
     - mcp_server.py
 
   # --- SSE transport (used when transport=sse) ---
-  # Uncomment when running mcp_server.py as a standalone service.
-  # sse_url: http://localhost:8000/sse
+  # Where the shared server listens (server side) and where runs find it (client
+  # side). Port 8100 stays clear of uvicorn's 8000; bind to 127.0.0.1 unless the
+  # server really is remote — these tools execute SAP work and carry no auth.
+  sse_host: 127.0.0.1
+  sse_port: 8100
+  sse_url: http://127.0.0.1:8100/sse
+
+  # Max simultaneously open SAP connections in the shared server (env: SAP_POOL_SIZE).
+  # This is the RFC concurrency cap for the WHOLE fleet — each busy connection
+  # occupies one SAP dialog work process, so agree the number with Basis. Polling
+  # calls are short; only inline-wait SUBMITs (async: false) hold a slot for long.
+  pool_size: 8
 
 
 # ── Tool behaviour ─────────────────────────────────────────────────────────

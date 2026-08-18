@@ -5,8 +5,10 @@ Endpoints
 ---------
   GET  /               → index.html (login overlay shown by JS if unauthenticated)
   POST /api/login      → validate credentials, set session cookie
-  GET  /api/me         → current user info (401 if not logged in)
+  GET  /api/me         → current user info + permission set (401 if not logged in)
   POST /api/logout     → clear session cookie
+  POST /api/me/password → change own password (any authenticated user)
+  POST /api/password-reset → unauthenticated: mail the user a new one-time password
   GET  /api/companies  → authorized companies with live run status
 
   WS   /ws/dashboard   → aggregated status stream for all authorized companies
@@ -36,6 +38,8 @@ load_dotenv(Path(__file__).parent / ".env", override=True)
 
 import auth
 import config_settings
+import mailer
+import permissions
 from config import reset_each_run_enabled
 from config_schema import STEP_SCHEMA_VERSION, SchemaTooNew, migrate_document, step_json_schema
 from config_store import VersionConflict, get_config_store, load_effective_config
@@ -52,6 +56,11 @@ async def lifespan(_app: FastAPI):
     import graph_builder  # noqa: F401
     logger.info("graph_builder pre-imported — first run will start immediately")
     yield
+    # Shared per-process resources (checkpointer connection, LLM HTTP pool) are
+    # opened lazily by config.py and live for the life of the app — close them here.
+    import config
+    await config.close_checkpointers()
+    await config.close_http_clients()
 
 
 app = FastAPI(title="SAP Period Close Agent", lifespan=lifespan)
@@ -75,9 +84,16 @@ def _get_session_ws(cookies: dict) -> dict | None:
     return auth.decode_session_token(token) if token else None
 
 
+def _scoped_codes(session: dict, all_codes) -> list[str]:
+    """The companies this session may reach — the one place the scope rule is applied
+    (role-implied `*` for sys_admin, an explicit `"*"` entry, or the plain list)."""
+    return permissions.resolve_scope(
+        session.get("role"), session.get("company_codes", []), all_codes)
+
+
 def _companies_for_user(session: dict) -> list[dict]:
-    codes = session.get("company_codes", [])
     all_companies = load_companies()
+    codes = set(_scoped_codes(session, [c["code"] for c in all_companies]))
     mgr = get_run_manager()
     result = []
     for c in all_companies:
@@ -122,14 +138,24 @@ async def login(request: Request, response: Response):
         return JSONResponse({"error": "Invalid username or password"}, status_code=401)
 
     token = auth.create_session_token(user)
-    companies = _companies_for_user(
-        {"company_codes": user.get("company_codes", [])}
-    )
+    # Same shape the session cookie carries — role included, since scope resolution
+    # depends on it (sys_admin reaches every registered company).
+    companies = _companies_for_user({
+        "role": user.get("role", permissions.DEFAULT_ROLE),
+        "company_codes": user.get("company_codes", []),
+    })
 
+    role = user.get("role", permissions.DEFAULT_ROLE)
     response = JSONResponse({
         "username": user["username"],
         "display_name": user.get("display_name", username),
-        "role": user.get("role", "operator"),
+        "email": user.get("email"),
+        "role": role,
+        "permissions": sorted(permissions.permissions_for(role)),
+        # A handed-over password (initial account, or a reset) lets you in exactly once:
+        # the UI forces the change modal and `_require` refuses everything else until
+        # the user has set a password only they know.
+        "must_change_password": bool(user.get("must_change_password")),
         "companies": companies,
     })
     response.set_cookie(
@@ -150,10 +176,17 @@ async def me(request: Request):
     if not session:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     companies = _companies_for_user(session)
+    role = session.get("role", permissions.DEFAULT_ROLE)
     return JSONResponse({
         "username": session["username"],
         "display_name": session.get("display_name", session["username"]),
-        "role": session.get("role", "operator"),
+        "email": session.get("email"),
+        "role": role,
+        # The UI hides controls off this list rather than keeping its own copy of the
+        # role table — the server stays the single source of truth (and the authority:
+        # hiding a button is not access control, every endpoint re-checks).
+        "permissions": sorted(permissions.permissions_for(role)),
+        "must_change_password": bool(session.get("must_change_password")),
         "companies": companies,
     })
 
@@ -163,6 +196,89 @@ async def logout(response: Response):
     response = JSONResponse({"ok": True})
     response.delete_cookie(auth.COOKIE_NAME, path="/")
     return response
+
+
+_MIN_PASSWORD_LEN = 8
+
+
+@app.post("/api/me/password")
+async def change_own_password(request: Request):
+    """Self-service password change for any authenticated user.
+
+    Deliberately needs no permission: routing every password change through a
+    sys_admin is what pushes teams toward shared accounts. Requires the current
+    password, so a borrowed session cannot lock the real owner out."""
+    session = _get_session(request)
+    if not session:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    body = await request.json()
+    current = body.get("current_password") or ""
+    new = body.get("new_password") or ""
+    if len(new) < _MIN_PASSWORD_LEN:
+        return JSONResponse(
+            {"error": f"New password must be at least {_MIN_PASSWORD_LEN} characters"},
+            status_code=400)
+    username = session["username"]
+    user = await run_in_threadpool(auth.get_user, username)
+    if not user or not auth.verify_password(current, user["password_hash"]):
+        return JSONResponse({"error": "Current password is incorrect"}, status_code=403)
+    await run_in_threadpool(
+        lambda: get_config_store().update_user(
+            username, password_hash=auth.hash_password(new),
+            must_change_password=False, user=username)
+    )
+    logger.info("Password changed by %s (self-service)", username)
+    # Re-issue the cookie: this is what lifts the hand-over lock (`_require` reads the
+    # flag off the session, so a stale cookie would keep the account fenced off).
+    fresh = dict(user, must_change_password=False)
+    response = JSONResponse({"ok": True})
+    response.set_cookie(auth.COOKIE_NAME, auth.create_session_token(fresh),
+                        httponly=True, samesite="lax", max_age=8 * 3600, path="/")
+    return response
+
+
+@app.post("/api/password-reset")
+async def password_reset(request: Request):
+    """Self-service reset from the login screen — deliberately unauthenticated.
+
+    Mints a one-time password, mails it to the address on the account, and flags the
+    account so that password only works for the one login that replaces it. The reply
+    never says whether the username exists: a 200 here means "if that account exists,
+    its owner has mail", which is the only answer that does not turn this into a user
+    directory. A deployment with no SMTP configured says so plainly (that leaks nothing
+    about accounts) so the user knows to call an administrator instead."""
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    if not mailer.is_configured():
+        return JSONResponse(
+            {"error": "E-mail delivery is not configured on this deployment — "
+                      "ask your system administrator to reset your password"},
+            status_code=503)
+    generic = JSONResponse(
+        {"ok": True, "message": "If that account exists, a new password has been "
+                                "sent to the address on file."})
+    if not username:
+        return generic
+    user = await run_in_threadpool(auth.get_user, username)
+    if not user or not (user.get("email") or "").strip():
+        logger.info("Password reset requested for unknown/e-mail-less account %r", username)
+        return generic
+    password = auth.generate_password()
+    try:
+        await run_in_threadpool(
+            mailer.send_password_email, user["email"], username, password, reset=True)
+    except mailer.MailError as exc:
+        logger.warning("Self-service reset for %s failed to send: %s", username, exc)
+        return JSONResponse({"error": str(exc)}, status_code=502)
+    # Only after the mail is away — a password the user never receives would lock them
+    # out of an account they could still have signed into.
+    await run_in_threadpool(
+        lambda: get_config_store().update_user(
+            username, password_hash=auth.hash_password(password),
+            must_change_password=True, user=username)
+    )
+    logger.info("Password reset (self-service) for %s", username)
+    return generic
 
 
 @app.get("/api/companies")
@@ -177,30 +293,38 @@ async def companies(request: Request):
 # Admin Settings REST endpoints (per-company config deltas)
 # ---------------------------------------------------------------------------
 
-def _require_admin(request: Request, code: str | None = None):
-    """Return (session, None) when the caller is an admin authorized for `code`,
-    else (None, JSONResponse) with the right status.
+def _require(request: Request, permission: str, code: str | None = None):
+    """Return (session, None) when the caller carries `permission` and — if `code` is
+    given — has that company in scope; else (None, JSONResponse) with the right status.
 
-    An admin may configure any company in the registry — registry management is already
-    role-only, so a company an admin created must also be one they can set up. Companies
-    listed in their users.yaml `company_codes` stay reachable too (that list still gates
-    running/monitoring, which is a separate, operator-level concern)."""
+    Two independent questions, always in this order: does the *role* carry the verb
+    (permissions.PERMISSIONS), and is the *company* in scope (company_codes, with `"*"`
+    and the sys_admin role meaning all). Nothing here branches on a role name, so adding
+    a role is a row in permissions.PERMISSIONS and no endpoint edits.
+
+    One question comes first, before either of those: is this session still running on a
+    handed-over password? If so it may do nothing but change it (see `/api/me/password`),
+    whatever its role — a temporary password that reached someone over e-mail is not yet
+    proof of who is holding it."""
     session = _get_session(request)
     if not session:
         return None, JSONResponse({"error": "Not authenticated"}, status_code=401)
-    if session.get("role") != "admin":
-        return None, JSONResponse({"error": "Admin role required"}, status_code=403)
-    if code is not None and code not in set(session.get("company_codes", [])):
-        registered = {c["code"] for c in get_config_store().list_registry()}
-        if code not in registered:
-            return None, JSONResponse({"error": "Not authorized for this company"},
-                                      status_code=403)
+    if session.get("must_change_password"):
+        return None, JSONResponse({"error": "Set a password of your own to continue"},
+                                  status_code=403)
+    if not permissions.has_permission(session.get("role"), permission):
+        return None, JSONResponse({"error": f"Permission '{permission}' required"},
+                                  status_code=403)
+    if code is not None and not permissions.in_scope(
+            session.get("role"), session.get("company_codes", []), code):
+        return None, JSONResponse({"error": "Not authorized for this company"},
+                                  status_code=403)
     return session, None
 
 
 @app.get("/api/settings/schema")
 async def settings_schema(request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.CONFIG_COMPANY)
     if err:
         return err
     return JSONResponse(step_json_schema())
@@ -209,7 +333,7 @@ async def settings_schema(request: Request):
 @app.get("/api/settings/form-schema")
 async def settings_form_schema(request: Request):
     """UI form descriptor (sections, fields, conditional visibility, logical enums)."""
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.CONFIG_COMPANY)
     if err:
         return err
     # Base globals feed only the advisory TOOLS catalog; if the base can't be loaded
@@ -224,10 +348,14 @@ async def settings_form_schema(request: Request):
 
 # --- Base tier: the product base (globals + ordered steps), edited as "Company Base" ---
 # Registered before /api/settings/{code} so the literal "base" path wins the match.
+#
+# Reads take CONFIG_COMPANY, writes take CONFIG_BASE. That asymmetry is the point of the
+# role split: a company `admin` can *see* the base their delta sits on top of, but only a
+# `sys_admin` can move it — one base edit changes every company at once.
 
 @app.get("/api/settings/base")
 async def get_base_settings(request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.CONFIG_COMPANY)
     if err:
         return err
     data = await run_in_threadpool(config_settings.build_base_settings)
@@ -236,7 +364,7 @@ async def get_base_settings(request: Request):
 
 @app.put("/api/settings/base")
 async def put_base_settings(request: Request):
-    session, err = _require_admin(request)
+    session, err = _require(request, permissions.CONFIG_BASE)
     if err:
         return err
     body = await request.json()
@@ -263,7 +391,7 @@ async def put_base_settings(request: Request):
 
 @app.get("/api/settings/base/history")
 async def get_base_history(request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.CONFIG_COMPANY)
     if err:
         return err
     rows = await run_in_threadpool(get_config_store().base_history)
@@ -272,7 +400,7 @@ async def get_base_history(request: Request):
 
 @app.delete("/api/settings/base/history/oldest")
 async def delete_base_history_oldest(request: Request):
-    session, err = _require_admin(request)
+    session, err = _require(request, permissions.CONFIG_BASE)
     if err:
         return err
     try:
@@ -287,7 +415,7 @@ async def delete_base_history_oldest(request: Request):
 async def export_base_settings(request: Request):
     """Download the base (globals + steps) as a YAML file — the seed an admin hands to
     another deployment (Manage companies → Base → download/upload)."""
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.CONFIG_COMPANY)
     if err:
         return err
     data = await run_in_threadpool(config_settings.build_base_settings)
@@ -306,7 +434,7 @@ async def import_base_settings(request: Request):
     """Replace the base with an uploaded YAML file (same shape as the export). The
     overwrite itself is confirmed client-side; this always writes against the current
     version (a deliberate full replace, not an optimistic-locked edit)."""
-    session, err = _require_admin(request)
+    session, err = _require(request, permissions.CONFIG_BASE)
     if err:
         return err
     raw = (await request.body()).decode("utf-8")
@@ -336,7 +464,7 @@ async def import_base_settings(request: Request):
 
 @app.get("/api/settings/{code}")
 async def get_settings(code: str, request: Request):
-    _, err = _require_admin(request, code)
+    _, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     data = await run_in_threadpool(config_settings.build_settings, code)
@@ -345,7 +473,7 @@ async def get_settings(code: str, request: Request):
 
 @app.put("/api/settings/{code}")
 async def put_settings(code: str, request: Request):
-    session, err = _require_admin(request, code)
+    session, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     body = await request.json()
@@ -373,7 +501,7 @@ async def put_settings(code: str, request: Request):
 
 @app.get("/api/settings/{code}/history")
 async def settings_history(code: str, request: Request):
-    session, err = _require_admin(request, code)
+    session, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     try:
@@ -386,7 +514,7 @@ async def settings_history(code: str, request: Request):
 
 @app.delete("/api/settings/{code}/history/oldest")
 async def delete_settings_history_oldest(code: str, request: Request):
-    session, err = _require_admin(request, code)
+    session, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     try:
@@ -401,7 +529,7 @@ async def delete_settings_history_oldest(code: str, request: Request):
 @app.get("/api/settings/{code}/export")
 async def export_settings(code: str, request: Request):
     """Download a company's override + run_context as a YAML file."""
-    _, err = _require_admin(request, code)
+    _, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     state = await run_in_threadpool(get_config_store().get_override, code)
@@ -416,7 +544,7 @@ async def import_settings(code: str, request: Request):
     """Replace a company's override + run_context with an uploaded YAML file (same shape
     as the export). Always writes against the current version — the overwrite is
     confirmed client-side, not optimistic-locked."""
-    session, err = _require_admin(request, code)
+    session, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     raw = (await request.body()).decode("utf-8")
@@ -440,7 +568,7 @@ async def import_settings(code: str, request: Request):
 
 @app.post("/api/settings/{code}/reset")
 async def reset_settings(code: str, request: Request):
-    session, err = _require_admin(request, code)
+    session, err = _require(request, permissions.CONFIG_COMPANY, code)
     if err:
         return err
     body = await request.json()
@@ -463,14 +591,14 @@ async def reset_settings(code: str, request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Admin company registry (create / rename / delete companies)
+# Company registry (create / rename / delete companies) — sys_admin only
 # ---------------------------------------------------------------------------
-# Role-only admin check: registry management spans all companies. Editing a company's
-# per-company delta still requires that code in the admin's users.yaml company_codes.
+# No company scope on these: the registry defines what companies *are*, so it sits above
+# per-company scope and takes MANAGE_REGISTRY, which only sys_admin carries.
 
 @app.get("/api/registry/companies")
 async def registry_list(request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.MANAGE_REGISTRY)
     if err:
         return err
     return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
@@ -478,7 +606,7 @@ async def registry_list(request: Request):
 
 @app.post("/api/registry/companies")
 async def registry_create(request: Request):
-    session, err = _require_admin(request)
+    session, err = _require(request, permissions.MANAGE_REGISTRY)
     if err:
         return err
     body = await request.json()
@@ -499,7 +627,7 @@ async def registry_create(request: Request):
 
 @app.put("/api/registry/companies/{code}")
 async def registry_update(code: str, request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.MANAGE_REGISTRY)
     if err:
         return err
     body = await request.json()
@@ -515,12 +643,228 @@ async def registry_update(code: str, request: Request):
 
 @app.delete("/api/registry/companies/{code}")
 async def registry_delete(code: str, request: Request):
-    _, err = _require_admin(request)
+    _, err = _require(request, permissions.MANAGE_REGISTRY)
     if err:
         return err
     await run_in_threadpool(get_config_store().delete_company, code)
     logger.info("Company %s deleted", code)
     return JSONResponse(await run_in_threadpool(get_config_store().list_registry))
+
+
+# ---------------------------------------------------------------------------
+# User registry (create / edit / delete users) — DB-backed
+# ---------------------------------------------------------------------------
+# MANAGE_USERS (sys_admin only), like the company registry: whoever can mint users can
+# mint a sys_admin, so this cannot sit below the top role. Every response is the
+# hash-free user list.
+#
+# A sys_admin can hand out a password but never *knows* one. Two moments produce a
+# password here — creating the account (the initial one, typed or generated) and
+# resetting it (always generated) — and both mark the account `must_change_password`, so
+# the password an administrator saw stops working the moment its owner signs in. Editing
+# a user therefore has no password field at all: there is nothing an admin could set that
+# would survive the user's first login, and a settable one would only invite the habit of
+# choosing passwords for people.
+
+_VALID_ROLES = permissions.VALID_ROLES
+
+
+def _scope_conflict_error(role: str, company_codes: list[str],
+                          exclude_username: str | None = None):
+    """400 when this assignment would take a company off another operator, else None."""
+    clashes = permissions.scope_conflicts(
+        role, company_codes, auth.list_users(), exclude_username=exclude_username)
+    if not clashes:
+        return None
+    detail = ", ".join(f"{code} (held by {who})" for code, who in sorted(clashes.items()))
+    return JSONResponse(
+        {"error": f"Each company is closed by exactly one operator — already assigned: {detail}"},
+        status_code=400)
+
+
+@app.get("/api/registry/users")
+async def users_list(request: Request):
+    _, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    return JSONResponse(await run_in_threadpool(auth.list_users))
+
+
+@app.get("/api/registry/company-scope")
+async def users_company_scope(request: Request, role: str = Query(...),
+                              username: str | None = Query(None)):
+    """Which companies the scope picker may offer for a user in `role`.
+
+    `all` is the registry; `free` drops the companies another operator already owns, so
+    the picker cannot build a clash the server would then refuse. `username` is the user
+    being edited — their own codes stay free, since keeping them is not a clash."""
+    _, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    registry = await run_in_threadpool(get_config_store().list_registry)
+    all_codes = [c["code"] for c in registry]
+    users = await run_in_threadpool(auth.list_users)
+    return JSONResponse({
+        "all": all_codes,
+        "free": permissions.free_codes(role, users, all_codes, exclude_username=username),
+        "exclusive": role in permissions.EXCLUSIVE_SCOPE_ROLES,
+        "global_scope": role in permissions.GLOBAL_SCOPE_ROLES,
+    })
+
+
+@app.post("/api/registry/users")
+async def users_create(request: Request):
+    session, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    body = await request.json()
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    display_name = (body.get("display_name") or username).strip()
+    email = (body.get("email") or "").strip()
+    role = (body.get("role") or permissions.DEFAULT_ROLE).strip()
+    company_codes = body.get("company_codes") or []
+    if not username:
+        return JSONResponse({"error": "username is required"}, status_code=400)
+    if role not in _VALID_ROLES:
+        return JSONResponse({"error": f"role must be one of {sorted(_VALID_ROLES)}"},
+                            status_code=400)
+    # Either the admin types an initial password, or (with an address on file) we
+    # generate one and mail it — but an account is never created without one.
+    generated = False
+    if not password:
+        if not email:
+            return JSONResponse(
+                {"error": "Set an initial password, or give an e-mail address to send "
+                          "a generated one to"}, status_code=400)
+        password, generated = auth.generate_password(), True
+    err_resp = await run_in_threadpool(_scope_conflict_error, role, company_codes)
+    if err_resp:
+        return err_resp
+    try:
+        await run_in_threadpool(
+            lambda: get_config_store().create_user(
+                username, auth.hash_password(password), display_name, role,
+                company_codes, session["username"], email=email,
+                must_change_password=True)
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("User %s created by %s", username, session["username"])
+    delivery = await _deliver_password(username, email, password, reset=False,
+                                       generated=generated)
+    return JSONResponse({"users": await run_in_threadpool(auth.list_users), **delivery})
+
+
+@app.put("/api/registry/users/{username}")
+async def users_update(username: str, request: Request):
+    session, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    body = await request.json()
+    kwargs: dict = {}
+    if "display_name" in body:
+        kwargs["display_name"] = (body.get("display_name") or username).strip()
+    if "email" in body:
+        kwargs["email"] = (body.get("email") or "").strip()
+    if "role" in body:
+        role = (body.get("role") or "").strip()
+        if role not in _VALID_ROLES:
+            return JSONResponse({"error": f"role must be one of {sorted(_VALID_ROLES)}"},
+                                status_code=400)
+        kwargs["role"] = role
+    if "company_codes" in body:
+        kwargs["company_codes"] = body.get("company_codes") or []
+    # Resolve the pair the exclusivity rule needs against what the user will *become*:
+    # either field may be absent from a partial edit.
+    if "role" in kwargs or "company_codes" in kwargs:
+        existing = await run_in_threadpool(auth.get_user, username)
+        if existing is None:
+            return JSONResponse({"error": f"User '{username}' not found"}, status_code=400)
+        err_resp = await run_in_threadpool(
+            _scope_conflict_error,
+            kwargs.get("role", existing.get("role")),
+            kwargs.get("company_codes", existing.get("company_codes") or []),
+            username)
+        if err_resp:
+            return err_resp
+    try:
+        await run_in_threadpool(
+            lambda: get_config_store().update_user(
+                username, user=session["username"], **kwargs)
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("User %s updated by %s", username, session["username"])
+    return JSONResponse(await run_in_threadpool(auth.list_users))
+
+
+async def _deliver_password(username: str, email: str, password: str, *,
+                            reset: bool, generated: bool = True) -> dict:
+    """Mail a one-time password to its owner; report what actually happened.
+
+    The plaintext comes back to the caller only when it could *not* be delivered — an
+    unconfigured mail server or a user with no address on file. That is a deliberate
+    fallback, not a convenience: without it a deployment with no SMTP has no way to
+    onboard anyone. When the mail goes out, nobody sees the password but its owner."""
+    if not generated:
+        return {"emailed": False, "password": None,
+                "note": f"Give {username} their initial password. They will be asked to "
+                        f"change it at first sign-in."}
+    if not email:
+        return {"emailed": False, "password": password,
+                "note": "No e-mail address on file — hand this one-time password over "
+                        "directly. It must be changed at the next sign-in."}
+    if not mailer.is_configured():
+        return {"emailed": False, "password": password,
+                "note": "E-mail is not configured on this deployment (SMTP_HOST) — hand "
+                        "this one-time password over directly."}
+    try:
+        await run_in_threadpool(mailer.send_password_email, email, username, password,
+                                reset=reset)
+    except mailer.MailError as exc:
+        return {"emailed": False, "password": password,
+                "note": f"{exc}. Hand this one-time password over directly."}
+    return {"emailed": True, "password": None,
+            "note": f"A one-time password was sent to {email}."}
+
+
+@app.post("/api/registry/users/{username}/reset-password")
+async def users_reset_password(username: str, request: Request):
+    """Generate a new one-time password for someone else's account and mail it to them.
+
+    Rare in practice — users reset their own from the login screen — but it is the way
+    back in for an account whose address is wrong or whose owner cannot reach mail."""
+    session, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    user = await run_in_threadpool(auth.get_user, username)
+    if user is None:
+        return JSONResponse({"error": f"User '{username}' not found"}, status_code=400)
+    password = auth.generate_password()
+    email = (user.get("email") or "").strip()
+    delivery = await _deliver_password(username, email, password, reset=True)
+    await run_in_threadpool(
+        lambda: get_config_store().update_user(
+            username, password_hash=auth.hash_password(password),
+            must_change_password=True, user=session["username"])
+    )
+    logger.info("Password reset for %s by %s (emailed=%s)",
+                username, session["username"], delivery["emailed"])
+    return JSONResponse({"users": await run_in_threadpool(auth.list_users), **delivery})
+
+
+@app.delete("/api/registry/users/{username}")
+async def users_delete(username: str, request: Request):
+    session, err = _require(request, permissions.MANAGE_USERS)
+    if err:
+        return err
+    try:
+        await run_in_threadpool(get_config_store().delete_user, username)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    logger.info("User %s deleted by %s", username, session["username"])
+    return JSONResponse(await run_in_threadpool(auth.list_users))
 
 
 # ---------------------------------------------------------------------------
@@ -536,7 +880,19 @@ async def ws_dashboard(ws: WebSocket):
         await ws.close(code=4001, reason="Unauthenticated")
         return
 
-    authorized_codes: set[str] = set(session.get("company_codes", []))
+    role = session.get("role")
+    if session.get("must_change_password"):
+        await ws.close(code=4003, reason="Password change required")
+        return
+    if not permissions.has_permission(role, permissions.VIEW):
+        await ws.close(code=4003, reason="Not authorized")
+        return
+
+    authorized_codes: set[str] = set(
+        _scoped_codes(session, [c["code"] for c in load_companies()]))
+    # Read-only roles (manager) get the full event stream and no control over it. This
+    # is the enforcement point — the UI also hides the buttons, but that is cosmetic.
+    may_run = permissions.has_permission(role, permissions.RUN)
     mgr = get_run_manager()
 
     # Subscribe to all authorized companies
@@ -551,7 +907,12 @@ async def ws_dashboard(ws: WebSocket):
                 msg_type = data.get("type")
                 company_code = data.get("company")
 
-                if msg_type == "start" and company_code in authorized_codes:
+                if msg_type == "start" and not may_run:
+                    await ws.send_json({
+                        "type": "error", "company": company_code,
+                        "message": "Your role is read-only — runs are started by an operator",
+                    })
+                elif msg_type == "start" and company_code in authorized_codes:
                     company = get_company(company_code)
                     if not company:
                         await ws.send_json({"type": "error", "message": f"Unknown company {company_code}"})
@@ -634,11 +995,19 @@ async def ws_company(ws: WebSocket, company: str = Query(...)):
         await ws.close(code=4001, reason="Unauthenticated")
         return
 
-    authorized_codes: set[str] = set(session.get("company_codes", []))
-    if company not in authorized_codes:
+    role = session.get("role")
+    if session.get("must_change_password"):
+        await ws.close(code=4003, reason="Password change required")
+        return
+    if (not permissions.has_permission(role, permissions.VIEW)
+            or not permissions.in_scope(role, session.get("company_codes", []), company)):
         await ws.close(code=4003, reason="Not authorized for this company")
         return
 
+    # Read-only roles (manager) may watch every event but drive nothing: start,
+    # rollback_and_restart and decision are all refused below. Server-side, because
+    # hiding the buttons in the UI is not access control.
+    may_run = permissions.has_permission(role, permissions.RUN)
     mgr = get_run_manager()
     sub_q = mgr.subscribe(company)
 
@@ -654,7 +1023,12 @@ async def ws_company(ws: WebSocket, company: str = Query(...)):
                 data = await ws.receive_json()
                 msg_type = data.get("type")
 
-                if msg_type == "start":
+                if (msg_type in ("start", "rollback_and_restart", "decision")
+                        and not may_run):
+                    await send({"type": "error",
+                                "message": "Your role is read-only — "
+                                           "this run is driven by an operator"})
+                elif msg_type == "start":
                     company_info = get_company(company)
                     if company_info:
                         ok = await mgr.start(

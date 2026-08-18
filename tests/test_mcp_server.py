@@ -7,8 +7,8 @@ Every tool returns the unified envelope {status, messages, meta, data}.
 """
 
 import json
+import threading
 
-import pytest
 
 import mcp_server
 from sap_connection_manager import HAS_PYRFC, _StubConnection
@@ -166,3 +166,88 @@ def test_check_period_ok():
         "TOOLS", "TOOL_READ_TABLE", json.dumps({"table": "COKP"}))
     _assert_envelope(out)
     assert out["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Tool registration — the sync bodies above are what runs, but never on the loop
+#
+# Under SSE one server process serves every concurrent run, so a tool that
+# executed inline would serialize the whole fleet behind one blocking RFC call.
+# ---------------------------------------------------------------------------
+
+TOOL_NAMES = {"sap_check_period", "sap_execute_step", "sap_run_tool", "sap_read_table",
+              "sap_job_status", "sap_read_spool", "sap_read_job_log", "sap_system_identity"}
+
+
+async def test_every_tool_is_registered_async():
+    listed = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    assert TOOL_NAMES <= set(listed)
+    registered = mcp_server.mcp._tool_manager._tools
+    assert all(registered[name].is_async for name in TOOL_NAMES), \
+        "a sync tool would block the shared server's event loop"
+
+
+async def test_registration_preserves_the_tool_schema():
+    """The thread shim wraps the function — the parameters clients see must not change."""
+    listed = {t.name: t for t in await mcp_server.mcp.list_tools()}
+    props  = listed["sap_read_table"].inputSchema["properties"]
+    assert set(props) == {"table", "where", "fields", "max_rows"}
+    assert props["max_rows"]["type"] == "integer"
+    assert listed["sap_read_table"].description.strip().startswith("Read rows from any SAP")
+
+
+async def test_tool_call_runs_off_the_event_loop():
+    loop_thread = threading.get_ident()
+    ran_on: list[int] = []
+
+    original = mcp_server._rfc
+
+    def _spy(*args, **kwargs):
+        ran_on.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    mcp_server._rfc = _spy
+    try:
+        await mcp_server.mcp.call_tool("sap_read_table",
+                                       {"table": "COKP", "where": "", "fields": ""})
+    finally:
+        mcp_server._rfc = original
+
+    assert ran_on and all(tid != loop_thread for tid in ran_on)
+
+
+async def test_concurrent_tool_calls_do_not_serialize():
+    """Two runs calling the shared server at once must overlap, not queue."""
+    import asyncio
+
+    in_call = threading.Barrier(2, timeout=5)
+    original = mcp_server._rfc
+
+    def _blocking(*args, **kwargs):
+        in_call.wait()                      # deadlocks (BrokenBarrier) if calls serialize
+        return original(*args, **kwargs)
+
+    mcp_server._rfc = _blocking
+    # The shim's limiter is sized to the connection pool; two slots are needed here
+    # regardless of what SAP_POOL_SIZE happens to be in this environment.
+    tokens = mcp_server._rfc_limiter.total_tokens
+    mcp_server._rfc_limiter.total_tokens = max(2, tokens)
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*[
+            mcp_server.mcp.call_tool("sap_read_table",
+                                     {"table": "COKP", "where": "", "fields": ""})
+            for _ in range(2)
+        ]), timeout=10)
+    finally:
+        mcp_server._rfc = original
+        mcp_server._rfc_limiter.total_tokens = tokens
+
+    assert len(results) == 2
+
+
+def test_rfc_returns_its_connection_to_the_pool():
+    before = mcp_server.conn_mgr.stats()
+    mcp_server.sap_read_table("COKP", "", "", 100)
+    after = mcp_server.conn_mgr.stats()
+    assert after["live"] == after["idle"]        # nothing left checked out
+    assert after["live"] >= before["live"]

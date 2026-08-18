@@ -11,7 +11,6 @@ session cannot catch this — only a real subprocess launch can.
 import asyncio
 from pathlib import Path
 
-import pytest
 import yaml
 from mcp import ClientSession
 

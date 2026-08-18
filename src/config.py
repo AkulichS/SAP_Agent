@@ -1,9 +1,17 @@
 """
 config.py — config loader, LLM factory and checkpointer for the SAP Period Close agent.
+
+Both factories here are **process-wide caches**, not per-run constructors: a busy
+web deployment runs many companies at once through a single event loop, and a
+fresh checkpointer (an aiosqlite connection, which owns a thread) or a fresh LLM
+(two httpx clients, which own connection pools) per run leaks both for the life
+of the process. Everything below is shared and reused instead; see
+``build_async_checkpointer`` and ``_llm_from_profile``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 from pathlib import Path
@@ -12,7 +20,6 @@ import httpx
 import yaml
 from langchain_openai import ChatOpenAI
 
-SERVERS_DIR = Path(__file__).parent / "tools"
 CONFIGS_DIR = Path(__file__).parent / "configs"
 DB_DIR = Path(__file__).parent / "db"
 DEFAULT_CHECKPOINT_DB = DB_DIR / "period_close_checkpoints.db"
@@ -289,12 +296,6 @@ def reset_each_run_enabled(defaults: dict) -> bool:
             or os.getenv("RESET_EACH_RUN") in ("1", "true", "True"))
 
 
-def build_llm(profile_name: str = "analysis") -> ChatOpenAI:
-    """Return an LLM from a named default profile ('analysis' | 'validation')."""
-    profile = _DEFAULT_PROFILES.get(profile_name, _DEFAULT_PROFILES["analysis"])
-    return _llm_from_profile(profile)
-
-
 def build_llms_from_config(period_cfg: dict) -> dict[str, ChatOpenAI]:
     """
     Return {"analysis": LLM, "validation": LLM} resolved from config.
@@ -308,34 +309,39 @@ def build_llms_from_config(period_cfg: dict) -> dict[str, ChatOpenAI]:
     return result
 
 
-def build_checkpointer(db_path: str | None = None):
-    """Sync checkpointer for CLI use. Falls back to InMemorySaver."""
-    import logging as _log
-    path = db_path or os.getenv("CHECKPOINT_DB", str(DEFAULT_CHECKPOINT_DB))
-    try:
-        import sqlite3
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        DB_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(path, check_same_thread=False)
-        saver = SqliteSaver(conn)
-        _log.getLogger(__name__).info("Using SqliteSaver at %s", path)
-        return saver
-    except Exception as exc:
-        _log.getLogger(__name__).warning(
-            "SqliteSaver failed (%s) — using InMemorySaver", exc
-        )
-    from langgraph.checkpoint.memory import InMemorySaver
-    return InMemorySaver()
+# One checkpointer per (db path, event loop). Keyed by loop as well as path so a
+# test suite spinning up a loop per test never inherits a connection bound to a
+# closed one; a server (single loop, single worker) resolves to exactly one entry.
+# The value is the in-flight *task*, so two runs starting simultaneously await the
+# same open instead of racing to open two connections.
+_checkpointers: dict[tuple[str, int], asyncio.Task] = {}
 
 
 async def build_async_checkpointer(db_path: str | None = None):
     """
-    Async checkpointer for use with graph.ainvoke / astream.
-    Creates an AsyncSqliteSaver by opening an aiosqlite connection directly.
-    Falls back to InMemorySaver when aiosqlite is absent.
+    Async checkpointer for use with graph.ainvoke / astream — shared per DB path.
+
+    The saver wraps one aiosqlite connection, and aiosqlite backs each connection
+    with its own thread, so this MUST NOT be built per run: N concurrent closes
+    would mean N threads and N connections against one SQLite file that they then
+    contend on. One shared saver serializes its own writes internally (it holds an
+    asyncio lock) and each checkpoint write is a small insert under WAL, which is
+    far cheaper than the contention it replaces.
     """
-    import logging as _log
     path = db_path or os.getenv("CHECKPOINT_DB", str(DEFAULT_CHECKPOINT_DB))
+    key  = (str(path), id(asyncio.get_running_loop()))
+
+    task = _checkpointers.get(key)
+    if task is None or (task.done() and task.exception() is not None):
+        task = asyncio.ensure_future(_open_checkpointer(str(path)))
+        _checkpointers[key] = task
+    # Shielded: one run being cancelled must not cancel the open every other run awaits.
+    return await asyncio.shield(task)
+
+
+async def _open_checkpointer(path: str):
+    """Open an AsyncSqliteSaver; fall back to InMemorySaver when aiosqlite is absent."""
+    import logging as _log
     try:
         import aiosqlite
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -353,9 +359,78 @@ async def build_async_checkpointer(db_path: str | None = None):
     return InMemorySaver()
 
 
+async def close_checkpointers() -> None:
+    """Close every shared checkpointer opened on the current loop (app shutdown)."""
+    import logging as _log
+    loop_id = id(asyncio.get_running_loop())
+    for key in [k for k in _checkpointers if k[1] == loop_id]:
+        task = _checkpointers.pop(key)
+        if not task.done():
+            task.cancel()
+            continue
+        if task.exception() is not None:
+            continue
+        conn = getattr(task.result(), "conn", None)
+        try:
+            if conn is not None:
+                await conn.close()
+        except Exception as exc:                      # pragma: no cover - defensive
+            _log.getLogger(__name__).warning("Checkpointer close failed: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Internal helper
 # ---------------------------------------------------------------------------
+
+# Shared HTTP transport for every LLM client. One connection pool for the whole
+# process instead of a fresh pair of httpx clients per run (which never got closed
+# and each carried its own pool). The async client is keyed by event loop: httpx
+# keeps live connections bound to the loop that opened them.
+_http_sync:  httpx.Client | None = None
+_http_async: dict[int, httpx.AsyncClient] = {}
+
+_HTTP_LIMITS  = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+_HTTP_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+# ChatOpenAI instances are stateless per call, so one per distinct profile serves
+# every run. Keyed by the profile fields that change the client.
+_llms: dict[tuple, ChatOpenAI] = {}
+
+
+def _loop_key() -> int:
+    try:
+        return id(asyncio.get_running_loop())
+    except RuntimeError:                       # built outside a loop (CLI bootstrap)
+        return 0
+
+
+def _shared_http_clients(loop_id: int) -> tuple[httpx.Client, httpx.AsyncClient]:
+    global _http_sync
+    if _http_sync is None:
+        _http_sync = httpx.Client(verify=False, limits=_HTTP_LIMITS, timeout=_HTTP_TIMEOUT)
+    client = _http_async.get(loop_id)
+    if client is None:
+        client = httpx.AsyncClient(verify=False, limits=_HTTP_LIMITS, timeout=_HTTP_TIMEOUT)
+        _http_async[loop_id] = client
+    return _http_sync, client
+
+
+async def close_http_clients() -> None:
+    """Close the shared LLM HTTP clients for the current loop (app shutdown).
+
+    Drops the LLMs cached against that loop too — they hold its async client.
+    """
+    global _http_sync
+    loop_id = _loop_key()
+    client  = _http_async.pop(loop_id, None)
+    if client is not None:
+        await client.aclose()
+    for key in [k for k in _llms if k[-1] == loop_id]:
+        _llms.pop(key)
+    if not _http_async and _http_sync is not None:
+        _http_sync.close()
+        _http_sync = None
+
 
 def _llm_from_profile(profile: dict) -> ChatOpenAI:
     provider_name = profile.get("provider", "groq")
@@ -365,13 +440,22 @@ def _llm_from_profile(profile: dict) -> ChatOpenAI:
             f"Unknown LLM provider '{provider_name}'. "
             f"Supported: {list(_PROVIDERS)}"
         )
-    api_key = os.getenv(provider["api_key_env"])
-    return ChatOpenAI(
+    # The loop is part of the key: a cached LLM holds that loop's async client.
+    loop_id = _loop_key()
+    key = (provider_name, profile["model"], profile.get("temperature", 0), loop_id)
+    cached = _llms.get(key)
+    if cached is not None:
+        return cached
+
+    sync_client, async_client = _shared_http_clients(loop_id)
+    llm = ChatOpenAI(
         model=profile["model"],
         base_url=provider["base_url"],
-        api_key=api_key,
+        api_key=os.getenv(provider["api_key_env"]),
         temperature=profile.get("temperature", 0),
         max_retries=3,
-        http_client=httpx.Client(verify=False),
-        http_async_client=httpx.AsyncClient(verify=False),
+        http_client=sync_client,
+        http_async_client=async_client,
     )
+    _llms[key] = llm
+    return llm

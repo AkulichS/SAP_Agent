@@ -28,7 +28,7 @@ unit-testable with an injected fake session.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .base import BaseConnector, envelope_data, parse_tool_result
 from .registry import register_connector

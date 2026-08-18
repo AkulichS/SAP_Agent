@@ -196,11 +196,15 @@ def build_base_settings(store: ConfigStore | None = None, base_path=None) -> dic
     if base["version"] == 0:
         b = config_store.get_base_config(store=store, base_path=base_path)
         globals_ = {k: b[k] for k in ("defaults", "llm_profiles", "analysis_defaults") if k in b}
-        return {"version": 0, "globals": globals_, "steps": b.get("steps") or []}
+        return {"version": 0, "globals": globals_, "steps": b.get("steps") or [],
+                "updated_at": None, "updated_by": None}
     return {
         "version": base["version"],
         "globals": base.get("globals") or {},
         "steps": base.get("steps") or [],
+        # who last moved the base, for the registry dialog's Base panel
+        "updated_at": base.get("updated_at"),
+        "updated_by": base.get("updated_by"),
     }
 
 

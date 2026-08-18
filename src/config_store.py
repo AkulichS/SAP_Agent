@@ -35,11 +35,17 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
+import permissions
+
 DEFAULT_DB = Path(__file__).parent / "db" / "config_store.db"
 
 
 class VersionConflict(Exception):
     """Raised when a save's expected_version does not match the stored version."""
+
+
+# Sentinel for update_user: distinguishes "field omitted" from "field set to None/[]".
+_UNSET = object()
 
 
 def _now() -> str:
@@ -107,6 +113,17 @@ class ConfigStore:
                     value_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS users (
+                    username             TEXT PRIMARY KEY,
+                    password_hash        TEXT NOT NULL,
+                    display_name         TEXT,
+                    email                TEXT,
+                    role                 TEXT NOT NULL DEFAULT 'operator',
+                    company_codes_json   TEXT NOT NULL DEFAULT '[]',
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at           TEXT,
+                    updated_at           TEXT
+                );
                 """
             )
 
@@ -148,14 +165,6 @@ class ConfigStore:
                 "  value_json=excluded.value_json, updated_at=excluded.updated_at",
                 (key, json.dumps(value or {}, ensure_ascii=False), _now()),
             )
-
-    def list_companies(self) -> list[dict]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT company_code, version, updated_at, updated_by "
-                "FROM company_overrides ORDER BY company_code"
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     def history(self, company_code: str) -> list[dict]:
         with self._connect() as conn:
@@ -267,13 +276,15 @@ class ConfigStore:
     # as company overrides. version 0 means 'no row yet' → callers fall back to files.
 
     def get_base(self) -> dict:
-        """Return {globals, steps, version}. version 0 means unseeded (use file fallback)."""
+        """Return {globals, steps, version, updated_at, updated_by}. version 0 means
+        unseeded (use file fallback), and then there is no author to report."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT doc_json, version FROM base_config WHERE id = 1"
+                "SELECT doc_json, version, updated_at, updated_by FROM base_config WHERE id = 1"
             ).fetchone()
         if row is None:
-            return {"globals": {}, "steps": [], "version": 0}
+            return {"globals": {}, "steps": [], "version": 0,
+                    "updated_at": None, "updated_by": None}
         doc = json.loads(row["doc_json"]) or {}
         return {
             "globals": doc.get("globals", {}),
@@ -281,6 +292,8 @@ class ConfigStore:
             # untagged stored doc == pre-versioning == schema v1 (grandfather rule)
             "schema_version": doc.get("schema_version", 1),
             "version": row["version"],
+            "updated_at": row["updated_at"],
+            "updated_by": row["updated_by"],
         }
 
     def save_base(
@@ -373,12 +386,30 @@ class ConfigStore:
     # in-app. run_context still lives in company_overrides.
 
     def list_registry(self) -> list[dict]:
+        """The registry, each row carrying the state of that company's own delta so a
+        listing can say whether a company has settings of its own, at which version and
+        who last touched them, without a query per company.
+
+        `has_override` is about the *delta* only: a company seeded with just a run_context
+        has a row (version 1) but still runs the base step library, and reads as False."""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT code, display_name, created_at, updated_at "
-                "FROM companies ORDER BY code"
+                "SELECT c.code, c.display_name, c.created_at, c.updated_at, "
+                "       o.override_json AS override_json, "
+                "       o.version    AS override_version, "
+                "       o.updated_at AS override_updated_at, "
+                "       o.updated_by AS override_updated_by "
+                "FROM companies c "
+                "LEFT JOIN company_overrides o ON o.company_code = c.code "
+                "ORDER BY c.code"
             ).fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["has_override"] = bool(json.loads(d.pop("override_json") or "{}"))
+            d["override_version"] = d["override_version"] or 0
+            result.append(d)
+        return result
 
     def create_company(self, code: str, display_name: str,
                        run_context: dict | None = None, user: str | None = None) -> dict:
@@ -418,6 +449,133 @@ class ConfigStore:
             conn.execute("DELETE FROM companies WHERE code = ?", (code,))
             conn.execute("DELETE FROM company_overrides WHERE company_code = ?", (code,))
             conn.execute("DELETE FROM company_overrides_history WHERE company_code = ?", (code,))
+
+    # -- user registry ------------------------------------------------------
+    # Users live here and nowhere else: admins create/edit/delete them in the admin
+    # UI ("Manage users"), the same file-free model as the company registry. A fresh
+    # DB starts with no users; the first one comes from the `auth.py create-admin`
+    # CLI. Passwords are stored only as bcrypt hashes.
+
+    @staticmethod
+    def _sys_admin_count(conn: sqlite3.Connection) -> int:
+        """How many users hold the top role. Guards below refuse to leave this at 0 —
+        that would lock everyone out of the base config, the registries and licensing
+        with no in-app way back (only the create-admin CLI could recover it)."""
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE role = ?", (permissions.SYS_ADMIN,)
+        ).fetchone()["n"]
+
+    def _public_user(self, username: str) -> dict:
+        """One user WITHOUT the password hash (safe to return to the UI/API)."""
+        return next((u for u in self.list_users() if u["username"] == username),
+                    {"username": username})
+
+    def get_user(self, username: str) -> dict | None:
+        """Full user record INCLUDING password_hash (auth verification uses it), or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "username": row["username"],
+            "password_hash": row["password_hash"],
+            "display_name": row["display_name"],
+            "email": row["email"],
+            "role": row["role"],
+            "company_codes": json.loads(row["company_codes_json"] or "[]"),
+            "must_change_password": bool(row["must_change_password"]),
+        }
+
+    def list_users(self) -> list[dict]:
+        """All users WITHOUT password hashes — the shape the admin UI consumes."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT username, display_name, email, role, company_codes_json, "
+                "       must_change_password, created_at, updated_at "
+                "FROM users ORDER BY username"
+            ).fetchall()
+        return [{
+            "username": r["username"],
+            "display_name": r["display_name"],
+            "email": r["email"],
+            "role": r["role"],
+            "company_codes": json.loads(r["company_codes_json"] or "[]"),
+            "must_change_password": bool(r["must_change_password"]),
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+        } for r in rows]
+
+    def create_user(self, username: str, password_hash: str, display_name: str | None = None,
+                    role: str = "operator", company_codes: list[str] | None = None,
+                    user: str | None = None, email: str | None = None,
+                    must_change_password: bool = False) -> dict:
+        """Register a new user. Raises ValueError if the username already exists.
+
+        `must_change_password` marks the stored hash as a hand-over password (the initial
+        one an admin sets, or a generated reset): it lets someone in exactly once, and the
+        web layer refuses everything else until they replace it."""
+        username = (username or "").strip()
+        if not username:
+            raise ValueError("username is required")
+        ts = _now()
+        with self._lock, self._connect() as conn:
+            if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+                raise ValueError(f"User '{username}' already exists")
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, email, role, "
+                "company_codes_json, must_change_password, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (username, password_hash, display_name or username,
+                 (email or "").strip() or None, role or permissions.DEFAULT_ROLE,
+                 json.dumps(company_codes or []), int(bool(must_change_password)), ts, ts),
+            )
+        return self._public_user(username)
+
+    def update_user(self, username: str, *, display_name=_UNSET, role=_UNSET,
+                    company_codes=_UNSET, password_hash=_UNSET, email=_UNSET,
+                    must_change_password=_UNSET, user: str | None = None) -> dict:
+        """Partially update a user; only the fields passed (not _UNSET) are changed.
+
+        Refuses to demote the last remaining system administrator (that would lock
+        everyone out of the base config and both registries). Raises ValueError if the
+        user does not exist."""
+        ts = _now()
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+            if row is None:
+                raise ValueError(f"User '{username}' not found")
+            if (role is not _UNSET and row["role"] == permissions.SYS_ADMIN
+                    and role != permissions.SYS_ADMIN and self._sys_admin_count(conn) <= 1):
+                raise ValueError(
+                    "Cannot remove the sys_admin role from the last system administrator")
+            new_display = row["display_name"] if display_name is _UNSET else display_name
+            new_email   = (row["email"] if email is _UNSET
+                           else ((email or "").strip() or None))
+            new_role    = row["role"] if role is _UNSET else (role or permissions.DEFAULT_ROLE)
+            new_codes   = (json.loads(row["company_codes_json"] or "[]")
+                           if company_codes is _UNSET else (company_codes or []))
+            new_hash    = row["password_hash"] if password_hash is _UNSET else password_hash
+            new_must    = (row["must_change_password"] if must_change_password is _UNSET
+                           else int(bool(must_change_password)))
+            conn.execute(
+                "UPDATE users SET display_name=?, email=?, role=?, company_codes_json=?, "
+                "password_hash=?, must_change_password=?, updated_at=? WHERE username=?",
+                (new_display, new_email, new_role, json.dumps(new_codes), new_hash,
+                 new_must, ts, username),
+            )
+        return self._public_user(username)
+
+    def delete_user(self, username: str) -> None:
+        """Remove a user. Refuses to delete the last remaining system administrator."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+            if row is None:
+                raise ValueError(f"User '{username}' not found")
+            if row["role"] == permissions.SYS_ADMIN and self._sys_admin_count(conn) <= 1:
+                raise ValueError("Cannot delete the last system administrator")
+            conn.execute("DELETE FROM users WHERE username = ?", (username,))
 
 
 # ---------------------------------------------------------------------------

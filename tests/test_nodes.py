@@ -2,7 +2,6 @@
 
 import json
 
-import pytest
 
 from graph_builder import (make_analysis_node, make_execute_node, make_poll_node,
                            make_pre_check_node, make_validate_node)

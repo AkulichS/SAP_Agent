@@ -2,11 +2,9 @@
 
 import textwrap
 
-import pytest
-
 import config
 from config import (_build_steps, _merge_params, build_async_checkpointer,
-                    build_checkpointer, load_config, reset_each_run_enabled)
+                    load_config, reset_each_run_enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -141,19 +139,95 @@ def test_reset_each_run_from_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Checkpointers — must always return a usable saver
+# Checkpointer — must always return a usable saver
 # ---------------------------------------------------------------------------
-
-def test_build_checkpointer_returns_saver(tmp_path):
-    saver = build_checkpointer(str(tmp_path / "cp.db"))
-    assert type(saver).__name__ in ("SqliteSaver", "InMemorySaver")
-
 
 async def test_build_async_checkpointer_returns_saver(tmp_path):
     saver = await build_async_checkpointer(str(tmp_path / "cp_async.db"))
     try:
         assert type(saver).__name__ in ("AsyncSqliteSaver", "InMemorySaver")
     finally:
-        conn = getattr(saver, "conn", None)
-        if conn is not None:
-            await conn.close()   # avoid aiosqlite "event loop closed" warning at teardown
+        await config.close_checkpointers()   # also avoids an aiosqlite "loop closed" warning
+
+
+# ---------------------------------------------------------------------------
+# Shared per-process resources
+#
+# A checkpointer owns an aiosqlite connection (and therefore a thread); an LLM
+# owns two httpx clients (and therefore connection pools). Built per run, N
+# concurrent company closes leak N of each for the life of the process — so both
+# factories cache. These tests are the guard on that.
+# ---------------------------------------------------------------------------
+
+async def test_checkpointer_is_shared_per_db_path(tmp_path):
+    path = str(tmp_path / "shared.db")
+    try:
+        first  = await build_async_checkpointer(path)
+        second = await build_async_checkpointer(path)
+        assert first is second
+
+        other = await build_async_checkpointer(str(tmp_path / "other.db"))
+        assert other is not first                  # a different DB is a different saver
+    finally:
+        await config.close_checkpointers()
+
+
+async def test_concurrent_starts_share_one_checkpointer(tmp_path):
+    """Two runs starting at the same moment must not open two connections."""
+    import asyncio
+    path  = str(tmp_path / "race.db")
+    opens = 0
+    original = config._open_checkpointer
+
+    async def _counting(p):
+        nonlocal opens
+        opens += 1
+        return await original(p)
+
+    config._open_checkpointer = _counting
+    try:
+        savers = await asyncio.gather(*[build_async_checkpointer(path) for _ in range(5)])
+        assert opens == 1
+        assert all(s is savers[0] for s in savers)
+    finally:
+        config._open_checkpointer = original
+        await config.close_checkpointers()
+
+
+async def test_close_checkpointers_releases_the_cache(tmp_path):
+    path  = str(tmp_path / "closed.db")
+    first = await build_async_checkpointer(path)
+    await config.close_checkpointers()
+    try:
+        assert await build_async_checkpointer(path) is not first
+    finally:
+        await config.close_checkpointers()
+
+
+async def test_llm_clients_are_shared_across_runs(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    profile = {"provider": "groq", "model": "llama-3.3-70b", "temperature": 0}
+    try:
+        first  = config._llm_from_profile(dict(profile))
+        second = config._llm_from_profile(dict(profile))
+        assert first is second                     # same profile → one client, reused
+
+        other = config._llm_from_profile({**profile, "model": "gpt-oss-120b"})
+        assert other is not first
+        # …but both ride the SAME http connection pool
+        assert other.http_async_client is first.http_async_client
+        assert other.http_client is first.http_client
+        assert first.http_async_client in config._http_async.values()
+    finally:
+        await config.close_http_clients()
+
+
+async def test_close_http_clients_clears_the_cache(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    profile = {"provider": "groq", "model": "llama-3.3-70b", "temperature": 0}
+    first = config._llm_from_profile(dict(profile))
+    await config.close_http_clients()
+    try:
+        assert config._llm_from_profile(dict(profile)) is not first
+    finally:
+        await config.close_http_clients()

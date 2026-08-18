@@ -36,7 +36,7 @@ from uuid import uuid4
 import yaml
 from dotenv import load_dotenv
 from langchain_core.messages import (
-    AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage,
+    BaseMessage, HumanMessage, SystemMessage, ToolMessage, RemoveMessage,
 )
 
 load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -49,7 +49,7 @@ from mcp import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from config import (build_async_checkpointer, build_checkpointer, build_llms_from_config,
+from config import (build_async_checkpointer, build_llms_from_config,
                     load_config, reset_each_run_enabled)
 from connectors import (DEFAULT_CONNECTOR, POLL_ABORTED, POLL_FINISHED,
                         get_connector)
@@ -2347,11 +2347,20 @@ def _build_initial_state(period_cfg: dict, steps: list[dict],
 
 
 def _build_cm(mcp_cfg: dict):
+    """Open the MCP transport for one run.
+
+    ``stdio`` spawns a private MCP server subprocess **per run** — fine for the CLI
+    and for dev, ruinous for a busy web deployment (each subprocess carries its own
+    interpreter, its own NW RFC SDK and its own SAP connections). Set
+    ``MCP_TRANSPORT=sse`` + ``MCP_SSE_URL`` there instead: every run then shares one
+    already-running ``mcp_server.py``, which pools SAP connections across them.
+    Env wins over the YAML so a deployment flips transport without editing config.
+    """
     server_cfg = mcp_cfg.get("server", {})
     command    = server_cfg.get("command", "python")
     if command == "sys.executable":
         command = sys.executable
-    transport = server_cfg.get("transport", "stdio")
+    transport = os.getenv("MCP_TRANSPORT") or server_cfg.get("transport", "stdio")
     if transport == "stdio":
         env = dict(os.environ) | (server_cfg.get("env") or {})
         # Spawn the MCP server with its working directory pinned to this package
@@ -2364,7 +2373,13 @@ def _build_cm(mcp_cfg: dict):
             env=env,
             cwd=cwd,
         ))
-    return sse_client(server_cfg["sse_url"])
+    sse_url = os.getenv("MCP_SSE_URL") or server_cfg.get("sse_url")
+    if not sse_url:
+        raise ValueError(
+            "MCP transport is 'sse' but no server URL is set — "
+            "set MCP_SSE_URL (or server.sse_url in configs/mcp_config.yaml)"
+        )
+    return sse_client(sse_url)
 
 
 async def _run_with_interrupts(

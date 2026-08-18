@@ -7,16 +7,28 @@ Run with SSE transport:           MCP_TRANSPORT=sse python mcp_server.py
 
 All SAP calls go through ZFI_AI_PERIOD_CLOSE_RFC — the agent process
 never imports pyrfc or SAPConnectionManager directly.
+
+Concurrency
+-----------
+Under SSE this one process serves **every** concurrent company run, so nothing
+here may hold the event loop. Each tool is registered through ``_tool``, which
+wraps the (sync, blocking) implementation in an async shim that runs it in a
+worker thread, bounded by a capacity limiter sized to the connection pool. The
+module-level names stay the plain sync functions — that is what the tests call,
+and it is the same code the shim executes.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import anyio
+import anyio.to_thread
 import yaml
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -63,7 +75,7 @@ def _get_sap_params() -> SAPConnectionParams:
 cfg = _load_config()
 
 conn_mgr = SAPConnectionManager()
-conn_mgr.configure(_get_sap_params())
+conn_mgr.configure(_get_sap_params(), pool_size=cfg.get("server", {}).get("pool_size"))
 
 logger.info("MCP server starting — SAP host=%s", os.environ.get("SAP_HOST"))
 
@@ -76,28 +88,72 @@ logger.info("MCP server starting — SAP host=%s", os.environ.get("SAP_HOST"))
 async def lifespan(server: FastMCP):
     logger.info("MCP server lifespan: startup")
     yield
-    logger.info("MCP server lifespan: shutdown — closing SAP connection")
+    logger.info("MCP server lifespan: shutdown — closing SAP connections")
     conn_mgr.close()
 
 
-mcp = FastMCP(name="sap-period-close", lifespan=lifespan)
+_server_cfg = cfg.get("server", {})
+mcp = FastMCP(
+    name="sap-period-close",
+    lifespan=lifespan,
+    # Env wins over YAML, so a deployment (and the SSE test) sets the listen
+    # address without editing config — matches MCP_SSE_URL on the client side.
+    host=os.getenv("MCP_SSE_HOST") or _server_cfg.get("sse_host", "127.0.0.1"),
+    port=int(os.getenv("MCP_SSE_PORT") or _server_cfg.get("sse_port", 8100)),
+)
+
+
+# ---------------------------------------------------------------------------
+# Tool registration
+#
+# A tool body is blocking (pyrfc is a C extension with no async API), and under
+# SSE every run shares this process — so registering the sync function directly
+# would serialize the whole fleet on the event loop. ``_tool`` registers an async
+# shim that offloads to a worker thread instead, and returns the SYNC function so
+# the module-level name stays directly callable (tests, and any in-process use).
+#
+# The limiter caps worker threads at the connection-pool size: past that point a
+# thread could only sit blocked in SAPConnectionManager._acquire anyway, so the
+# queueing happens in anyio rather than in threads nobody can use.
+# ---------------------------------------------------------------------------
+
+_rfc_limiter = anyio.CapacityLimiter(conn_mgr.pool_size)
+
+
+def _tool(fn: Callable[..., dict]) -> Callable[..., dict]:
+    """Register ``fn`` as an MCP tool that runs off the event loop."""
+
+    @functools.wraps(fn)          # carries name/doc/annotations → identical tool schema
+    async def _threaded(*args: Any, **kwargs: Any) -> dict:
+        return await anyio.to_thread.run_sync(
+            functools.partial(fn, *args, **kwargs), limiter=_rfc_limiter
+        )
+
+    mcp.add_tool(_threaded)
+    return fn
 
 
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
-def _rfc(conn, action_type: str, object_name: str, params: dict,
+def _rfc(action_type: str, object_name: str, params: dict,
          async_mode: bool = False, test_run: bool = False) -> dict:
-    """Call ZFI_AI_PERIOD_CLOSE_RFC and return a normalised result dict."""
-    rfc_result = conn.call(
-        RFC,
-        IV_ACTION_TYPE = action_type,
-        IV_OBJECT_NAME = object_name,
-        IV_PARAMS_JSON = json.dumps(params, separators=(',', ':')),
-        IV_ASYNC       = "X" if async_mode else "",
-        IV_TEST_RUN    = "X" if test_run else "",
-    )
+    """Call ZFI_AI_PERIOD_CLOSE_RFC on a pooled connection; return a normalised dict.
+
+    The connection is checked out for exactly this call and handed straight back,
+    so a long inline-wait SUBMIT is the only thing that can hold a pool slot for
+    more than a round trip.
+    """
+    with conn_mgr.connection() as conn:
+        rfc_result = conn.call(
+            RFC,
+            IV_ACTION_TYPE = action_type,
+            IV_OBJECT_NAME = object_name,
+            IV_PARAMS_JSON = json.dumps(params, separators=(',', ':')),
+            IV_ASYNC       = "X" if async_mode else "",
+            IV_TEST_RUN    = "X" if test_run else "",
+        )
     return {
         "status":   rfc_result.get("EV_STATUS", ""),
         "data":     json.loads(rfc_result.get("EV_RESULT_DATA", "{}") or "{}"),
@@ -157,7 +213,7 @@ def _norm_spool(raw: Any) -> dict | None:
 # Pre-check RFC call — used by pre_check_node for all modes
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_check_period(
     action_type: str,
     object_name: str,
@@ -179,9 +235,8 @@ def sap_check_period(
     {"status": "ok"|"error", "messages": list,
      "meta": {"action_type", "object_name"}, "data": <raw RFC payload>}
     """
-    conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
-    result = _rfc(conn, action_type, object_name, params, async_mode, test_run)
+    result = _rfc(action_type, object_name, params, async_mode, test_run)
     has_errors = any(m.get("TYPE") in ("E", "A") for m in result["messages"]) \
                  or result["status"] == "E"
     status = "error" if has_errors else "ok"
@@ -201,7 +256,7 @@ def sap_check_period(
 # Submit / run a single period-close step — returns immediately for async
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_execute_step(
     action_type: str,
     object_name: str,
@@ -223,10 +278,9 @@ def sap_execute_step(
         data   — neutral payload; for an inline-wait SUBMIT the report output is
                  normalised in place as data["text"] = {available, line_count, text}
     """
-    conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else params_json
 
-    result = _rfc(conn, action_type, object_name, params, async_mode=async_mode, test_run=test_run)
+    result = _rfc(action_type, object_name, params, async_mode=async_mode, test_run=test_run)
     messages  = result["messages"]
     data      = result["data"]
     rfc_meta  = result["meta"]
@@ -300,7 +354,7 @@ def sap_execute_step(
 # stay: they are the diagnostic tools the analysis ReAct agent calls by name.)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_run_tool(object_name: str, params_json: str, test_run: bool = False) -> dict:
     """
     Run any TOOLS-type SAP tool and normalise its result generically.
@@ -315,9 +369,8 @@ def sap_run_tool(object_name: str, params_json: str, test_run: bool = False) -> 
         meta — {"object_name", "row_count"} merged with the RFC's own EV_META
                (e.g. {"table","count"} for a table read, {"state"} for a status check)
     """
-    conn = conn_mgr.get_connection()
     params = json.loads(params_json) if isinstance(params_json, str) else (params_json or {})
-    result = _rfc(conn, "TOOLS", object_name, params, test_run=test_run)
+    result = _rfc("TOOLS", object_name, params, test_run=test_run)
     payload = result["data"]
 
     data: dict = {"raw": payload}
@@ -347,7 +400,7 @@ def sap_run_tool(object_name: str, params_json: str, test_run: bool = False) -> 
 # Direct diagnostic table read — used by analysis_node
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> dict:
     """
     Read rows from any SAP transparent table via RFC_READ_TABLE.
@@ -358,8 +411,7 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
         meta — {"table", "row_count"}
         data — {"rows": [{"FIELD": "value"}, ...]}
     """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_READ_TABLE", {
+    result = _rfc("TOOLS", "TOOL_READ_TABLE", {
         "table":    table,
         "where":    where,
         "fields":   fields,
@@ -380,7 +432,7 @@ def sap_read_table(table: str, where: str, fields: str, max_rows: int = 100) -> 
 # Single-shot job status check — polling loop lives in graph's poll_node
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_job_status(job_name: str, job_id: str) -> dict:
     """
     Check the current status of a SAP background job (single shot, non-blocking).
@@ -397,8 +449,7 @@ def sap_job_status(job_name: str, job_id: str) -> dict:
         meta   — {"job_name", "job_id"}
         data   — {"state", "is_running", "is_finished", "is_aborted"}
     """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_JOB_STATUS", {
+    result = _rfc("TOOLS", "TOOL_JOB_STATUS", {
         "jobname":  job_name,
         "jobcount": job_id,
     })
@@ -424,7 +475,7 @@ def sap_job_status(job_name: str, job_id: str) -> dict:
 # Read spool output of a completed background job
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
     """
     Read the spool output of a completed SAP background job.
@@ -435,8 +486,7 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         meta — {"job_name", "job_id", "line_count", "truncated"}
         data — {"text": {available, line_count, text}}   (neutral text channel)
     """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_SPOOL", {
+    result = _rfc("TOOLS", "TOOL_READ_JOB_SPOOL", {
         "jobname":  job_name,
         "jobcount": job_id,
     })
@@ -466,7 +516,7 @@ def sap_read_spool(job_name: str, job_id: str, max_lines: int = 500) -> dict:
 # Read the SM37 runtime job log of a background job (abort reason lives here)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
     """
     Read the runtime job log (SM37 "Job log") of a SAP background job.
@@ -483,8 +533,7 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
         meta — {"job_name", "job_id", "line_count", "truncated"}
         data — {"text": {available, line_count, text}}   (neutral text channel)
     """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_READ_JOB_LOG", {
+    result = _rfc("TOOLS", "TOOL_READ_JOB_LOG", {
         "jobname":  job_name,
         "jobcount": job_id,
     })
@@ -514,7 +563,7 @@ def sap_read_job_log(job_name: str, job_id: str, max_lines: int = 500) -> dict:
 # Logical SAP identity (SID + installation number) — licensing binding anchor
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool
 def sap_system_identity() -> dict:
     """
     Return the logical identity of the connected SAP system, for anchoring the
@@ -532,8 +581,7 @@ def sap_system_identity() -> dict:
         meta — {"sid", "client", "installation_number"} (also the flat convenience view)
         data — {"rows": [{"name","value"}, ...]}   (backend-neutral rows channel)
     """
-    conn = conn_mgr.get_connection()
-    result = _rfc(conn, "TOOLS", "TOOL_SYSTEM_IDENTITY", {})
+    result = _rfc("TOOLS", "TOOL_SYSTEM_IDENTITY", {})
     rows = result["data"].get("rows", []) if isinstance(result["data"], dict) else []
     meta = result["meta"] or {}
 
@@ -554,6 +602,13 @@ def sap_system_identity() -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    transport = cfg.get("server", {}).get("transport", "stdio")
-    logger.info("Starting MCP server transport=%s", transport)
+    # MCP_TRANSPORT is the deployment switch: the same env var the agent side
+    # reads (graph_builder._build_cm), so server and client can never disagree.
+    transport = os.getenv("MCP_TRANSPORT") or cfg.get("server", {}).get("transport", "stdio")
+    if transport == "sse":
+        logger.info("Starting MCP server transport=sse on %s:%s (pool_size=%d) — "
+                    "one shared server for all runs",
+                    mcp.settings.host, mcp.settings.port, conn_mgr.pool_size)
+    else:
+        logger.info("Starting MCP server transport=%s", transport)
     mcp.run(transport=transport)
